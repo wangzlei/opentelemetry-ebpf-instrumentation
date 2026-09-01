@@ -702,10 +702,12 @@ func traceAttributesSelectorInternal(span *request.Span, optionalAttrs map[attr.
 
 		if span.SubType == request.HTTPSubtypeAWSGeneric && span.AWS != nil {
 			g := span.AWS.Generic
-			attrs = append(attrs, semconv.RPCService(g.Service))
+			// semconv v1.41.0 has no RPCService/CloudRegion helper; use the raw
+			// key and the request-package helper respectively.
+			attrs = append(attrs, attribute.String("rpc.service", g.Service))
 			attrs = append(attrs, request.RPCSystem("aws-api"))
 			attrs = append(attrs, semconv.RPCMethod(g.Operation))
-			attrs = append(attrs, semconv.CloudRegion(g.Region))
+			attrs = append(attrs, request.CloudRegion(g.Region))
 		}
 
 		if span.SubType == request.HTTPSubtypeAWSSQS && span.AWS != nil {
