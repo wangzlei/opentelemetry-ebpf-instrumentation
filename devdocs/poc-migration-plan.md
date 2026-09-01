@@ -29,11 +29,13 @@ one "payload enrichment" commit rather than split.
 ## Files in the ③+④ enrichment change
 
 New:
+
 - `pkg/ebpf/common/http/aws_generic.go` (+ `_test.go`) — the generic AWS parser.
 - `bpf/gotracer/maps/go_aws_req_head.h` — crypto/tls → roundTrip request-head hand-off (also declares `volatile const http_aws_semantics`).
 - `bpf/maps/svc_peer_name_map.h`, `bpf/tpinjector/maps/{sk_svc_name_map,svc_name_by_pid}.h` — TCP service-name maps.
 
 Edited (AWS/TCP hunks only; HTTP/2 hunks in shared files were dropped):
+
 - `bpf/common/common.h`, `bpf/common/http_info.h` — struct fields + padding.
 - `bpf/generictracer/protocol_http.h` — peer-name lookup moved into `submit_http_event` (upstream renamed the old `finish_http`).
 - `bpf/gotracer/go_net_tls.c`, `bpf/gotracer/go_nethttp.c` — request-head capture + peer lookup.
@@ -51,10 +53,12 @@ Dropped entirely (① / ②): `pkg/ebpf/instrumenter.go`,
 
 ## Regeneration
 
-BPF C changed, so `*_bpfel.go` / `*_bpfeb.go` bindings must be regenerated and
-committed (`make docker-generate`), or CI `check-clean-work-tree` fails and Go code
-referencing new struct fields (`AwsReqHead`, `PeerServiceName`, `SvcNameByPid`)
-won't compile.
+BPF C changed, so the `*_bpfel.go` / `*_bpfeb.go` bindings must be regenerated
+(`make docker-generate`) for local builds. These bindings are `.gitignore`d and are
+NOT committed — CI regenerates them in its `generate-bpf` job, so a source-only
+commit is correct. Regenerating locally is still worthwhile: it catches BPF compile
+errors before CI (e.g. this change tripped the 512-byte BPF stack limit until the
+peer-name lookup key was moved to percpu scratch in `submit_http_event`).
 
 ## Long-term maintenance strategy
 
