@@ -23,6 +23,7 @@
 
 #include <gotracer/go_common.h>
 #include <gotracer/go_large_buffer.h>
+#include <gotracer/maps/go_aws_req_head.h>
 #include <gotracer/maps/go_persist_conn.h>
 #include <gotracer/maps/ongoing_ssl_ops.h>
 
@@ -234,6 +235,14 @@ int GUARDED_PROG(obi_uprobe_cryptoTlsWrite, struct pt_regs *, ctx) {
         sort_connection_info(&args.p_conn.conn);
 
         if (already_handled_request_sorted(&args.p_conn.conn)) {
+            // net/http's roundTrip probe owns this request and will report it, so
+            // we must not report it again. But these are the only plaintext
+            // request bytes anyone sees, and roundTrip cannot read headers out of
+            // the http.Request struct -- so hand the head over instead of letting
+            // it die here. See maps/go_aws_req_head.h.
+            if (http_aws_semantics) {
+                store_go_aws_req_head(&args.p_conn.conn, buf, len);
+            }
             cleanup_duplicate_generic_events_sorted(&args.p_conn);
             if (!http_large_buffer_skip(len)) {
                 send_http_large_buffers_if_needed(&g_key, &args.p_conn.conn, buf, len, TCP_SEND);

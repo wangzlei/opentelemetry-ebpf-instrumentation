@@ -18,6 +18,24 @@
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/utils.h>
 
+#include <common/http_info.h> // FULL_BUF_SIZE
+
+// Size of the raw request head handed from the crypto/tls probe to the roundTrip
+// probe for AWS SDK identification on Go clients (see
+// gotracer/maps/go_aws_req_head.h for the mechanism).
+//
+// Deliberately NOT FULL_BUF_SIZE (256): that constant sizes the inline buffer OBI
+// already ships for every HTTP event and is fixed by the existing wire format.
+// This buffer is private to the AWS hand-off, and it has to be bigger because the
+// two SDKs order headers differently:
+//   boto3 (Python):  X-Amz-Target at offset ~17     -> 256 is plenty
+//   aws-sdk-go-v2:   User-Agent (158B), Authorization (~250B) and Amz-Sdk-* come
+//                    FIRST, pushing X-Amz-Target past offset 400 -> 256 misses it
+// Measured Go request heads total 767 bytes, so 1024 covers them with headroom.
+#define GO_AWS_REQ_HEAD_SIZE 1024
+
+// HTTP_PEER_SVC_NAME_LEN is defined in common/http_info.h (included above).
+
 #include <common/connection_info.h>
 #include <common/event_source.h>
 #include <common/http_types.h>
@@ -93,6 +111,26 @@ typedef struct http_request_trace {
     tp_info_t tp;
     connection_info_t conn;
     pid_info pid;
+    // Raw request head, handed over by the crypto/tls probe for AWS SDK semantic
+    // detail (see gotracer/maps/go_aws_req_head.h). Empty (aws_req_head_len == 0)
+    // unless payload_extraction.http.aws.enabled is set and the request went over
+    // TLS -- the struct fields above carry no headers, and X-Amz-Target is the
+    // only way to name an AWS-JSON/RPC operation.
+    // Sized well above FULL_BUF_SIZE on purpose: aws-sdk-go-v2 emits User-Agent
+    // and Authorization before X-Amz-Target, pushing it past offset 400.
+    unsigned char aws_req_head[GO_AWS_REQ_HEAD_SIZE];
+    u16 aws_req_head_len;
+    // EXPERIMENTAL — TCP service-name propagation: the immediate downstream
+    // service's name, learned from a kind-26 TCP option on the response and
+    // looked up by connection in roundTripReturn. Empty unless the peer is an
+    // OBI-instrumented service on a direct (proxy-free) hop. HTTP_PEER_SVC_NAME_LEN
+    // must match K_SVC_NAME_MAX_LEN in bpf/maps/svc_peer_name_map.h.
+    u8 peer_service_name_len;
+    unsigned char peer_service_name[HTTP_PEER_SVC_NAME_LEN];
+    // BPF is built with -Werror -Wpadded, so tail padding is explicit and must be
+    // recomputed whenever fields change. Tail after aws_req_head[1024]:
+    // 2 + 1 + 25 = 28, pad 4 -> 32 (8-aligned).
+    u8 _pad2[4];
 } http_request_trace_t;
 
 typedef struct sql_request_trace {

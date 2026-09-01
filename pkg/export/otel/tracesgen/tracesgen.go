@@ -665,6 +665,14 @@ func traceAttributesSelectorInternal(span *request.Span, optionalAttrs map[attr.
 			}
 		}
 
+		// EXPERIMENTAL — TCP service-name propagation. Distinct from peer.service
+		// (which is OBI's local k8s-resolved guess): this value is what the
+		// downstream reported about ITSELF over a kind-26 TCP option, so it is
+		// emitted under its own key rather than overwriting peer.service.
+		if span.PeerServiceName != "" {
+			attrs = append(attrs, attribute.String("tcp.peer.service.name", span.PeerServiceName))
+		}
+
 		if span.SubType == request.HTTPSubtypeElasticsearch && span.Elasticsearch != nil {
 			attrs = append(attrs, request.DBCollectionName(span.Elasticsearch.DBCollectionName))
 			attrs = append(attrs, request.ElasticsearchNodeName(span.Elasticsearch.NodeName))
@@ -690,6 +698,14 @@ func traceAttributesSelectorInternal(span *request.Span, optionalAttrs map[attr.
 			attrs = append(attrs, request.AWSExtendedRequestID(s3.Meta.ExtendedRequestID))
 			attrs = append(attrs, semconv.AWSS3Bucket(s3.Bucket))
 			attrs = append(attrs, semconv.AWSS3Key(s3.Key))
+		}
+
+		if span.SubType == request.HTTPSubtypeAWSGeneric && span.AWS != nil {
+			g := span.AWS.Generic
+			attrs = append(attrs, semconv.RPCService(g.Service))
+			attrs = append(attrs, request.RPCSystem("aws-api"))
+			attrs = append(attrs, semconv.RPCMethod(g.Operation))
+			attrs = append(attrs, semconv.CloudRegion(g.Region))
 		}
 
 		if span.SubType == request.HTTPSubtypeAWSSQS && span.AWS != nil {

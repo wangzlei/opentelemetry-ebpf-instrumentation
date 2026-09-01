@@ -114,6 +114,7 @@ const (
 	HTTPSubtypeRetrieval        = 15 // http + vector retrieval (Pinecone, Qdrant, Milvus, Chroma, Weaviate, etc.)
 	HTTPSubtypeOpenAICompatible = 16 // http + OpenAI-compatible API (custom provider)
 	HTTPSubtypeOllama           = 17 // http + Ollama native API
+	HTTPSubtypeAWSGeneric       = 18 // http + any AWS service, identified from the first 256B of the request
 )
 
 func IsGenAISubtype(subtype int) bool {
@@ -260,6 +261,19 @@ type AWS struct {
 	S3 AWSS3 `json:"s3"`
 	// https://opentelemetry.io/docs/specs/semconv/messaging/sqs/
 	SQS AWSSQS `json:"sqs"`
+	// Generic: any AWS service, resolved from the request head only (no body,
+	// no response headers). Set when SubType == HTTPSubtypeAWSGeneric.
+	Generic AWSGeneric `json:"generic"`
+}
+
+// AWSGeneric carries the AWS service/operation identified from the first bytes
+// of the request (request line + leading headers), which is all the small
+// inline eBPF buffer contains. It deliberately has no RequestID (that lives in
+// a response header) and no body-derived fields.
+type AWSGeneric struct {
+	Service   string `json:"service"`   // e.g. "DynamoDB", "SNS", "Lambda"
+	Operation string `json:"operation"` // e.g. "Query", "Publish", "Invoke"
+	Region    string `json:"region"`    // e.g. "us-west-2"
 }
 
 type AWSMeta struct {
@@ -1327,12 +1341,18 @@ type Span struct {
 	// ParentConditional marks a parent that may already have finished when this
 	// span started: BPF cannot tell at that moment, so the pipeline settles the
 	// link against the parent span's real end timestamp before export.
-	ParentConditional bool           `json:"-"`
-	TraceFlags        uint8          `json:"traceFlags,string"`
-	Links             []SpanLink     `json:"links,omitempty"`
-	Pid               PidInfo        `json:"-"`
-	PeerName          string         `json:"peerName"`
-	HostName          string         `json:"hostName"`
+	ParentConditional bool       `json:"-"`
+	TraceFlags        uint8      `json:"traceFlags,string"`
+	Links             []SpanLink `json:"links,omitempty"`
+	Pid               PidInfo    `json:"-"`
+	PeerName          string     `json:"peerName"`
+	HostName          string     `json:"hostName"`
+	// PeerServiceName is the immediate downstream service's OpenTelemetry
+	// service.name, learned hop-by-hop from a TCP option the peer wrote on the
+	// response (EXPERIMENTAL — TCP service-name propagation). Set on client spans
+	// only, and only when the downstream is an OBI-instrumented service reached
+	// over a direct, proxy-free connection.
+	PeerServiceName   string         `json:"peerServiceName,omitempty"`
 	OtherNamespace    string         `json:"-"`
 	OtherK8SNamespace string         `json:"-"`
 	Statement         string         `json:"-"`
@@ -1420,6 +1440,9 @@ func spanAttributes(s *Span) SpanAttributes {
 			"clientAddr": SpanPeer(s),
 			"serverAddr": SpanHost(s),
 			"serverPort": strconv.Itoa(s.HostPort),
+		}
+		if s.PeerServiceName != "" {
+			attrs["peerServiceName"] = s.PeerServiceName
 		}
 		if s.SubType == HTTPSubtypeElasticsearch && s.Elasticsearch != nil {
 			attrs["dbCollectionName"] = s.Elasticsearch.DBCollectionName
@@ -1968,6 +1991,16 @@ func (s *Span) TraceName() string {
 				return "sqs." + s.AWS.SQS.OperationName
 			} else {
 				return "sqs.Operation"
+			}
+		}
+
+		if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSGeneric && s.AWS != nil {
+			g := s.AWS.Generic
+			if g.Service != "" && g.Operation != "" {
+				return g.Service + "." + g.Operation
+			}
+			if g.Service != "" {
+				return g.Service + ".Operation"
 			}
 		}
 

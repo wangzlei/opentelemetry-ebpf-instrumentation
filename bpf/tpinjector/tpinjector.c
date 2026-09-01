@@ -36,6 +36,7 @@
 #include <maps/msg_buffers.h>
 #include <maps/outgoing_trace_map.h>
 #include <maps/sock_dir.h>
+#include <maps/svc_peer_name_map.h>
 #include <maps/tp_info_mem.h>
 #include <maps/tracked_sock_cookies.h>
 
@@ -45,7 +46,9 @@
 #include <tpinjector/inject_policy.h>
 #include <tpinjector/maps/sk_h2_flags.h>
 #include <tpinjector/maps/sk_h2_conn_flag.h>
+#include <tpinjector/maps/sk_svc_name_map.h>
 #include <tpinjector/maps/sk_tp_info_pid_map.h>
+#include <tpinjector/maps/svc_name_by_pid.h>
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
@@ -316,6 +319,23 @@ struct tp_option {
     unsigned char span_id[SPAN_ID_SIZE_BYTES];
 };
 
+// EXPERIMENTAL — TCP service-name propagation (docs/TCP_SERVICE_NAME_PROPAGATION.md).
+// A SEPARATE option kind from the trace option (25), so the kind-25 trace write
+// and parse paths are left byte-for-byte unchanged. Both kinds are unassigned in
+// the IANA registry. This option is written only on responses (server sockets)
+// and read only on the client, so requests keep carrying just the trace option.
+enum {
+    k_tcp_option_kind_svc_name = 26,
+    k_svc_name_option_version = 1,
+};
+
+struct svc_name_option {
+    u8 kind;
+    u8 len; // always sizeof(struct svc_name_option) == 28
+    u8 version;
+    unsigned char name[K_SVC_NAME_MAX_LEN];
+};
+
 static __always_inline const char *tp_string_from_opt(const struct tp_option *opt) {
     unsigned char *buf = tp_str_buf_mem();
 
@@ -515,6 +535,13 @@ static __always_inline void bpf_sock_ops_active_est_cb(struct bpf_sock_ops *skop
         bpf_map_update_elem(&tracked_sock_cookies, &cookie, &(u8){1}, BPF_ANY);
     }
     bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG);
+
+    // EXPERIMENTAL — service-name propagation: the client also PARSES, to read
+    // the server's name off response segments. Reading is idle unless a kind-26
+    // option is present, so this does not affect the existing request path.
+    if (inject_flags & k_inject_tcp_options) {
+        bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG);
+    }
 }
 
 static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *skops) {
@@ -523,6 +550,27 @@ static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *sko
     }
 
     bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG);
+
+    // EXPERIMENTAL — service-name propagation, write side. A server must (a) run
+    // its responses through sk_msg to resolve the writing PID -> local name, so
+    // insert it into sock_dir like active sockets; (b) be able to WRITE a header
+    // option; (c) be marked as a responder. The pending marker is also what makes
+    // the sk_msg entry point treat this as a server socket and skip the
+    // client-side traceparent logic. PID is not reliably available here (passive
+    // established runs in softirq), so the name is resolved later, in sk_msg.
+    const u64 cookie = bpf_get_socket_cookie(skops);
+    bpf_sock_hash_update(skops, &sock_dir, (void *)&cookie, BPF_ANY);
+    bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG);
+
+    struct bpf_sock *sk = skops->sk;
+    if (sk) {
+        sk_svc_name_state_t *st =
+            bpf_sk_storage_get(&sk_svc_name_map, sk, NULL, BPF_SK_STORAGE_GET_F_CREATE);
+        if (st) {
+            st->state = k_svc_state_server_pending;
+            st->name.len = 0;
+        }
+    }
 }
 
 static __always_inline void bpf_sock_ops_opt_len_cb(struct bpf_sock_ops *skops) {
@@ -534,15 +582,22 @@ static __always_inline void bpf_sock_ops_opt_len_cb(struct bpf_sock_ops *skops) 
 
     tp_info_pid_t *tp_pid = bpf_sk_storage_get(&sk_tp_info_pid_map, sk, NULL, 0);
 
-    if (!tp_pid) {
+    if (tp_pid) {
+        const long ret = bpf_reserve_hdr_opt(skops, sizeof(struct tp_option), 0);
+        if (ret != 0) {
+            bpf_dbg_printk("failed to reserve TCP option: %d", ret);
+        }
         return;
     }
 
-    const long ret = bpf_reserve_hdr_opt(skops, sizeof(struct tp_option), 0);
-
-    if (ret != 0) {
-        bpf_dbg_printk("failed to reserve TCP option: %d", ret);
-        return;
+    // EXPERIMENTAL — reserve space for the service-name option on server sockets
+    // that have a resolved local name ready to emit.
+    sk_svc_name_state_t *st = bpf_sk_storage_get(&sk_svc_name_map, sk, NULL, 0);
+    if (st && st->state == k_svc_state_ready) {
+        const long ret = bpf_reserve_hdr_opt(skops, sizeof(struct svc_name_option), 0);
+        if (ret != 0) {
+            bpf_dbg_printk("failed to reserve svc-name option: %d", ret);
+        }
     }
 }
 
@@ -555,40 +610,60 @@ static __always_inline void bpf_sock_ops_write_hdr_cb(struct bpf_sock_ops *skops
 
     const tp_info_pid_t *tp_pid = bpf_sk_storage_get(&sk_tp_info_pid_map, sk, NULL, 0);
 
-    if (!tp_pid) {
-        bpf_dbg_printk("tp info not found");
+    if (tp_pid) {
+        // cleanup the storage to prevent it from being written more than once
+        // (including during responses);
+        bpf_sk_storage_delete(&sk_tp_info_pid_map, sk);
+
+        struct tp_option opt = {.kind = k_tcp_option_kind_otel, .len = sizeof(struct tp_option)};
+
+        __builtin_memcpy(opt.trace_id, tp_pid->tp.trace_id, sizeof(opt.trace_id));
+        __builtin_memcpy(opt.span_id, tp_pid->tp.span_id, sizeof(opt.span_id));
+
+        const long ret = bpf_store_hdr_opt(skops, &opt, sizeof(opt), 0);
+
+        if (ret != 0) {
+            bpf_dbg_printk("failed to store option: %d", ret);
+        }
+
+        if (g_bpf_debug) {
+            const char *tp_str = tp_string_from_opt(&opt);
+
+            if (tp_str) {
+                bpf_dbg_printk("written TP to TCP options: %s", tp_str);
+            }
+        }
         return;
     }
 
-    // cleanup the storage to prevent it from being written more than once
-    // (including during responses);
-    bpf_sk_storage_delete(&sk_tp_info_pid_map, sk);
-
-    struct tp_option opt = {.kind = k_tcp_option_kind_otel, .len = sizeof(struct tp_option)};
-
-    __builtin_memcpy(opt.trace_id, tp_pid->tp.trace_id, sizeof(opt.trace_id));
-    __builtin_memcpy(opt.span_id, tp_pid->tp.span_id, sizeof(opt.span_id));
-
-    const long ret = bpf_store_hdr_opt(skops, &opt, sizeof(opt), 0);
-
-    if (ret != 0) {
-        bpf_dbg_printk("failed to store option: %d", ret);
+    // EXPERIMENTAL — write the service-name option on server responses. Unlike the
+    // trace path above (which deletes unconditionally), keep the pending entry if
+    // the write fails with ENOSPC, so a later, less-crowded segment can carry it.
+    sk_svc_name_state_t *st = bpf_sk_storage_get(&sk_svc_name_map, sk, NULL, 0);
+    if (!st || st->state != k_svc_state_ready || st->name.len == 0) {
+        return;
     }
 
-    if (g_bpf_debug) {
-        const char *tp_str = tp_string_from_opt(&opt);
+    struct svc_name_option opt = {
+        .kind = k_tcp_option_kind_svc_name,
+        .len = sizeof(struct svc_name_option),
+        .version = k_svc_name_option_version,
+    };
+    __builtin_memcpy(opt.name, st->name.name, K_SVC_NAME_MAX_LEN);
 
-        if (tp_str) {
-            bpf_dbg_printk("written TP to TCP options: %s", tp_str);
+    const long ret = bpf_store_hdr_opt(skops, &opt, sizeof(opt), 0);
+    if (ret == 0) {
+        bpf_sk_storage_delete(&sk_svc_name_map, sk); // emitted once per connection
+        if (g_bpf_debug) {
+            bpf_dbg_printk("wrote svc-name TCP option (len=%d)", st->name.len);
         }
+    } else {
+        bpf_dbg_printk("failed to store svc-name option, will retry: %d", ret);
     }
 }
 
-static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops) {
-    if (!(inject_flags & k_inject_tcp_options)) {
-        return;
-    }
-
+// Parse the kind-25 trace option carried on request segments (unchanged behaviour).
+static __always_inline void parse_trace_hdr_opt(struct bpf_sock_ops *skops) {
     struct tp_option opt = {};
     opt.kind = k_tcp_option_kind_otel;
 
@@ -622,6 +697,56 @@ static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops
 
     dbg_print_http_connection_info(&conn);
     bpf_map_update_elem(&incoming_trace_map, &conn, &tp, BPF_ANY);
+}
+
+// EXPERIMENTAL — parse the kind-26 service-name option a peer wrote on a segment
+// it sent (a client reading it off a response). Stores the peer's name keyed by
+// the sorted connection, for the client-span producer to pick up.
+static __always_inline void parse_svc_name_hdr_opt(struct bpf_sock_ops *skops) {
+    struct svc_name_option opt = {};
+    opt.kind = k_tcp_option_kind_svc_name;
+
+    const long ret = bpf_load_hdr_opt(skops, &opt, sizeof(opt), 0);
+    if (ret < 0) {
+        return; // -ENOMSG on the common path (no name option present)
+    }
+
+    if (opt.version != k_svc_name_option_version) {
+        return;
+    }
+
+    svc_name_value_t val = {};
+    // Trust the wire only up to the fixed field width; find the NUL-free length.
+    u8 n = 0;
+#pragma unroll
+    for (u8 i = 0; i < K_SVC_NAME_MAX_LEN; i++) {
+        if (opt.name[i] == 0) {
+            break;
+        }
+        n++;
+    }
+    if (n == 0) {
+        return;
+    }
+    __builtin_memcpy(val.name, opt.name, K_SVC_NAME_MAX_LEN);
+    val.len = n;
+
+    connection_info_t conn = get_connection_info_ops(skops);
+    sort_connection_info(&conn);
+    bpf_map_update_elem(&svc_peer_name_map, &conn, &val, BPF_ANY);
+
+    if (g_bpf_debug) {
+        bpf_dbg_printk("parsed peer svc-name from TCP option (len=%d)", n);
+    }
+}
+
+static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops) {
+    if (!(inject_flags & k_inject_tcp_options)) {
+        return;
+    }
+
+    parse_trace_hdr_opt(skops);
+    parse_svc_name_hdr_opt(skops);
 }
 
 // Tracks all outgoing sockets (BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB)
@@ -1093,6 +1218,42 @@ static __always_inline bool handle_existing_tp_pid(struct sk_msg_md *msg,
     return false;
 }
 
+// EXPERIMENTAL — service-name propagation, write scheduling.
+// Runs on every sk_msg send. On a SERVER (passive) socket it resolves the writing
+// process's local service.name (from the user-space-populated svc_name_by_pid map)
+// and stages it so the sockops write callbacks emit the kind-26 option on the
+// response. Returns true for server sockets: the caller must then NOT run the
+// client-oriented traceparent logic (which is only correct for outgoing requests).
+// Client sockets have no sk_svc_name_map entry, so they return false and the
+// existing request path is untouched.
+static __always_inline bool schedule_service_name_option(struct sk_msg_md *msg, u64 id) {
+    struct bpf_sock *sk = msg->sk;
+    if (!sk) {
+        return false;
+    }
+
+    sk_svc_name_state_t *st = bpf_sk_storage_get(&sk_svc_name_map, sk, NULL, 0);
+    if (!st) {
+        return false; // not a server socket
+    }
+
+    if (st->state == k_svc_state_server_pending) {
+        const u32 pid = pid_from_pid_tgid(id);
+        const svc_name_value_t *name = bpf_map_lookup_elem(&svc_name_by_pid, &pid);
+        if (name && name->len > 0 && name->len <= K_SVC_NAME_MAX_LEN) {
+            __builtin_memcpy(st->name.name, name->name, K_SVC_NAME_MAX_LEN);
+            st->name.len = name->len;
+            st->state = k_svc_state_ready;
+            if (g_bpf_debug) {
+                bpf_dbg_printk("staged local svc-name for response pid=%d len=%d", pid, name->len);
+            }
+        }
+        // Name unknown yet: leave pending; a later response segment retries.
+    }
+
+    return true; // server socket — skip client traceparent logic
+}
+
 // Sock_msg program which detects packets where it should add space for
 // the 'Traceparent' string. It extends the HTTP header and writes the
 // Traceparent string.
@@ -1122,6 +1283,12 @@ int obi_packet_extender(struct sk_msg_md *msg) {
     t_ctx->h2_frames = 0;
     t_ctx->h2_tp_retries = 0;
     t_ctx->go_grpc_conn = false;
+
+    // EXPERIMENTAL — service-name propagation. Server sockets only stage their own
+    // name here and return; they must not run the client request logic below.
+    if (schedule_service_name_option(msg, id)) {
+        return SK_PASS;
+    }
 
     // skip H2 here — it uses HPACK for per-stream traceparents
     tp_info_pid_t *tp_pid = get_tp_info_pid(&e_key);
