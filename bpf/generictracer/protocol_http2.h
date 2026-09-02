@@ -462,7 +462,15 @@ handle_headers_frame(void *ctx, grpc_frames_ctx_t *g_ctx, const frame_header_t *
             http2_poison_hpack(&g_ctx->stream, &g_ctx->prev_info, poison);
         }
 
-        if (http_grpc_stream_ended(frame)) {
+        // Emit the exchange at the response HEADERS frame directly, rather than
+        // deferring to the terminating DATA frame through the single shared
+        // saved_buf_pos slot. In a multiplexed response block (H(s1) H(s3) D(s1)
+        // D(s3)) a later stream's HEADERS overwrites that slot before the earlier
+        // stream's DATA arrives, so deferring drops every stream but the last.
+        // The plain-HTTP/2 :status lives in this response HEADERS frame, and the
+        // ret_data captured from this position still contains any trailing
+        // gRPC-status frame within the buffer, so both protocols decode here.
+        if (response || http_grpc_stream_ended(frame)) {
             if (h2_next_frame_changes_hpack(g_ctx, frame)) {
                 http2_poison_hpack(&g_ctx->stream, &g_ctx->prev_info, poison);
             }
@@ -796,6 +804,12 @@ int GUARDED_PROG(obi_protocol_http2_grpc_handle_end_frame, void *, ctx) {
         http2_grpc_end(&g_ctx->stream, &g_ctx->prev_info, offset);
 
         bpf_map_delete_elem(&active_ssl_connections, &g_ctx->args.pid_conn);
+
+        // This stream's exchange is complete: drop the per-stream latch so the
+        // resumed scan looks up the next stream fresh, and the DATA end-frame
+        // path below cannot re-emit this same stream.
+        g_ctx->has_prev_info = 0;
+        g_ctx->saved_stream_id = 0;
     } else {
         // Wrong-direction end flag (e.g. a CLIENT request's own HEADERS
         // carries END_STREAM=1). Keep ongoing_http2_grpc so the correct
