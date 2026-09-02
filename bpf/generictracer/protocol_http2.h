@@ -466,6 +466,9 @@ handle_headers_frame(void *ctx, grpc_frames_ctx_t *g_ctx, const frame_header_t *
             if (h2_next_frame_changes_hpack(g_ctx, frame)) {
                 http2_poison_hpack(&g_ctx->stream, &g_ctx->prev_info, poison);
             }
+            // resume the scan after end_frame so other multiplexed streams
+            // in this buffer are still processed
+            g_ctx->resume_pos = g_ctx->pos + frame->length + k_frame_header_len;
             preempt_guarded_tail_call(
                 ctx, &jump_table, k_tail_protocol_http2_grpc_handle_end_frame);
             return 0; // normally unreachable
@@ -483,6 +486,9 @@ handle_headers_frame(void *ctx, grpc_frames_ctx_t *g_ctx, const frame_header_t *
             if (h2_next_frame_changes_hpack(g_ctx, frame)) {
                 http2_poison_hpack(&g_ctx->stream, 0, h2_hpack_req_unreliable);
             }
+            // resume the scan after start_frame registers this stream so the
+            // other multiplexed streams in this buffer also get registered
+            g_ctx->resume_pos = g_ctx->pos + frame->length + k_frame_header_len;
             preempt_guarded_tail_call(
                 ctx, &jump_table, k_tail_protocol_http2_grpc_handle_start_frame);
             return 0; // normally unreachable
@@ -490,6 +496,22 @@ handle_headers_frame(void *ctx, grpc_frames_ctx_t *g_ctx, const frame_header_t *
     }
 
     return 1;
+}
+
+// Total frames the scan walks across the unrolled loop + tail-call recursion,
+// mirroring k_max_loop_iterations * k_loop_count in the frames program below.
+enum { k_h2_frame_scan_max_iterations = 12 };
+
+// resume_frame_scan hands control back to the frame scan after a per-frame
+// handler was tail-called, so the remaining multiplexed streams in the same
+// buffer are processed too (instead of the scan ending on the first stream).
+// The caller must have set g_ctx->resume_pos to the offset past its frame.
+static __always_inline void resume_frame_scan(void *ctx, grpc_frames_ctx_t *g_ctx) {
+    g_ctx->pos = g_ctx->resume_pos;
+    if (!g_ctx->terminate_search && g_ctx->pos < g_ctx->args.bytes_len &&
+        g_ctx->iterations < k_h2_frame_scan_max_iterations) {
+        preempt_guarded_tail_call(ctx, &jump_table, k_tail_protocol_http2_grpc_frames);
+    }
 }
 
 static __always_inline void handle_data_frame(void *ctx, grpc_frames_ctx_t *g_ctx) {
@@ -530,6 +552,9 @@ int GUARDED_PROG(obi_protocol_http2_grpc_handle_start_frame, void *, ctx) {
     http2_grpc_start(
         ctx, &g_ctx->stream, offset, args->bytes_len, args->direction, args->ssl, args->orig_dport);
 
+    // reached only on the client path (the server path tail-calls away inside
+    // http2_grpc_start); continue scanning the remaining multiplexed streams
+    resume_frame_scan(ctx, g_ctx);
     return 0;
 }
 
@@ -743,6 +768,9 @@ int GUARDED_PROG(obi_protocol_http2_grpc_handle_start_frame_server_commit, void 
     http2_grpc_start_finalize_server(
         &g_ctx->stream, h2g_info, tp_p, found_tp, g_ctx->args.ssl, g_ctx->args.orig_dport);
 
+    // server request registered; continue scanning the remaining multiplexed
+    // request streams in this buffer
+    resume_frame_scan(ctx, g_ctx);
     return 0;
 }
 
@@ -778,6 +806,8 @@ int GUARDED_PROG(obi_protocol_http2_grpc_handle_end_frame, void *, ctx) {
                        g_ctx->prev_info.type);
     }
 
+    // continue scanning the remaining multiplexed streams in this buffer
+    resume_frame_scan(ctx, g_ctx);
     return 0;
 }
 
@@ -829,6 +859,19 @@ int GUARDED_PROG(obi_protocol_http2_grpc_frames, void *, ctx) {
 
         if (is_data_frame(&frame)) {
             g_ctx->found_data_frame = 1;
+            // Close the stream at its own DATA end-frame (per-stream), then
+            // resume the scan. Without this, multiplexed responses grouped in
+            // one buffer (H(s1)D(s1) H(s3)D(s3)) all funnel through the single
+            // saved slot and only the last stream is emitted.
+            if (http_grpc_stream_ended(&frame) && g_ctx->has_prev_info &&
+                g_ctx->saved_stream_id == frame.stream_id) {
+                g_ctx->stream.pid_conn = g_ctx->args.pid_conn;
+                g_ctx->stream.stream_id = g_ctx->saved_stream_id;
+                g_ctx->resume_pos = g_ctx->pos + frame.length + k_frame_header_len;
+                preempt_guarded_tail_call(
+                    ctx, &jump_table, k_tail_protocol_http2_grpc_handle_end_frame);
+                return 0; // resumes via end_frame
+            }
         }
 
         if (is_invalid_frame(&frame)) {
