@@ -119,7 +119,7 @@ func HTTPRequestTraceToSpan(parseCtx *EBPFParseContext, trace *HTTPRequestTrace)
 	// This is a fallback: the dedicated S3/SQS parsers in enrichedGoHTTPSpan need
 	// response headers/body and take precedence, so skip when they already matched.
 	if trace.AwsReqHeadLen > 0 && parseCtx != nil && parseCtx.payloadExtraction.HTTP.AWS.Enabled &&
-		isClientEvent(uint8(trace.Type)) &&
+		isClientEvent(trace.Type) &&
 		span.SubType != request.HTTPSubtypeAWSS3 && span.SubType != request.HTTPSubtypeAWSSQS {
 		head := trace.AwsReqHead[:]
 		if n := int(trace.AwsReqHeadLen); n < len(head) {

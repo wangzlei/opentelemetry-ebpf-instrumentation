@@ -4,6 +4,7 @@
 package ebpfcommon
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -14,10 +15,7 @@ import (
 // reqHead builds a raw HTTP request head, zero-padded to 256 bytes to mimic the
 // eBPF FULL_BUF_SIZE inline buffer (which is truncated and NUL-padded).
 func reqHead(line string, headers ...string) []byte {
-	s := line + "\r\n"
-	for _, h := range headers {
-		s += h + "\r\n"
-	}
+	s := strings.Join(append([]string{line}, headers...), "\r\n") + "\r\n"
 	b := make([]byte, 256)
 	copy(b, s)
 	return b

@@ -385,20 +385,20 @@ func TestHTTPRequestToSpanMethodFromSSLBuffer(t *testing.T) {
 
 	t.Run("short request line is enough to recover the method", func(t *testing.T) {
 		event := newSSLEvent([]uint8("GET /greeting HTTP/1.1\r\n"))
-		span := httpRequestToSpan(event, largebuf.NewLargeBufferFrom(event.Buf[:]))
+		span := httpRequestToSpan(nil, event, largebuf.NewLargeBufferFrom(event.Buf[:]))
 		assert.Equal(t, "GET", span.Method)
 		assert.Equal(t, "/greeting", span.Path)
 	})
 
 	t.Run("minimal method token still recovers the method", func(t *testing.T) {
 		event := newSSLEvent([]uint8("GET /"))
-		span := httpRequestToSpan(event, largebuf.NewLargeBufferFrom(event.Buf[:]))
+		span := httpRequestToSpan(nil, event, largebuf.NewLargeBufferFrom(event.Buf[:]))
 		assert.Equal(t, "GET", span.Method)
 	})
 
 	t.Run("zeroed buffer yields empty method", func(t *testing.T) {
 		event := newSSLEvent(nil)
-		span := httpRequestToSpan(event, largebuf.NewLargeBufferFrom(event.Buf[:]))
+		span := httpRequestToSpan(nil, event, largebuf.NewLargeBufferFrom(event.Buf[:]))
 		assert.Empty(t, span.Method)
 	})
 }
