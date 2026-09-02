@@ -96,8 +96,38 @@ func HTTPRequestTraceToSpan(parseCtx *EBPFParseContext, trace *HTTPRequestTrace)
 		SubType:   subType,
 	}
 
+	// EXPERIMENTAL — TCP service-name propagation: downstream service name learned
+	// from a kind-26 TCP option the peer wrote on the response (see
+	// bpf/maps/svc_peer_name_map.h). Set before enrichment so it survives regardless
+	// of which path builds the final span.
+	if trace.PeerServiceNameLen > 0 {
+		n := int(trace.PeerServiceNameLen)
+		if n > len(trace.PeerServiceName) {
+			n = len(trace.PeerServiceName)
+		}
+		span.PeerServiceName = string(trace.PeerServiceName[:n])
+	}
+
 	if parseCtx != nil && parseCtx.payloadExtraction.Enabled() && (!span.IsClientSpan() || !parseCtx.defersGoHTTPClientRequests()) {
 		span = enrichedGoHTTPSpan(parseCtx, trace.Conn, &span)
+	}
+
+	// AWS SDK identification for Go clients from the raw request head. The struct
+	// fields above carry no headers, so the kernel hands the head over separately
+	// (crypto/tls probe -- see bpf/gotracer/maps/go_aws_req_head.h); without it
+	// AWS-JSON/RPC operations, which live in X-Amz-Target, are unreachable here.
+	// This is a fallback: the dedicated S3/SQS parsers in enrichedGoHTTPSpan need
+	// response headers/body and take precedence, so skip when they already matched.
+	if trace.AwsReqHeadLen > 0 && parseCtx != nil && parseCtx.payloadExtraction.HTTP.AWS.Enabled &&
+		isClientEvent(trace.Type) &&
+		span.SubType != request.HTTPSubtypeAWSS3 && span.SubType != request.HTTPSubtypeAWSSQS {
+		head := trace.AwsReqHead[:]
+		if n := int(trace.AwsReqHeadLen); n < len(head) {
+			head = head[:n]
+		}
+		if s, ok := ebpfhttp.AWSGenericSpan(&span, head, origHost); ok {
+			return s
+		}
 	}
 
 	return span

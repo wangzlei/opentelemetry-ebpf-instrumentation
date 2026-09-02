@@ -486,6 +486,16 @@ func (p *Tracer) constants() map[string]any {
 	}
 
 	m["http_max_captured_bytes"] = p.cfg.BufferSizes.HTTP
+
+	// Gates the hand-off of the raw request head from the crypto/tls probe to the
+	// roundTrip probe (bpf/gotracer/maps/go_aws_req_head.h). Off => the verifier
+	// strips the capture entirely, so it costs nothing when AWS parsing is unused.
+	if p.cfg.PayloadExtraction.HTTP.AWS.Enabled {
+		m["http_aws_semantics"] = uint32(1)
+	} else {
+		m["http_aws_semantics"] = uint32(0)
+	}
+
 	m["tcp_max_captured_bytes"] = p.cfg.BufferSizes.TCP
 	m["mysql_max_captured_bytes"] = p.cfg.BufferSizes.MySQL
 	m["kafka_max_captured_bytes"] = p.cfg.BufferSizes.Kafka

@@ -94,7 +94,21 @@ func httpInfoToSpanLegacy(info *HTTPInfo) request.Span {
 			Namespace: info.Pid.Ns,
 		},
 		Statement: scheme + request.SchemeHostSeparator + info.HeaderHost,
+		// EXPERIMENTAL — TCP service-name propagation: downstream service name the
+		// peer wrote on the response TCP option (client spans only; empty otherwise).
+		PeerServiceName: peerSvcNameFromInfo(&info.BPFHTTPInfo),
 	}
+}
+
+// peerSvcNameFromInfo extracts the NUL-free service name the kernel copied from
+// the kind-26 TCP option (EXPERIMENTAL — TCP service-name propagation). Takes the
+// embedded BPF struct so both the legacy and large-buffer span builders can use it.
+func peerSvcNameFromInfo(info *BPFHTTPInfo) string {
+	n := int(info.PeerServiceNameLen)
+	if n <= 0 || n > len(info.PeerServiceName) {
+		return ""
+	}
+	return string(info.PeerServiceName[:n])
 }
 
 func httpRequestResponseToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo, req *http.Request, resp *http.Response) request.Span {
@@ -158,6 +172,8 @@ func httpRequestResponseToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo, r
 			Namespace: event.Pid.Ns,
 		},
 		Statement: scheme + request.SchemeHostSeparator + headerHost,
+		// EXPERIMENTAL — TCP service-name propagation (large-buffer path).
+		PeerServiceName: peerSvcNameFromInfo(event),
 	}
 
 	return postProcessHTTPSpan(parseCtx, &httpSpan, req, resp)
@@ -346,12 +362,12 @@ func HTTPInfoEventToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo) (reques
 	if parseCtx != nil && !parseCtx.payloadExtraction.Enabled() {
 		// There's no need to parse HTTP headers/body,
 		// create the span directly.
-		return httpRequestToSpan(event, requestBuffer), false, nil
+		return httpRequestToSpan(parseCtx, event, requestBuffer), false, nil
 	}
 
 	if !hasResponse {
 		// Large buffers disabled
-		return httpRequestToSpan(event, requestBuffer), false, nil
+		return httpRequestToSpan(parseCtx, event, requestBuffer), false, nil
 	}
 
 	// http.ReadRequest requires a *bufio.Reader; that one allocation is unavoidable.
@@ -360,7 +376,7 @@ func HTTPInfoEventToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo) (reques
 	resp, err2 := httpSafeParseResponse(responseBuffer, req)
 	if err != nil || err2 != nil {
 		slog.Debug("error while parsing http request or response, falling back to manual HTTP info parsing", "reqErr", err, "respErr", err2)
-		return httpRequestToSpan(event, requestBuffer), false, nil
+		return httpRequestToSpan(parseCtx, event, requestBuffer), false, nil
 	}
 
 	// When the body is empty but Content-Length indicates data should be
@@ -537,7 +553,7 @@ func dechunkBody(data []byte) []byte {
 	return result
 }
 
-func httpRequestToSpan(event *BPFHTTPInfo, requestBuffer *largebuf.LargeBuffer) request.Span {
+func httpRequestToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo, requestBuffer *largebuf.LargeBuffer) request.Span {
 	var (
 		result     = HTTPInfo{BPFHTTPInfo: *event}
 		bufHost    string
@@ -571,7 +587,25 @@ func httpRequestToSpan(event *BPFHTTPInfo, requestBuffer *largebuf.LargeBuffer) 
 
 	result.HeaderHost = bufHost
 
-	return httpInfoToSpanLegacy(&result)
+	span := httpInfoToSpanLegacy(&result)
+
+	// Generic AWS SDK identification from the request head only. This runs on
+	// the path where large buffers are absent, so it costs nothing extra: the
+	// 256B inline buffer is captured for every request anyway. The dedicated
+	// S3/SQS parsers (which need response headers and the body) still take
+	// precedence when large buffers are enabled -- see the AWS block in
+	// httpRequestResponseToSpan.
+	if isClientEvent(event.Type) && parseCtx != nil && parseCtx.payloadExtraction.HTTP.AWS.Enabled {
+		host := result.HeaderHost
+		if host == "" {
+			host = result.Host
+		}
+		if s, ok := ebpfhttp.AWSGenericSpan(&span, raw, host); ok {
+			return s
+		}
+	}
+
+	return span
 }
 
 func httpURLFromBuf(req []byte) string {
