@@ -1,0 +1,151 @@
+name: Build artifacts (obi + collector)
+
+# Builds usable artifacts from a fork work branch:
+#  - obi eBPF agent: multi-arch image to GHCR + raw `obi` binary artifact
+#  - OTel Collector (with the OBI receiver): image to GHCR + raw `otelcol` binary
+# Images use the built-in GITHUB_TOKEN (no extra secrets). Tags are branch-scoped
+# (the sanitized ref name) so a work branch never overwrites another branch's tags.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [fix/http2-multiplex]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  OBI_IMAGE: ghcr.io/${{ github.repository_owner }}/obi
+  COLLECTOR_IMAGE: ghcr.io/${{ github.repository_owner }}/obi-collector
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "go.mod"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags
+        id: tags
+        run: |
+          echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "slug=${GITHUB_REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
+
+      # ---------- OBI agent ----------
+      - name: Build OBI image
+        run: |
+          docker buildx build \
+            --platform linux/${{ matrix.arch }} \
+            --build-arg RELEASE_VERSION=${{ steps.tags.outputs.slug }} \
+            --build-arg RELEASE_REVISION=${{ steps.tags.outputs.short }} \
+            -t "$OBI_IMAGE:${{ steps.tags.outputs.slug }}-${{ steps.tags.outputs.short }}-${{ matrix.arch }}" \
+            -t "$OBI_IMAGE:${{ steps.tags.outputs.slug }}-${{ matrix.arch }}" \
+            --load -f Dockerfile .
+
+      - name: Push OBI image
+        run: |
+          docker push "$OBI_IMAGE:${{ steps.tags.outputs.slug }}-${{ steps.tags.outputs.short }}-${{ matrix.arch }}"
+          docker push "$OBI_IMAGE:${{ steps.tags.outputs.slug }}-${{ matrix.arch }}"
+
+      - name: Extract obi binary
+        run: |
+          cid=$(docker create "$OBI_IMAGE:${{ steps.tags.outputs.slug }}-${{ matrix.arch }}")
+          docker cp "$cid:/obi" "./obi"
+          docker rm "$cid"
+
+      - name: Upload obi binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: obi-linux-${{ matrix.arch }}
+          path: ./obi
+          if-no-files-found: error
+
+      # ---------- OTel Collector (with OBI receiver) ----------
+      - name: Generate BPF bindings
+        run: make docker-generate
+
+      - name: Generate collector source (ocb)
+        working-directory: examples/otel-collector
+        run: |
+          version=$(grep -E '^[[:space:]]*go\.opentelemetry\.io/collector v[0-9]' ../../go.mod | awk '{print $2}')
+          echo "ocb version: $version"
+          go install go.opentelemetry.io/collector/cmd/builder@"$version"
+          "$(go env GOPATH)/bin/builder" --skip-compilation --config ./builder-config.yaml
+
+      - name: Build collector image
+        run: |
+          docker buildx build \
+            --platform linux/${{ matrix.arch }} \
+            -t "$COLLECTOR_IMAGE:${{ steps.tags.outputs.slug }}-${{ steps.tags.outputs.short }}-${{ matrix.arch }}" \
+            -t "$COLLECTOR_IMAGE:${{ steps.tags.outputs.slug }}-${{ matrix.arch }}" \
+            --load -f examples/otel-collector/Dockerfile .
+
+      - name: Push collector image
+        run: |
+          docker push "$COLLECTOR_IMAGE:${{ steps.tags.outputs.slug }}-${{ steps.tags.outputs.short }}-${{ matrix.arch }}"
+          docker push "$COLLECTOR_IMAGE:${{ steps.tags.outputs.slug }}-${{ matrix.arch }}"
+
+      - name: Extract otelcol binary
+        run: |
+          cid=$(docker create "$COLLECTOR_IMAGE:${{ steps.tags.outputs.slug }}-${{ matrix.arch }}")
+          docker cp "$cid:/otelcol" "./otelcol"
+          docker rm "$cid"
+
+      - name: Upload otelcol binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: otelcol-linux-${{ matrix.arch }}
+          path: ./otelcol
+          if-no-files-found: error
+
+  manifest:
+    name: Multi-arch manifests
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags
+        id: tags
+        run: |
+          echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "slug=${GITHUB_REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
+
+      - name: Create multi-arch manifests
+        run: |
+          for img in "$OBI_IMAGE" "$COLLECTOR_IMAGE"; do
+            for tag in "${{ steps.tags.outputs.slug }}-${{ steps.tags.outputs.short }}" "${{ steps.tags.outputs.slug }}"; do
+              docker buildx imagetools create -t "$img:$tag" \
+                "$img:${{ steps.tags.outputs.slug }}-${{ steps.tags.outputs.short }}-amd64" \
+                "$img:${{ steps.tags.outputs.slug }}-${{ steps.tags.outputs.short }}-arm64"
+            done
+          done
