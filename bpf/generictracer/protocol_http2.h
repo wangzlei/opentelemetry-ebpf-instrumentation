@@ -878,19 +878,6 @@ int GUARDED_PROG(obi_protocol_http2_grpc_frames, void *, ctx) {
 
         if (is_data_frame(&frame)) {
             g_ctx->found_data_frame = 1;
-            // Close the stream at its own DATA end-frame (per-stream), then
-            // resume the scan. Without this, multiplexed responses grouped in
-            // one buffer (H(s1)D(s1) H(s3)D(s3)) all funnel through the single
-            // saved slot and only the last stream is emitted.
-            if (http_grpc_stream_ended(&frame) && g_ctx->has_prev_info &&
-                g_ctx->saved_stream_id == frame.stream_id) {
-                g_ctx->stream.pid_conn = g_ctx->args.pid_conn;
-                g_ctx->stream.stream_id = g_ctx->saved_stream_id;
-                g_ctx->resume_pos = g_ctx->pos + frame.length + k_frame_header_len;
-                preempt_guarded_tail_call(
-                    ctx, &jump_table, k_tail_protocol_http2_grpc_handle_end_frame);
-                return 0; // resumes via end_frame
-            }
         }
 
         if (is_invalid_frame(&frame)) {
