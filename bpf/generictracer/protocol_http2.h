@@ -471,10 +471,14 @@ handle_headers_frame(void *ctx, grpc_frames_ctx_t *g_ctx, const frame_header_t *
         // ret_data captured from this position still contains any trailing
         // gRPC-status frame within the buffer, so both protocols decode here.
         if (response || http_grpc_stream_ended(frame)) {
-            // EXPERIMENT: do not poison on a following HEADERS frame. The scan
-            // now processes every frame in this buffer in wire order, so the
-            // userspace response HPACK decoder stays synced across multiplexed
-            // streams and dynamic-indexed :status resolves correctly.
+            // No h2_next_frame_changes_hpack poison here: the scan now processes
+            // every frame in this buffer in wire order (resume_frame_scan), so
+            // the userspace response HPACK decoder stays synced across the
+            // multiplexed streams and dynamic-indexed :status resolves. The
+            // beyond-budget case (more frames than the iteration budget can
+            // reach) is still marked unreliable by the end-of-scan poison in the
+            // frames loop, and the decoder freezes dynamic lookups on the first
+            // bad index, so a desync yields status 0 rather than a wrong value.
             // resume the scan after end_frame so other multiplexed streams
             // in this buffer are still processed
             g_ctx->resume_pos = g_ctx->pos + frame->length + k_frame_header_len;
