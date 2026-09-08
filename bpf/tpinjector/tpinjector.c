@@ -1286,7 +1286,13 @@ int obi_packet_extender(struct sk_msg_md *msg) {
 
     // EXPERIMENTAL — service-name propagation. Server sockets only stage their own
     // name here and return; they must not run the client request logic below.
+    // Pull the data before returning: a socket in sock_dir sends via the sk_psock
+    // path, and an SK_PASS that leaves the data unpulled bypasses the generic
+    // tracer's egress capture of the response (plaintext HTTP/1 -> status 499).
+    // Pulling keeps the response on the path the tracer observes, matching the
+    // client request logic below.
     if (schedule_service_name_option(msg, id)) {
+        bpf_msg_pull_data(msg, 0, msg->size, 0);
         return SK_PASS;
     }
 

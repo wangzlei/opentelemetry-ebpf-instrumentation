@@ -26,6 +26,9 @@ processors:
   # CloudWatch OTLP requires DELTA temporality; convert if OBI emits cumulative.
   - gomod:
       github.com/open-telemetry/opentelemetry-collector-contrib/processor/cumulativetodeltaprocessor v0.151.0
+  # Rename/derive AWS-flavored resource attributes (ec2.instance.id, aws.*, host.ip).
+  - gomod:
+      github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor v0.151.0
 
 receivers:
   - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.151.0
