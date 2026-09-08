@@ -559,7 +559,11 @@ static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *sko
     // client-side traceparent logic. PID is not reliably available here (passive
     // established runs in softirq), so the name is resolved later, in sk_msg.
     const u64 cookie = bpf_get_socket_cookie(skops);
-    bpf_sock_hash_update(skops, &sock_dir, (void *)&cookie, BPF_ANY);
+    // DIAGNOSTIC: passive sockets intentionally NOT added to sock_dir. Routing
+    // server responses through the sk_psock path breaks the generic tracer's
+    // egress capture (plaintext HTTP/1 -> status 499). Testing whether removing
+    // this restores response capture.
+    (void)cookie;
     bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG);
 
     struct bpf_sock *sk = skops->sk;
@@ -1286,13 +1290,7 @@ int obi_packet_extender(struct sk_msg_md *msg) {
 
     // EXPERIMENTAL — service-name propagation. Server sockets only stage their own
     // name here and return; they must not run the client request logic below.
-    // Pull the data before returning: a socket in sock_dir sends via the sk_psock
-    // path, and an SK_PASS that leaves the data unpulled bypasses the generic
-    // tracer's egress capture of the response (plaintext HTTP/1 -> status 499).
-    // Pulling keeps the response on the path the tracer observes, matching the
-    // client request logic below.
     if (schedule_service_name_option(msg, id)) {
-        bpf_msg_pull_data(msg, 0, msg->size, 0);
         return SK_PASS;
     }
 
