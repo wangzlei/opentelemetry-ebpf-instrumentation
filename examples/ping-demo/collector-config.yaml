@@ -1,0 +1,144 @@
+extensions:
+  # SigV4 signer for the CloudWatch Metrics OTLP endpoint (service "monitoring").
+  sigv4auth:
+    region: us-west-2
+    service: monitoring
+  # SigV4 signer for the CloudWatch/X-Ray traces OTLP endpoint (service "xray").
+  sigv4auth/xray:
+    region: us-west-2
+    service: xray
+
+receivers:
+  obi:
+    open_port: "8000"
+    log_level: INFO
+    ebpf:
+      context_propagation: "all"
+      bpf_fs_base_dir: /sys/fs/bpf
+    metrics:
+      features: "application"
+
+connectors:
+  # Span-derived RED. One connector per span kind so each emits a single semconv
+  # metric name via its namespace: <namespace>.duration => http.server.request.duration.
+  spanmetrics/server:
+    namespace: http.server.request
+    histogram:
+      unit: s
+      explicit:
+        buckets: [5ms, 10ms, 25ms, 50ms, 75ms, 100ms, 250ms, 500ms, 750ms, 1s, 2500ms, 5s, 7500ms, 10s]
+    dimensions:
+      - {name: http.request.method}
+      - {name: http.route}
+      - {name: http.response.status_code}
+      - {name: url.scheme}
+  spanmetrics/client:
+    namespace: http.client.request
+    histogram:
+      unit: s
+      explicit:
+        buckets: [5ms, 10ms, 25ms, 50ms, 75ms, 100ms, 250ms, 500ms, 750ms, 1s, 2500ms, 5s, 7500ms, 10s]
+    dimensions:
+      - {name: http.request.method}
+      - {name: http.route}
+      - {name: http.response.status_code}
+      - {name: url.scheme}
+      - {name: server.address}
+      - {name: server.port}
+      - {name: peer.service.name}   # downstream service name from the kind-26 TCP option
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+  cumulativetodelta: {}
+
+  # AWS-flavored resource attributes. OBI's EC2 detection sets host.id /
+  # cloud.account.id / cloud.region; copy to the requested keys + derive host.ip.
+  # Applied on the spans that feed spanmetrics, so the metrics inherit them.
+  transform/aws:
+    trace_statements:
+      - context: resource
+        statements:
+          - set(attributes["ec2.instance.id"], attributes["host.id"]) where attributes["host.id"] != nil
+          - set(attributes["aws.account.id"], attributes["cloud.account.id"]) where attributes["cloud.account.id"] != nil
+          - set(attributes["aws.region"], attributes["cloud.region"]) where attributes["cloud.region"] != nil
+          - set(attributes["host.ip"], attributes["host.name"]) where attributes["host.name"] != nil
+          - replace_pattern(attributes["host.ip"], "^ip-([0-9]+)-([0-9]+)-([0-9]+)-([0-9]+).*$", "$$1.$$2.$$3.$$4") where attributes["host.ip"] != nil
+
+  # Keep only one span kind per spanmetrics pipeline (drop-when-true).
+  filter/server:
+    error_mode: ignore
+    traces:
+      span:
+        - 'kind.string != "Server"'
+  filter/client:
+    error_mode: ignore
+    traces:
+      span:
+        - 'kind.string != "Client"'
+
+  # Strip spanmetrics' baked-in dimensions so the metric matches OBI's native attrs.
+  transform/strip:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - delete_key(attributes, "span.name")
+          - delete_key(attributes, "span.kind")
+          - delete_key(attributes, "status.code")
+
+  # Drop the redundant spanmetrics calls counter (duration histogram carries count).
+  filter/calls:
+    error_mode: ignore
+    metrics:
+      metric:
+        - 'IsMatch(name, ".*\\.calls(\\.total)?$")'
+
+exporters:
+  debug:
+    verbosity: normal
+  otlphttp/cloudwatch:
+    endpoint: https://monitoring.us-west-2.amazonaws.com
+    compression: gzip
+    auth:
+      authenticator: sigv4auth
+  otlphttp/xray:
+    endpoint: https://xray.us-west-2.amazonaws.com
+    compression: gzip
+    auth:
+      authenticator: sigv4auth/xray
+
+service:
+  extensions: [sigv4auth, sigv4auth/xray]
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    # All spans → X-Ray (unfiltered), with AWS resource attrs.
+    traces/xray:
+      receivers: [obi]
+      processors: [transform/aws, batch]
+      exporters: [otlphttp/xray, debug]
+    # Server spans → spanmetrics/server (http.server.request.duration).
+    traces/sm-server:
+      receivers: [obi]
+      processors: [transform/aws, filter/server, batch]
+      exporters: [spanmetrics/server]
+    # Client spans → spanmetrics/client (http.client.request.duration + peer.service.name).
+    traces/sm-client:
+      receivers: [obi]
+      processors: [transform/aws, filter/client, batch]
+      exporters: [spanmetrics/client]
+    # Span-derived RED → CloudWatch (replaces OBI native RED; same metric names).
+    metrics:
+      receivers: [spanmetrics/server, spanmetrics/client]
+      processors: [transform/strip, filter/calls, cumulativetodelta, batch]
+      exporters: [otlphttp/cloudwatch, debug]
