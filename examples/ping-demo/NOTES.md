@@ -1,9 +1,8 @@
-# ping demo — OBI collector notes
+# ping demo
 
-Session notes for the "ping" demo built on this branch (`demo/ping`). A 4-service
-RED topology instrumented by OBI, with metrics to CloudWatch and traces to X-Ray.
-`collector-config.yaml` in this folder is the runtime config the OBI-as-receiver
-collector is launched with (mounted at `/etc/otelcol/config.yaml`).
+A small 4-service HTTP app for exercising OBI's RED metrics, distributed traces,
+and the experimental TCP-option `peer.service.name` propagation — end to end into
+Amazon CloudWatch (metrics) and AWS X-Ray (traces).
 
 ## Topology
 
@@ -12,78 +11,90 @@ checkout ──POST /charges──▶ payment ──POST /audit──▶ audit  
    └───────POST /reservations──▶ inventory                   (leaf)
 ```
 
-Four Flask+gunicorn services (one codebase, role via `$ROLE`, health profile via
-`$PROFILE`). Deployed one-service-per-host on 8 x86 EC2 (checkout×1, payment×3,
-inventory×1, audit×3); each host runs its own OBI collector (host-net, privileged,
-`context_propagation: all`). Discovery is method-2: a Route53 private zone
-(`ping.internal`) with multivalue A records for payment/audit.
+`app/server.py` is one Flask+gunicorn codebase; each instance's behaviour is set
+by env vars, so the same image runs every role.
 
-## What this collector config does
+| env | meaning |
+|---|---|
+| `ROLE` | `checkout` / `payment` / `inventory` / `audit` — selects the served route and downstream calls |
+| `PROFILE` | `healthy` / `degraded` / `erroring` / `faulty` — status-code mix + latency of this service's own responses |
+| `PAYMENT_URLS` / `INVENTORY_URLS` / `AUDIT_URLS` | comma-separated downstream base URLs (a DNS name is fine — see Discovery) |
+| `USE_TLS` | `1` serves HTTPS with a self-signed cert (demo only) |
+| `PORT` | listen port (default 8000) |
 
-- **OBI receiver** (`open_port: 8000`, `features: application`) auto-instruments
-  the local Python service.
-- **traces/xray**: all spans → CloudWatch/X-Ray OTLP
-  (`https://xray.<region>.amazonaws.com/v1/traces`, SigV4 service `xray`).
-- **RED metrics are span-derived** via two `spanmetricsconnector` instances split
-  by span kind (`filter/server`, `filter/client`). Each uses `namespace:
-  http.server.request` / `http.client.request` so the emitted `<namespace>.duration`
-  histogram matches the OTel semconv names `http.server.request.duration` /
-  `http.client.request.duration`. Buckets and dimensions are curated to match OBI's
-  native RED; the client metric additionally carries `peer.service.name`.
-- **transform/aws** copies OBI's EC2-detected resource attributes to AWS-flavored
-  keys on the metric/span resource: `host.id`→`ec2.instance.id`,
-  `cloud.account.id`→`aws.account.id`, `cloud.region`→`aws.region`, and derives
-  `host.ip` from the `ip-a-b-c-d` internal hostname.
-- **transform/strip** removes spanmetrics' baked-in `span.name`/`span.kind`/
-  `status.code`; **filter/calls** drops the redundant `*.calls` counter.
-- **metrics** → CloudWatch Metrics OTLP
-  (`https://monitoring.<region>.amazonaws.com/v1/metrics`, SigV4 service
-  `monitoring`), delta temporality via `cumulativetodelta`.
+Runtime controls:
+- `POST /fault?profile=<name>` flips this service's `PROFILE` live (fault injection, no restart).
+- `GET /healthz` liveness.
 
-Adding any new metric dimension is config-only: add it under a connector's
-`dimensions` (must be a span attribute that OBI already emits). No rebuild.
+## Components
 
-## Querying (CloudWatch OTLP is a Prometheus-compatible store, NOT list-metrics)
+- **App image**: `docker build -t ping-app app/`.
+- **Collector image**: the OBI-as-receiver collector, built from `examples/otel-collector`
+  (published to GHCR by the fork's build-artifacts workflow). Run it with
+  `collector-config.yaml` mounted at `/etc/otelcol/config.yaml`.
 
-Metrics — SigV4 POST to `https://monitoring.<region>.amazonaws.com/api/v1/query`,
-body `query=<promql>`, sign service `monitoring`. Labels are prefixed:
-`@resource.service.name`, `@resource.ec2.instance.id`, etc. A metric name must be
-given explicitly, e.g. `{__name__="http.server.request.duration"}`.
+## Run locally (docker-compose)
 
-Traces — the X-Ray API (`get-trace-summaries` + `batch-get-traces`, max 5 ids/call).
-`peer.service.name` appears on CLIENT spans.
+`docker-compose.yaml` brings up the four services, a traffic generator, and the
+collector on one host. AWS credentials for the CloudWatch/X-Ray exporters come
+from the mounted `~/.aws` (or an instance role on EC2).
 
-## Collector image (builder-config components)
+```bash
+docker build -t ping-app app/
+docker compose up -d
+```
 
-The image is built from `examples/otel-collector` (ocb). Components this branch
-added to `builder-config.yaml`, all pinned to the collector core version the OBI
-`replace` pulls in (v0.158.0) to avoid an ottl/pprofile compile skew:
-`otlphttpexporter`, `sigv4authextension`, `cumulativetodeltaprocessor`,
-`transformprocessor`, `filterprocessor`, `spanmetricsconnector`.
+## Run on EC2 (one service per host)
 
-## The 499 fix (eBPF)
+Launch one instance per role (scale `payment` / `audit` to as many as you want),
+each running:
+- the collector (host network, privileged, `context_propagation: all`) with
+  `collector-config.yaml`, and
+- one `ping-app` container (host network) with the role's env.
 
-With `context_propagation: all`, passive (server) sockets are inserted into
-`sock_dir` (sockhash) by `bpf_sock_ops_passive_est_cb`, so their response egress
-goes through the sk_psock path. `kprobe/tcp_sendmsg` does not fire there, and the
-generic tracer's backup kprobe (`tcp_rate_check_app_limited`) reads the response
-from `msg_buffers` — which the sk_msg server branch (`schedule_service_name_option`
-→ `SK_PASS`) never populated. So plaintext HTTP/1 server responses were missed and
-`force_finish_http` stamped `http.response.status_code=499` with a 0-byte body.
-HTTPS was unaffected because its response is captured via the `SSL_write` uprobe
-(before encryption), off the psock egress path.
+The instance role needs CloudWatch OTLP + X-Ray write and (for `sigv4auth`) is
+picked up from IMDS — no credentials file required.
 
-Fix (`bpf/tpinjector/tpinjector.c`): the server sk_msg branch now calls
-`bpf_msg_pull_data` + `fill_msg_buffers(msg, &t_ctx->p_conn, &e_key)` before
-`SK_PASS`, mirroring the client request path, so the backup kprobe can capture the
-server response. This keeps `sock_dir` (and therefore `peer.service.name`) while
-restoring correct server-side RED.
+## Service discovery (Route 53, method 2)
 
-## peer.service.name
+Downstream URLs are DNS names (e.g. `payment.ping.internal`) backed by a Route 53
+private hosted zone with multivalue A records (one per instance). The app resolves
+the name to all A records and picks one per request (`server.py::_targets`), so
+traffic fans out evenly across instances while the `Host` header keeps the logical
+name — client `server.address` stays the clean DNS name and `peer.service.name`
+still resolves. Plain DNS + a pooled HTTP client would otherwise pin every request
+to a single instance.
 
-Carried hop-by-hop over a kind-26 TCP option: the downstream writes its own
-`service.name` on the response; the upstream's OBI parses it into
-`svc_peer_name_map` (conn→name) and stamps it onto the client HTTP event. Surfaced
-as the span attribute `peer.service.name` (renamed from `tcp.peer.service.name`).
-Works cross-host on plaintext and HTTPS; breaks only across a TCP-terminating hop
-(LB / proxy / mesh sidecar).
+## Telemetry it produces
+
+RED comes from OBI's native application metrics:
+- `http.server.request.duration` — per service (node RED), split per instance by
+  the `ec2.instance.id` / `service.instance.id` resource attributes.
+- `http.client.request.duration` — per outgoing edge; carries `server.address`
+  (the DNS name) **and** `peer.service.name` (the downstream service's own name,
+  learned over the kind-26 TCP option).
+
+`collector-config.yaml` also adds AWS-flavoured resource attributes to every span
+and metric via a `transform` processor: `ec2.instance.id`, `aws.account.id`,
+`aws.region`, `host.ip` (alongside OBI's native `host.id` / `cloud.*`).
+
+Spans go to X-Ray; metrics go to CloudWatch (delta temporality).
+
+## Querying
+
+CloudWatch OTLP metrics are a Prometheus-compatible store — query with PromQL, not
+`list-metrics`:
+- SigV4 POST `https://monitoring.<region>.amazonaws.com/api/v1/query`, body
+  `query=<promql>`, signing service `monitoring`.
+- Labels are prefixed: `@resource.service.name`, `@resource.ec2.instance.id`, …;
+  a metric name must be given, e.g. `{__name__="http.server.request.duration"}`.
+- p99: `histogram_quantile(0.99, sum_over_time({__name__="http.server.request.duration","@resource.service.name"="payment-service"}[5m]))`
+
+Traces: the X-Ray API (`get-trace-summaries` + `batch-get-traces`).
+`peer.service.name` is on CLIENT spans.
+
+## Customising metric dimensions
+
+Resource attributes: add/rename in the `transform` processor (config only).
+New span-derived metric attributes on the native RED metrics require an OBI change
+(an attribute name, a span getter, and the metric's attribute group).

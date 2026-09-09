@@ -18,7 +18,9 @@ http.client.request.duration (the edge signal).
 """
 import os
 import random
+import socket
 import time
+import urllib.parse
 
 import requests
 import urllib3
@@ -73,17 +75,37 @@ def pick_response():
     return status, latency
 
 
+def _targets(base):
+    """Expand a base URL into (ip, host_header) per resolved A record, so a
+    DNS name with multiple A records (Route53 multivalue) fans out across all
+    instances instead of pinning to one pooled connection. Host header keeps
+    the logical name (clean server.address); ip is what we connect to."""
+    p = urllib.parse.urlparse(base)
+    host, port = p.hostname, (p.port or 8000)
+    try:
+        ips = sorted({ai[4][0] for ai in socket.getaddrinfo(host, port,
+                                                             socket.AF_INET, socket.SOCK_STREAM)})
+    except socket.gaierror:
+        ips = [host]
+    hosthdr = f"{host}:{port}" if port else host
+    return [(f"{p.scheme}://{ip}:{port}{p.path or ''}", hosthdr) for ip in ips]
+
+
 def call(base_urls, path):
-    """POST to one downstream instance (retry another on failure)."""
+    """POST to one downstream instance, fanning out across resolved IPs;
+    retry another on failure (client-side resilience)."""
     if not base_urls:
         return
-    urls = random.sample(base_urls, len(base_urls))  # shuffle for failover order
-    for base in urls:
+    targets = []
+    for base in base_urls:
+        targets += _targets(base.rstrip("/") + path)
+    random.shuffle(targets)
+    for url, hosthdr in targets:
         try:
-            requests.post(base.rstrip("/") + path, json={}, timeout=5, verify=False)
+            requests.post(url, json={}, timeout=5, verify=False, headers={"Host": hosthdr})
             return
         except requests.RequestException:
-            continue  # dead instance -> try next (client-side resilience)
+            continue
 
 
 def fan_out():
