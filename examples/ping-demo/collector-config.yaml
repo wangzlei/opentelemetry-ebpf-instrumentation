@@ -65,6 +65,14 @@ processors:
           - set(attributes["aws.region"], attributes["cloud.region"]) where attributes["cloud.region"] != nil
           - set(attributes["host.ip"], attributes["host.name"]) where attributes["host.name"] != nil
           - replace_pattern(attributes["host.ip"], "^ip-([0-9]+)-([0-9]+)-([0-9]+)-([0-9]+).*$", "$$1.$$2.$$3.$$4") where attributes["host.ip"] != nil
+    metric_statements:
+      - context: resource
+        statements:
+          - set(attributes["ec2.instance.id"], attributes["host.id"]) where attributes["host.id"] != nil
+          - set(attributes["aws.account.id"], attributes["cloud.account.id"]) where attributes["cloud.account.id"] != nil
+          - set(attributes["aws.region"], attributes["cloud.region"]) where attributes["cloud.region"] != nil
+          - set(attributes["host.ip"], attributes["host.name"]) where attributes["host.name"] != nil
+          - replace_pattern(attributes["host.ip"], "^ip-([0-9]+)-([0-9]+)-([0-9]+)-([0-9]+).*$", "$$1.$$2.$$3.$$4") where attributes["host.ip"] != nil
 
   # Keep only one span kind per spanmetrics pipeline (drop-when-true).
   filter/server:
@@ -94,6 +102,16 @@ processors:
     metrics:
       metric:
         - 'IsMatch(name, ".*\\.calls(\\.total)?$")'
+
+  # TEMPORARY (comparison): prefix OBI's native metrics with "obi." so they can be
+  # exported alongside the spanmetrics-derived ones without a name collision.
+  # Remove the metrics/obi pipeline once spanmetrics is validated.
+  transform/obiprefix:
+    error_mode: ignore
+    metric_statements:
+      - context: metric
+        statements:
+          - set(name, Concat(["obi.", name], "")) where not IsMatch(name, "^obi\\.")
 
 exporters:
   debug:
@@ -137,8 +155,14 @@ service:
       receivers: [obi]
       processors: [transform/aws, filter/client, batch]
       exporters: [spanmetrics/client]
-    # Span-derived RED → CloudWatch (replaces OBI native RED; same metric names).
+    # Span-derived RED → CloudWatch (semconv metric names).
     metrics:
       receivers: [spanmetrics/server, spanmetrics/client]
       processors: [transform/strip, filter/calls, cumulativetodelta, batch]
+      exporters: [otlphttp/cloudwatch, debug]
+    # TEMPORARY: OBI native RED under an "obi." prefix, for side-by-side comparison
+    # with the spanmetrics-derived metrics. Delete this pipeline once validated.
+    metrics/obi:
+      receivers: [obi]
+      processors: [transform/aws, transform/obiprefix, cumulativetodelta, batch]
       exporters: [otlphttp/cloudwatch, debug]

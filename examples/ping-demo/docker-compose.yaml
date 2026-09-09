@@ -1,0 +1,97 @@
+services:
+  # OBI-as-receiver collector (built from fork demo/ping via build-collector.sh).
+  # host-pid + privileged so OBI sees every container process; host-net so BPF
+  # maps pin under /sys/fs/bpf. MUST be healthy before apps start (OBI discovery
+  # is biased toward process-exec events).
+  obi-collector:
+    image: obi-collector:ping
+    container_name: ping-collector
+    privileged: true
+    pid: "host"
+    network_mode: "host"
+    environment:
+      - AWS_PROFILE=ping
+      - AWS_REGION=us-west-2
+    volumes:
+      - /sys/fs/bpf:/sys/fs/bpf
+      - /sys:/sys
+      - /proc:/proc:ro
+      - ./collector-config.yaml:/etc/otelcol/config.yaml:ro
+      - ${AWS_CREDS_DIR:-${HOME}/.aws}:/root/.aws:ro
+    command: ["--config", "/etc/otelcol/config.yaml"]
+    healthcheck:
+      test: ["CMD-SHELL", "test -d /sys/fs/bpf/link"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+
+  checkout:
+    image: ping-app
+    build: ./app
+    container_name: ping-checkout
+    networks: { apps: { aliases: [checkout] } }
+    environment:
+      - OTEL_SERVICE_NAME=checkout-service
+      - ROLE=checkout
+      - PROFILE=healthy
+      - PAYMENT_URLS=http://payment:8000
+      - INVENTORY_URLS=http://inventory:8000
+    depends_on:
+      obi-collector: { condition: service_healthy }
+
+  payment:
+    image: ping-app
+    container_name: ping-payment
+    networks: { apps: { aliases: [payment] } }
+    environment:
+      - OTEL_SERVICE_NAME=payment-service
+      - ROLE=payment
+      - PROFILE=erroring
+      - AUDIT_URLS=http://audit:8000
+    depends_on:
+      obi-collector: { condition: service_healthy }
+
+  inventory:
+    image: ping-app
+    container_name: ping-inventory
+    networks: { apps: { aliases: [inventory] } }
+    environment:
+      - OTEL_SERVICE_NAME=inventory-service
+      - ROLE=inventory
+      - PROFILE=degraded
+    depends_on:
+      obi-collector: { condition: service_healthy }
+
+  audit:
+    image: ping-app
+    container_name: ping-audit
+    networks: { apps: { aliases: [audit] } }
+    environment:
+      - OTEL_SERVICE_NAME=audit-service
+      - ROLE=audit
+      - PROFILE=healthy
+    depends_on:
+      obi-collector: { condition: service_healthy }
+
+  # drives POST /checkout so the full 4-node / 3-edge RED shows up
+  traffic:
+    image: curlimages/curl:latest
+    container_name: ping-traffic
+    networks: { apps: { aliases: [traffic] } }
+    depends_on:
+      checkout: { condition: service_started }
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        sleep 15
+        while true; do
+          curl -s -m 15 -X POST http://checkout:8000/checkout > /dev/null
+          sleep 1
+        done
+
+networks:
+  apps:
+    driver: bridge
+    name: ping-apps
