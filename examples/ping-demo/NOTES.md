@@ -47,15 +47,20 @@ gh workflow run "Build artifacts (obi + collector)" \
 
 ---
 
-## 2. Run locally (docker-compose, single host)
+## 2. Quick local smoke test (single host)
 
-Everything on one Docker host; exporters use your `~/.aws` (profile via `AWS_PROFILE`).
+The demo proper is the EC2 deployment (§3). For a quick single-host check, run the
+collector + one app container with `docker run` (host networking; creds from your
+`~/.aws` or an instance role):
 ```bash
 docker build -t ping-app app/
-AWS_PROFILE=<profile> docker compose up -d
-docker logs -f ping-collector      # watch export
+docker pull ghcr.io/wangzlei/obi-collector:latest && docker tag ghcr.io/wangzlei/obi-collector:latest obi-collector:ping
+# collector (see §3c for the full docker run), then an app container, e.g.:
+docker run -d --name ping-app-svc --network host -e ROLE=audit -e OTEL_SERVICE_NAME=audit-service ping-app
 ```
-`docker-compose.yaml` runs the four services + a traffic generator + the collector.
+Note: with both endpoints on one host, cross-service `peer.service.name` can be
+unreliable (same-host TCP-option self-reference) — use §3 (separate hosts) for the
+full behaviour.
 
 ---
 
