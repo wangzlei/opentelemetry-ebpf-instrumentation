@@ -18,45 +18,18 @@ receivers:
     metrics:
       features: "application"
 
-connectors:
-  # Span-derived RED. One connector per span kind so each emits a single semconv
-  # metric name via its namespace: <namespace>.duration => http.server.request.duration.
-  spanmetrics/server:
-    namespace: http.server.request
-    histogram:
-      unit: s
-      explicit:
-        buckets: [5ms, 10ms, 25ms, 50ms, 75ms, 100ms, 250ms, 500ms, 750ms, 1s, 2500ms, 5s, 7500ms, 10s]
-    dimensions:
-      - {name: http.request.method}
-      - {name: http.route}
-      - {name: http.response.status_code}
-      - {name: url.scheme}
-  spanmetrics/client:
-    namespace: http.client.request
-    histogram:
-      unit: s
-      explicit:
-        buckets: [5ms, 10ms, 25ms, 50ms, 75ms, 100ms, 250ms, 500ms, 750ms, 1s, 2500ms, 5s, 7500ms, 10s]
-    dimensions:
-      - {name: http.request.method}
-      - {name: http.route}
-      - {name: http.response.status_code}
-      - {name: url.scheme}
-      - {name: server.address}
-      - {name: server.port}
-      - {name: peer.service.name}   # downstream service name from the kind-26 TCP option
-
 processors:
   batch:
     timeout: 5s
     send_batch_size: 1024
+  # CloudWatch OTLP requires DELTA temporality; OBI emits cumulative.
   cumulativetodelta: {}
 
-  # AWS-flavored resource attributes. OBI's EC2 detection sets host.id /
-  # cloud.account.id / cloud.region; copy to the requested keys + derive host.ip.
-  # Applied on the spans that feed spanmetrics, so the metrics inherit them.
+  # AWS-flavored resource attributes on every span AND metric. OBI's EC2 detection
+  # sets host.id / cloud.account.id / cloud.region; copy to the requested keys and
+  # derive host.ip from the ip-a-b-c-d internal hostname.
   transform/aws:
+    error_mode: ignore
     trace_statements:
       - context: resource
         statements:
@@ -74,53 +47,16 @@ processors:
           - set(attributes["host.ip"], attributes["host.name"]) where attributes["host.name"] != nil
           - replace_pattern(attributes["host.ip"], "^ip-([0-9]+)-([0-9]+)-([0-9]+)-([0-9]+).*$", "$$1.$$2.$$3.$$4") where attributes["host.ip"] != nil
 
-  # Keep only one span kind per spanmetrics pipeline (drop-when-true).
-  filter/server:
-    error_mode: ignore
-    traces:
-      span:
-        - 'kind.string != "Server"'
-  filter/client:
-    error_mode: ignore
-    traces:
-      span:
-        - 'kind.string != "Client"'
-
-  # Strip spanmetrics' baked-in dimensions so the metric matches OBI's native attrs.
-  transform/strip:
-    error_mode: ignore
-    metric_statements:
-      - context: datapoint
-        statements:
-          - delete_key(attributes, "span.name")
-          - delete_key(attributes, "span.kind")
-          - delete_key(attributes, "status.code")
-
-  # Drop the redundant spanmetrics calls counter (duration histogram carries count).
-  filter/calls:
-    error_mode: ignore
-    metrics:
-      metric:
-        - 'IsMatch(name, ".*\\.calls(\\.total)?$")'
-
-  # TEMPORARY (comparison): prefix OBI's native metrics with "obi." so they can be
-  # exported alongside the spanmetrics-derived ones without a name collision.
-  # Remove the metrics/obi pipeline once spanmetrics is validated.
-  transform/obiprefix:
-    error_mode: ignore
-    metric_statements:
-      - context: metric
-        statements:
-          - set(name, Concat(["obi.", name], "")) where not IsMatch(name, "^obi\\.")
-
 exporters:
   debug:
     verbosity: normal
+  # CloudWatch Metrics OTLP ingest (us-west-2). otlphttp appends /v1/metrics.
   otlphttp/cloudwatch:
     endpoint: https://monitoring.us-west-2.amazonaws.com
     compression: gzip
     auth:
       authenticator: sigv4auth
+  # CloudWatch/X-Ray traces OTLP ingest (us-west-2). otlphttp appends /v1/traces.
   otlphttp/xray:
     endpoint: https://xray.us-west-2.amazonaws.com
     compression: gzip
@@ -140,29 +76,14 @@ service:
                 host: 0.0.0.0
                 port: 8888
   pipelines:
-    # All spans → X-Ray (unfiltered), with AWS resource attrs.
-    traces/xray:
+    # OBI-native RED → CloudWatch. Accurate counts; client metric carries the
+    # experimental peer.service.name; resource carries the AWS-flavored attrs.
+    metrics:
+      receivers: [obi]
+      processors: [transform/aws, cumulativetodelta, batch]
+      exporters: [otlphttp/cloudwatch, debug]
+    # All spans → CloudWatch/X-Ray OTLP, with the same AWS resource attrs.
+    traces:
       receivers: [obi]
       processors: [transform/aws, batch]
       exporters: [otlphttp/xray, debug]
-    # Server spans → spanmetrics/server (http.server.request.duration).
-    traces/sm-server:
-      receivers: [obi]
-      processors: [transform/aws, filter/server, batch]
-      exporters: [spanmetrics/server]
-    # Client spans → spanmetrics/client (http.client.request.duration + peer.service.name).
-    traces/sm-client:
-      receivers: [obi]
-      processors: [transform/aws, filter/client, batch]
-      exporters: [spanmetrics/client]
-    # Span-derived RED → CloudWatch (semconv metric names).
-    metrics:
-      receivers: [spanmetrics/server, spanmetrics/client]
-      processors: [transform/strip, filter/calls, cumulativetodelta, batch]
-      exporters: [otlphttp/cloudwatch, debug]
-    # TEMPORARY: OBI native RED under an "obi." prefix, for side-by-side comparison
-    # with the spanmetrics-derived metrics. Delete this pipeline once validated.
-    metrics/obi:
-      receivers: [obi]
-      processors: [transform/aws, transform/obiprefix, cumulativetodelta, batch]
-      exporters: [otlphttp/cloudwatch, debug]

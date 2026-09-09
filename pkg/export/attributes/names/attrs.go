@@ -38,6 +38,10 @@ const (
 	ClientAddr             = Name(semconv.ClientAddressKey)
 	ServerAddr             = Name(semconv.ServerAddressKey)
 	ServerPort             = Name(semconv.ServerPortKey)
+	// PeerServiceName is the downstream service's own service.name, learned
+	// hop-by-hop from a kind-26 TCP option (EXPERIMENTAL — TCP service-name
+	// propagation). Client-side only.
+	PeerServiceName = Name("peer.service.name")
 	HTTPRequestBodySize    = Name(semconv.HTTPRequestBodySizeKey)
 	HTTPResponseBodySize   = Name(semconv.HTTPResponseBodySizeKey)
 	SpanKind               = Name("span.kind")
