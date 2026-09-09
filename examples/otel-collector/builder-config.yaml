@@ -31,6 +31,15 @@ processors:
   # transformprocessor's ottl fails to compile against pprofile v0.158.0.
   - gomod:
       github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor v0.158.0
+  # Split spans by kind so each spanmetrics connector emits one semconv name.
+  - gomod:
+      github.com/open-telemetry/opentelemetry-collector-contrib/processor/filterprocessor v0.158.0
+
+connectors:
+  # Derive RED metrics from spans with fully configurable dimensions
+  # (peer.service.name, http.route, ...); resource attributes carry through.
+  - gomod:
+      github.com/open-telemetry/opentelemetry-collector-contrib/connector/spanmetricsconnector v0.158.0
 
 receivers:
   - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.151.0
