@@ -38,6 +38,10 @@ processors:
           - set(attributes["aws.region"], attributes["cloud.region"]) where attributes["cloud.region"] != nil
           - set(attributes["host.ip"], attributes["host.name"]) where attributes["host.name"] != nil
           - replace_pattern(attributes["host.ip"], "^ip-([0-9]+)-([0-9]+)-([0-9]+)-([0-9]+).*$", "$$1.$$2.$$3.$$4") where attributes["host.ip"] != nil
+          # VPC / subnet come from the host's IMDS at deploy time (OBI doesn't detect them),
+          # passed in as AWS_VPC_ID / AWS_SUBNET_ID env; ${env:..} is substituted at config load.
+          - set(attributes["aws.vpc.id"], "${env:AWS_VPC_ID}") where "${env:AWS_VPC_ID}" != ""
+          - set(attributes["aws.subnet.id"], "${env:AWS_SUBNET_ID}") where "${env:AWS_SUBNET_ID}" != ""
     metric_statements:
       - context: resource
         statements:
@@ -46,6 +50,8 @@ processors:
           - set(attributes["aws.region"], attributes["cloud.region"]) where attributes["cloud.region"] != nil
           - set(attributes["host.ip"], attributes["host.name"]) where attributes["host.name"] != nil
           - replace_pattern(attributes["host.ip"], "^ip-([0-9]+)-([0-9]+)-([0-9]+)-([0-9]+).*$", "$$1.$$2.$$3.$$4") where attributes["host.ip"] != nil
+          - set(attributes["aws.vpc.id"], "${env:AWS_VPC_ID}") where "${env:AWS_VPC_ID}" != ""
+          - set(attributes["aws.subnet.id"], "${env:AWS_SUBNET_ID}") where "${env:AWS_SUBNET_ID}" != ""
 
 exporters:
   debug:

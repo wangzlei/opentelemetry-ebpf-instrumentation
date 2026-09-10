@@ -64,6 +64,11 @@ aws ssm start-session --target <id>
 aws ssm send-command --targets Key=tag:purpose,Values=ping-demo --document-name AWS-RunShellScript --parameters 'commands=["docker ps"]'
 ```
 Config at `/opt/ping/collector-config.yaml` (mounted into collector); app files `/opt/ping/app`.
+The collector must be started with `AWS_VPC_ID` / `AWS_SUBNET_ID` env (fetched from IMDSv2 in
+the run script) so `transform/aws` can put `aws.vpc.id` / `aws.subnet.id` on RED metrics; the
+run flags are `--network host --pid host --privileged --restart unless-stopped` + the three
+`/sys`,`/proc`,`/sys/fs/bpf` mounts. If you recreate it without those env vars the two attrs
+just drop off (no crash).
 
 ## Teardown
 

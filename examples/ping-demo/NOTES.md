@@ -72,7 +72,11 @@ RED = OBI native application metrics → CloudWatch OTLP (query with PromQL, see
 - `http.client.request.duration` — edge RED; carries `server.address` (DNS name) **and**
   `peer.service.name` (downstream's own name, from the kind-26 TCP option).
 - `collector-config.yaml` adds AWS resource attrs to every span/metric via a transform
-  processor: `ec2.instance.id`, `aws.account.id`, `aws.region`, `host.ip`.
+  processor: `ec2.instance.id`, `aws.account.id`, `aws.region`, `host.ip` (from OBI's EC2
+  detection), plus `aws.vpc.id` / `aws.subnet.id` — OBI does **not** detect VPC/subnet, so
+  they're read from the host's IMDS at deploy time and passed to the collector as
+  `AWS_VPC_ID` / `AWS_SUBNET_ID` env, injected via `${env:...}` in `transform/aws`. The
+  subnet attr lets you slice RED by the same subnet NFM localizes a fault to.
 - Spans → X-Ray.
 
 NFM (agent installed via SSM Distributor + activate; see below) → the network layer.
