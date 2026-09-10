@@ -1,181 +1,164 @@
-# ping demo — usage guide
+# ping demo — design & usage notes
 
-A 4-service HTTP app for exercising OBI's RED metrics, distributed traces, and the
-experimental TCP-option `peer.service.name` propagation — end to end into Amazon
-CloudWatch (metrics) and AWS X-Ray (traces).
+A small 4-service HTTP app for demonstrating, end to end on AWS:
+- OBI's RED metrics + distributed traces (→ CloudWatch metrics via OTLP, → X-Ray),
+  incl. the experimental TCP-option `peer.service.name`;
+- CloudWatch **Network Flow Monitor (NFM)** for the network layer;
+- a two-layer RCA story: **OBI RED localizes the slow service/instance; NFM localizes
+  the bad subnet** (packet loss / retransmissions).
+
+This doc is written so a teammate (or a fresh Claude session) can pick the demo back up.
+Live resource IDs (instances, subnets, Route 53, active faults) are in `HANDOFF.md`.
+
+## Topology
 
 ```
 checkout ──POST /charges──▶ payment ──POST /audit──▶ audit   (leaf)
    └───────POST /reservations──▶ inventory                   (leaf)
 ```
 
-`app/server.py` is one Flask+gunicorn codebase; each instance's behaviour is set by
-env vars, so the same image runs every role.
+`app/server.py` is one Flask+gunicorn codebase; role/behaviour via env:
 
 | env | meaning |
 |---|---|
-| `ROLE` | `checkout` / `payment` / `inventory` / `audit` — served route + downstream calls |
-| `PROFILE` | `healthy` / `degraded` / `erroring` / `faulty` — status-code mix + latency of this service's own responses |
-| `PAYMENT_URLS` / `INVENTORY_URLS` / `AUDIT_URLS` | comma-separated downstream base URLs (a DNS name is fine — see Discovery) |
-| `USE_TLS` | `1` serves HTTPS with a self-signed cert (demo only) |
+| `ROLE` | checkout / payment / inventory / audit — served route + downstream calls |
+| `PROFILE` | healthy / degraded / erroring / faulty — this service's own status-mix + latency |
+| `PAYMENT_URLS` / `INVENTORY_URLS` / `AUDIT_URLS` | comma-separated downstream base URLs; a Route 53 DNS name is expected |
+| `PREFER_SAME_AZ` | `1` → call the same-AZ downstream (see routing below) |
+| `USE_TLS` | `1` → serve HTTPS with a self-signed cert |
 | `PORT` | listen port (default 8000) |
+| `POST /fault?profile=<name>` | flip PROFILE live (app-level fault injection) |
 
-Runtime controls: `POST /fault?profile=<name>` flips this service's `PROFILE` live;
-`GET /healthz` liveness.
+## How server.py routes to downstreams (`call()` / `_targets()`)
 
----
+Downstreams are Route 53 DNS names (e.g. `payment.ping.internal`) backed by **multivalue
+A records — one per instance**. Plain DNS + a pooled HTTP client would pin every request
+to one IP, so the app does its own client-side load-balancing:
 
-## 1. Images
+1. `_targets(base)` resolves the DNS name to **all** A records via `socket.getaddrinfo`,
+   returning one `(http://<ip>:<port><path>, Host=<name>)` per IP.
+2. `call()` collects targets for all downstream URLs, then:
+   - **`PREFER_SAME_AZ=1`**: keep only targets whose IP is in the caller's own `/24`.
+     In this demo one subnet == one AZ, so same `/24` == same AZ → the call stays in-AZ
+     (mirrors production topology-aware routing that avoids cross-AZ hops). Falls back to
+     all targets if none share the subnet (e.g. checkout, which lives in a different subnet).
+   - `random.shuffle` + take the first that succeeds (retry the next on failure).
+   - The IP is what we connect to; `Host` header stays the DNS name → the client
+     `server.address` stays the clean name and `peer.service.name` still resolves.
 
-**App** — built from this folder, no registry needed:
-```bash
-docker build -t ping-app app/
-```
+Demo wiring: **checkout→payment is random** (checkout is in a different subnet, no same-AZ
+payment, so it fans out across all 3); **payment→audit is same-AZ** (`PREFER_SAME_AZ=1` on
+payment → each payment calls only the audit in its own subnet/AZ).
 
-**Collector** — the OBI-as-receiver collector, built from `examples/otel-collector`
-(ocb) and published multi-arch to GHCR by the fork's `build-artifacts.yml` workflow.
-It bundles: obi receiver, otlphttp + sigv4auth (CloudWatch/X-Ray), cumulativetodelta,
-transformprocessor (+ spanmetrics/filter, unused by default).
-```bash
-# pull the current image (public; tag = a commit short-sha on demo/ping)
-docker pull ghcr.io/wangzlei/obi-collector:latest
-# or rebuild after an OBI/builder-config change:
-gh workflow run "Build artifacts (obi + collector)" \
-  --repo wangzlei/opentelemetry-ebpf-instrumentation --ref demo/ping
-```
-`collector-config.yaml` (this folder) is mounted at `/etc/otelcol/config.yaml`.
+## Why split into per-AZ subnets (for NFM)
 
----
+NFM's managed views aggregate flows by **subnet / AZ / VPC / service** — never per instance.
+So to let NFM *localize a network problem to a specific service*, put **one app subnet per
+AZ**, with that AZ's payment + audit sharing it (this is also how production looks — services
+of a tier share the per-AZ app subnet; per-service subnets are not real, isolation is via
+security groups). Then:
+- a fault on one AZ's instances shows up as **that subnet** being the retransmissions /
+  RTT top-contributor, distinct from the other AZs' subnets;
+- cross-AZ calls (checkout→payment) appear as `INTER_AZ`, in-AZ (payment→audit) as `INTRA_AZ`.
 
-## 2. Quick local smoke test (single host)
+(An earlier iteration used one subnet per instance — that makes NFM show per-instance, but
+is NOT production-realistic and oversells NFM; we deliberately use per-AZ shared subnets.)
 
-The demo proper is the EC2 deployment (§3). For a quick single-host check, run the
-collector + one app container with `docker run` (host networking; creds from your
-`~/.aws` or an instance role):
-```bash
-docker build -t ping-app app/
-docker pull ghcr.io/wangzlei/obi-collector:latest && docker tag ghcr.io/wangzlei/obi-collector:latest obi-collector:ping
-# collector (see §3c for the full docker run), then an app container, e.g.:
-docker run -d --name ping-app-svc --network host -e ROLE=audit -e OTEL_SERVICE_NAME=audit-service ping-app
-```
-Note: with both endpoints on one host, cross-service `peer.service.name` can be
-unreliable (same-host TCP-option self-reference) — use §3 (separate hosts) for the
-full behaviour.
+## Telemetry
 
----
-
-## 3. Run on EC2 (one service per host)
-
-This is the deployment used for the reference setup: N instances, each running its
-own collector + one app container, discovery via Route 53. There is no cross-host
-orchestrator — each host is provisioned individually over SSM.
-
-Reference values (us-west-2, profile `ping`): AMI `ami-0b787142aa56d54db`
-(AL2023 x86), VPC `vpc-017c34776120b35bc`, subnet `subnet-002be9598dad093c4`,
-SG `sg-0f6caf64203f751e2` (intra :8000 + egress), instance profile
-`Ec2DemoObservability-ObsInstanceInstanceProfile...` (SSM + CloudWatch + X-Ray),
-Route 53 private zone `ping.internal` (`Z097757611V01PJRE00N6`).
-
-### 3a. Launch instances (one per role; scale payment/audit)
-```bash
-aws ec2 run-instances --region us-west-2 --profile ping \
-  --image-id ami-0b787142aa56d54db --instance-type t3.medium --count 3 \
-  --subnet-id subnet-002be9598dad093c4 --security-group-ids sg-0f6caf64203f751e2 \
-  --iam-instance-profile Arn=<obs-instance-profile-arn> \
-  --metadata-options HttpTokens=required,HttpEndpoint=enabled \
-  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ping-payment},{Key=ping-role,Value=payment},{Key=purpose,Value=ping-demo}]'
-```
-Repeat per role (`checkout` ×1, `payment` ×3, `inventory` ×1, `audit` ×3).
-
-### 3b. Route 53 records (method-2 discovery)
-Multivalue A records, one value per instance IP, low TTL:
-```bash
-aws route53 change-resource-record-sets --profile ping --hosted-zone-id Z097757611V01PJRE00N6 \
-  --change-batch '{"Changes":[{"Action":"UPSERT","ResourceRecordSet":{
-    "Name":"payment.ping.internal","Type":"A","TTL":10,
-    "ResourceRecords":[{"Value":"<ip1>"},{"Value":"<ip2>"},{"Value":"<ip3>"}]}}]}'
-# repeat for audit (3), inventory (1), checkout (1)
-```
-
-### 3c. Provision each host (SSM `AWS-RunShellScript`)
-Per host: install docker, drop the app files + `collector-config.yaml` under
-`/opt/ping`, then run the collector (host-net, privileged) and one app container
-(host-net) with the role's env. Downstream URLs are the DNS names above, e.g.:
-- checkout: `PAYMENT_URLS=http://payment.ping.internal:8000 INVENTORY_URLS=http://inventory.ping.internal:8000`
-- payment:  `AUDIT_URLS=http://audit.ping.internal:8000`
-
-```bash
-docker run -d --name ping-collector --restart unless-stopped --privileged --pid host \
-  --network host -e AWS_REGION=us-west-2 \
-  -v /sys/fs/bpf:/sys/fs/bpf -v /sys:/sys -v /proc:/proc:ro \
-  -v /opt/ping/collector-config.yaml:/etc/otelcol/config.yaml:ro \
-  obi-collector:ping --config /etc/otelcol/config.yaml
-
-docker run -d --name ping-app-svc --restart unless-stopped --network host \
-  -e OTEL_SERVICE_NAME=payment-service -e ROLE=payment -e PROFILE=healthy \
-  -e AUDIT_URLS=http://audit.ping.internal:8000 ping-app
-```
-Access hosts with `aws ssm start-session --target <instance-id>` (no SSH/public IP).
-
----
-
-## 4. Service discovery / traffic fan-out
-
-Downstream URLs are DNS names backed by Route 53 multivalue A records. The app
-resolves the name to all A records and picks one per request (`server.py::_targets`),
-sending `Host: <name>` — so traffic spreads evenly across instances while the client
-`server.address` stays the clean DNS name and `peer.service.name` still resolves.
-(Plain DNS + a pooled HTTP client would pin every request to one instance.)
-
----
-
-## 5. Telemetry produced
-
-RED = OBI native application metrics:
-- `http.server.request.duration` — node RED, per service, split per instance by the
-  `@resource.ec2.instance.id` / `service.instance.id` resource attributes.
+RED = OBI native application metrics → CloudWatch OTLP (query with PromQL, see below):
+- `http.server.request.duration` — node RED, per service, split per instance by
+  `@resource.ec2.instance.id` / `service.instance.id`.
 - `http.client.request.duration` — edge RED; carries `server.address` (DNS name) **and**
-  `peer.service.name` (downstream service's own name, from the kind-26 TCP option).
+  `peer.service.name` (downstream's own name, from the kind-26 TCP option).
+- `collector-config.yaml` adds AWS resource attrs to every span/metric via a transform
+  processor: `ec2.instance.id`, `aws.account.id`, `aws.region`, `host.ip`.
+- Spans → X-Ray.
 
-`collector-config.yaml` adds AWS-flavoured resource attributes to every span/metric via
-a `transform` processor: `ec2.instance.id`, `aws.account.id`, `aws.region`, `host.ip`
-(alongside OBI's native `host.id` / `cloud.*`).
+NFM (agent installed via SSM Distributor + activate; see below) → the network layer.
 
----
+## Mocking a network problem (retransmission / latency)
 
-## 6. Fault injection
+Inject with `tc netem` on the **egress** of **all instances in the target subnet** (so the
+whole subnet's traffic is impaired), over SSM:
+```bash
+dnf install -y iproute-tc
+tc qdisc add dev ens5 root netem loss 25%          # packet loss  -> retransmissions/timeouts
+# or:  netem delay 400ms                            # latency      -> RTT
+# or:  netem loss 20% delay 200ms
+# remove:
+tc qdisc del dev ens5 root
+```
+`ens5` is the AL2023 ENA primary NIC. Loss is what NFM ranks best (see below). netem is a
+persistent qdisc — it keeps injecting until removed or reboot.
 
-- App latency / errors: `curl -XPOST 'http://<host>:8000/fault?profile=degraded'` on one
-  instance (per-instance, live).
-- Network latency (kernel qdisc): on one host over SSM —
-  `dnf install -y iproute-tc; tc qdisc add dev ens5 root netem delay 400ms`
-  (remove: `tc qdisc del dev ens5 root`). NOTE: netem sits below OBI's socket-level
-  measurement, so the affected server's OWN duration stays normal; the latency shows on
-  the caller's client edge (T_client) and propagates up — the client-vs-server gap is the
-  network-vs-code signal. Application RED cannot name which instance is slow (client edge
-  is aggregated by peer.service.name); enable OBI's `network`/TCP-RTT metrics for that.
+## What each tool shows (and what it can't)
 
----
+OBI RED (per-instance, exact):
+- The impaired subnet's **payment** instance server p99 spikes (it blocks on the lossy/slow
+  downstream + retransmits its own responses) — stands out vs the other AZs' payments.
+- The impaired **audit**'s own server RED stays ~normal — netem sits **below** OBI's
+  socket-level measurement, so audit's *code time* is unaffected. This is the
+  **network-vs-code** signal (caller/client time ≫ callee/server time = network, not code).
+- The client edge (`http.client.request.duration`) is aggregated by `peer.service.name`
+  (not per downstream instance), so it shows the edge is slow but not which instance.
 
-## 7. Querying
+NFM:
+- **Workload insights** (no monitor needed): top-contributors for `RETRANSMISSIONS`,
+  `TIMEOUTS`, `DATA_TRANSFERRED` — aggregated to subnet/AZ. Packet loss → the bad subnet
+  becomes the retransmissions top-contributor. **No RTT here.**
+- **A Monitor** (must be created; local↔remote resources = subnets/VPC/AZ/service, 25 each,
+  20 monitors/account/region) publishes CloudWatch `AWS/NetworkFlowMonitor` metrics:
+  `RoundTripTime`, `Retransmissions`, `Timeouts`, `DataTransferred`, `HealthIndicator (NHI)`.
+  **RTT only exists via a monitor.**
+- **NHI** = binary "is the *AWS* network degraded on this path" (0 healthy / 100 degraded).
+  You **cannot** fake NHI — injected netem is host-local, so NHI stays Healthy.
+- The NFM agent's raw OTLP actually carries per-flow `remote_address:port` + `rtt_us`
+  (dumped and verified), but the managed backend aggregates it to subnet. To get per-flow
+  IP/RTT you'd have to point the agent's `--endpoint` at your own OTLP collector.
 
-CloudWatch OTLP metrics are a Prometheus-compatible store — use PromQL, not `list-metrics`:
+## Two-layer RCA story (the demo payoff)
+
+1. **OBI RED** → the slow *service/instance*: e.g. payment-2b server p99 = 22s vs ~1s for
+   payment-2a/2c; audit-2b server ~normal → "payment-2b is slow, and it's not audit's code".
+2. **NFM Workload insights** → the bad *subnet*: the 2b app subnet is the retransmissions
+   top-contributor → "the 2b subnet has packet loss".
+3. Conclusion: a network fault on the 2b subnet is degrading the service instances there.
+
+## Querying
+
+CloudWatch OTLP metrics (Prometheus store, PromQL — NOT list-metrics):
 - SigV4 POST `https://monitoring.<region>.amazonaws.com/api/v1/query`, body `query=<promql>`,
-  signing service `monitoring`. Labels are prefixed (`@resource.service.name`,
-  `@resource.ec2.instance.id`, …); a metric name is required, e.g.
-  `{__name__="http.server.request.duration"}`.
-- p99: `histogram_quantile(0.99, sum_over_time({__name__="http.server.request.duration","@resource.service.name"="payment-service"}[5m]))`
-- count: `histogram_count(sum_over_time({__name__="http.server.request.duration","@resource.service.name"="payment-service"}[5m]))`
+  signing service `monitoring`. Labels prefixed `@resource.*`; a metric name is required.
+- `histogram_quantile(0.99, sum_over_time({__name__="http.server.request.duration","@resource.host.ip"="<ip>"}[3m]))`
 
-Traces: X-Ray API (`get-trace-summaries` + `batch-get-traces`, max 5 ids/call).
-`peer.service.name` is on CLIENT spans.
+NFM Workload insights (no monitor), via the `networkflowmonitor` API — scope id from
+`aws networkflowmonitor list-scopes`:
+```bash
+aws networkflowmonitor start-query-workload-insights-top-contributors \
+  --scope-id <SCOPE> --start-time <ISO> --end-time <ISO> \
+  --metric-name RETRANSMISSIONS --destination-category INTRA_AZ   # or INTER_AZ, TIMEOUTS, DATA_TRANSFERRED
+aws networkflowmonitor get-query-status-workload-insights-top-contributors  --scope-id <SCOPE> --query-id <QID>
+aws networkflowmonitor get-query-results-workload-insights-top-contributors --scope-id <SCOPE> --query-id <QID>
+```
+Result rows are keyed by `localSubnetId` / `localAz` / `remoteIdentifier` (subnet ARNs) —
+NFM's physical `usw2-azN` is a per-account random mapping; trust the subnet id.
 
----
+Traces: X-Ray `get-trace-summaries` + `batch-get-traces`; `peer.service.name` on CLIENT spans.
 
-## 8. Customising metric dimensions
+## NFM agent enablement (per instance)
 
-- Resource attributes: add/rename in the `transform` processor (config only, no rebuild).
-- New span-derived attributes on the native RED metrics: an OBI change (attribute name +
-  span getter + the metric's attribute group) — see how `peer.service.name` was added.
-- Fully arbitrary dimensions from any span/resource attribute: switch RED to the
-  `spanmetricsconnector` (already compiled into the image; wire it in `collector-config.yaml`).
+1. Attach managed policy `CloudWatchNetworkFlowMonitorAgentPublishPolicy` to the instance role.
+2. Install: SSM Distributor package `AmazonCloudWatchNetworkFlowMonitorAgent`
+   (`aws ssm send-command --document-name AWS-ConfigureAWSPackage --parameters action=Install,name=...`).
+3. Activate: SSM document `AmazonCloudWatch-NetworkFlowMonitorManageAgent` (`Action=Activate`).
+Agent = Rust + eBPF sock_ops (`aws/network-flow-monitor-agent`); publishes OTLP protobuf
+(SigV4 service `networkflowmonitor`) to `https://networkflowmonitorreports.<region>.api.aws/publish`.
+
+## Images / collector
+
+- App: `docker build -t ping-app app/`.
+- Collector: `ghcr.io/wangzlei/obi-collector` (public, multi-arch), run with `collector-config.yaml`
+  mounted at `/etc/otelcol/config.yaml`; rebuild via the fork's `build-artifacts.yml` workflow.
+- Deploy per host: collector (host-net, privileged, cp=all) + one `ping-app` container (host-net),
+  provisioned over SSM. No cross-host orchestrator; Route 53 for discovery.

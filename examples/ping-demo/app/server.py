@@ -91,6 +91,25 @@ def _targets(base):
     return [(f"{p.scheme}://{ip}:{port}{p.path or ''}", hosthdr) for ip in ips]
 
 
+def _local_ip():
+    """Primary private IP of this host (for same-subnet/same-AZ preference)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return None
+
+
+# PREFER_SAME_AZ: when set, pick a downstream whose IP shares this host's /24
+# (in this demo one subnet == one AZ, so same /24 == same AZ). Mirrors production
+# topology-aware routing that avoids cross-AZ hops. Falls back to all instances
+# when no same-subnet target exists (e.g. the caller is in a different subnet).
+PREFER_SAME_AZ = os.environ.get("PREFER_SAME_AZ", "0") == "1"
+
+
 def call(base_urls, path):
     """POST to one downstream instance, fanning out across resolved IPs;
     retry another on failure (client-side resilience)."""
@@ -99,6 +118,13 @@ def call(base_urls, path):
     targets = []
     for base in base_urls:
         targets += _targets(base.rstrip("/") + path)
+    if PREFER_SAME_AZ:
+        lip = _local_ip()
+        if lip:
+            prefix = lip.rsplit(".", 1)[0] + "."   # /24
+            same = [t for t in targets if urllib.parse.urlparse(t[0]).hostname.startswith(prefix)]
+            if same:
+                targets = same
     random.shuffle(targets)
     for url, hosthdr in targets:
         try:
