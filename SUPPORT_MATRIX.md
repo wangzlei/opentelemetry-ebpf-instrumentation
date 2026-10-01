@@ -61,7 +61,7 @@ through language-specific library instrumentation documented later in this file.
 | Protocol | Versions | Methods or operations | Secure | Context propagation | Limitations |
 |:---------|:---------|:----------------------|:------:|:-------------------:|:------------|
 | HTTP | `1.0/1.1` | All | Yes | Yes | None documented |
-| HTTP | `2.0` | All | Yes | No | Context propagation for HTTP/2 is only through Go library instrumentation |
+| HTTP | `2.0` | All | Yes | No | Context propagation for HTTP/2 is only through Go library instrumentation. On the generic path, concurrent (multiplexed) streams are parsed per read/write buffer up to the frame-scan budget (~6 streams grouped in one buffer); beyond that, overflow streams in that buffer are dropped or reported with an unknown status |
 | gRPC | `1.0+` | All | Yes | No | Long-lived connections started before OBI may use `*` for method names |
 | MySQL | All | All | Yes | No | Prepared statements created before OBI started may miss query text |
 | PostgreSQL | All | All | Yes | No | Prepared statements created before OBI started may miss query text |
