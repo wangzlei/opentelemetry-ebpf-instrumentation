@@ -303,8 +303,9 @@ func getDefinitions(
 		false,
 		nil,
 		map[attr.Name]Default{
-			attr.ServerAddr: true,
-			attr.ServerPort: true,
+			attr.ServerAddr:      true,
+			attr.ServerPort:      true,
+			attr.PeerServiceName: true,
 		},
 		extraGroupAttributes[GroupHTTPClientInfo],
 	)
