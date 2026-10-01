@@ -77,6 +77,13 @@ func spanOTELGetters(name attr.Name) (attributes.Getter[*Span, attribute.KeyValu
 		}
 	case attr.ServerPort:
 		getter = func(s *Span) attribute.KeyValue { return ServerPort(s.HostPort) }
+	case attr.PeerServiceName:
+		getter = func(s *Span) attribute.KeyValue {
+			if s.PeerServiceName == "" {
+				return attribute.KeyValue{}
+			}
+			return attribute.Key(attr.PeerServiceName).String(s.PeerServiceName)
+		}
 	case attr.RPCMethod:
 		getter = func(s *Span) attribute.KeyValue {
 			if s.Type == EventTypeSunRPCClient || s.Type == EventTypeSunRPCServer {

@@ -96,6 +96,11 @@ const (
 	HTTPResponseBodyContent  = Name("http.response.body.content")
 )
 
+// PeerServiceName is the downstream service's own service.name, learned
+// hop-by-hop from a kind-26 TCP option (EXPERIMENTAL — TCP service-name
+// propagation). Client-side only.
+const PeerServiceName = Name("peer.service.name")
+
 // HTTPRequestHeaderKey returns the attribute key for a request header (lowercased).
 func HTTPRequestHeaderKey(name string) string {
 	return HTTPRequestHeaderPrefix + strings.ToLower(name)
