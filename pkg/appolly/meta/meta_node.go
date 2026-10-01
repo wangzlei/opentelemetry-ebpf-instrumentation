@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"go.opentelemetry.io/contrib/detectors/aws/ec2/v2"
-	"go.opentelemetry.io/contrib/detectors/azure/azurevm"
 	"go.opentelemetry.io/contrib/detectors/gcp"
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
@@ -93,9 +92,7 @@ func NewNodeMeta(
 		// in order of the priority below (the later the highest)
 		linuxLocalFetcher,
 		kubeNodeFetcher(kubeInformer),
-		otelNodeFetcher(azurevm.NewResourceDetector(
-			azurevm.WithAttributeFilter(azureVMAttributeFilter),
-		)),
+		otelNodeFetcher(newAzureVMDetector(azureVMAttributeFilter)),
 		otelNodeFetcher(gcp.NewDetector()),
 		otelNodeFetcher(ec2.NewResourceDetector()),
 		func(_ context.Context) (NodeMeta, error) {

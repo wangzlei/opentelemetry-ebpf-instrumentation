@@ -12,7 +12,6 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
-	v2 "github.com/containers/common/pkg/cgroupv2"
 	"golang.org/x/sys/unix"
 )
 
@@ -34,7 +33,11 @@ type cgroupV2Result struct {
 
 var cgroupV2Once = sync.OnceValue(func() cgroupV2Result {
 	log := slog.With("component", "ebpf.cgroupv2")
-	if enabled, err := v2.Enabled(); err == nil && enabled {
+	// ADOT-OBI (patch 99-pin-to-cwagent): same check as
+	// github.com/containers/common/pkg/cgroupv2.Enabled() (statfs magic of the
+	// cgroup root); dropping containers/common avoids bumping the CloudWatch
+	// Agent's containerd/cgroups/v3 (v0.64.x requires v3.0.5, cwagent has v3.0.3).
+	if isCgroup2Mount(cgroupFSRoot) {
 		return cgroupV2Result{path: cgroupFSRoot, mfd: -1}
 	}
 	if isCgroup2Mount(cgroupV2Hybrid) {

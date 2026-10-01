@@ -18,7 +18,6 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
-	processcontextpb "go.opentelemetry.io/proto/otlp/processcontext/v1development"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app"
@@ -26,6 +25,7 @@ import (
 	execpkg "go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 	"go.opentelemetry.io/obi/pkg/ebpf"
 	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
+	processcontextpb "go.opentelemetry.io/obi/pkg/internal/processcontext/processcontextpb"
 )
 
 const (
