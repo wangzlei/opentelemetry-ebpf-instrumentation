@@ -8,14 +8,12 @@ import (
 	"log/slog"
 	"time"
 
-	"go.opentelemetry.io/ebpf-profiler/libpf"
-	"go.opentelemetry.io/ebpf-profiler/processcontext"
-	"go.opentelemetry.io/ebpf-profiler/remotememory"
-
 	"go.opentelemetry.io/obi/pkg/appolly/app"
 	execpkg "go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 	"go.opentelemetry.io/obi/pkg/ebpf"
 	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
+	"go.opentelemetry.io/obi/pkg/internal/processcontext"
+	"go.opentelemetry.io/obi/pkg/internal/processcontext/pf"
 	"go.opentelemetry.io/obi/pkg/internal/procs"
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
 	"go.opentelemetry.io/obi/pkg/pipe/swarm"
@@ -44,7 +42,7 @@ func ProcessContextDecoratorProvider(
 // processEntry holds per-process state needed for polling.
 type processEntry struct {
 	fi              *execpkg.FileInfo
-	mappingAddr     libpf.Address
+	mappingAddr     pf.Address
 	lastPublishedAt uint64
 }
 
@@ -125,7 +123,7 @@ func (pcd *processContextDecorator) pollEntry(pid app.PID, entry *processEntry) 
 		entry.mappingAddr = addr
 	}
 
-	rm := remotememory.NewProcessVirtualMemory(libpf.PID(pid))
+	rm := pf.NewProcessVirtualMemory(pf.PID(pid))
 	info, err := processcontext.Read(entry.mappingAddr, rm, entry.lastPublishedAt, 0)
 	switch {
 	case err == nil:
@@ -144,7 +142,7 @@ func (pcd *processContextDecorator) pollEntry(pid app.PID, entry *processEntry) 
 	}
 }
 
-func (pcd *processContextDecorator) findOTELContextMapping(pid app.PID) (libpf.Address, bool) {
+func (pcd *processContextDecorator) findOTELContextMapping(pid app.PID) (pf.Address, bool) {
 	maps, err := procs.FindLibMaps(pid)
 	if err != nil {
 		pcd.log.Debug("failed to read process maps", "pid", pid, "error", err)
@@ -153,7 +151,7 @@ func (pcd *processContextDecorator) findOTELContextMapping(pid app.PID) (libpf.A
 
 	for _, m := range maps {
 		if processcontext.IsContextMapping(m.Perms.Execute, m.Pathname) {
-			return libpf.Address(m.StartAddr), true
+			return pf.Address(m.StartAddr), true
 		}
 	}
 	return 0, false

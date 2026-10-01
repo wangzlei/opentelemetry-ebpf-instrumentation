@@ -734,6 +734,7 @@ func (c *Config) validate(context validationContext) error {
 	// for future custom validations
 	customValidations := CustomValidations{
 		validationTagAgentIPIface: ValidateAgentIPIface,
+		validationTagOneOfCI:      validateOneOfCI,
 	}
 
 	if err := registerCustomValidations(validate, customValidations); err != nil {
