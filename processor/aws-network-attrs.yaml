@@ -1,0 +1,21 @@
+# aws.vpc.id / aws.subnet.id on every OBI metric and span resource.
+#
+# This replaces fork commit ec412e21 (ping-demo transform/aws statements). It
+# needs no code and no patch: cwagent v1.300074.0 already ships the resource
+# processor. OBI does not detect VPC/subnet; the deploy step reads them from
+# IMDSv2 and passes them as env vars to the agent, e.g.
+#   TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+#   MAC=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/mac)
+#   export AWS_VPC_ID=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/network/interfaces/macs/$MAC/vpc-id)
+#   export AWS_SUBNET_ID=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/network/interfaces/macs/$MAC/subnet-id)
+# Merge this into the agent's OTel YAML and add `resource/aws_network` to the
+# OBI metrics and traces pipelines.
+processors:
+  resource/aws_network:
+    attributes:
+      - key: aws.vpc.id
+        value: ${env:AWS_VPC_ID}
+        action: upsert
+      - key: aws.subnet.id
+        value: ${env:AWS_SUBNET_ID}
+        action: upsert

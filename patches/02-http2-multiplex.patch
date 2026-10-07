@@ -1,0 +1,645 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wangzlei <66336933+wangzlei@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 12:57:03 -0700
+Subject: [PATCH 2/4] http2: capture every stream on a multiplexed connection
+
+Fixes OBI dropping all but one HTTP/2 stream per multiplexed connection, plus a
+unit test and an h2mux integration test (docker-compose fixture).
+
+Source: aed1c1c8, e74ebb5e.
+Adot-Obi-Patch: 02-http2-multiplex
+---
+ SUPPORT_MATRIX.md                             |   2 +-
+ bpf/generictracer/protocol_http2.h            |  40 ++++++-
+ bpf/generictracer/types/grpc_frames_ctx.h     |   4 +
+ .../components/h2mux/client/Dockerfile        |   6 +
+ .../components/h2mux/client/client.py         |  75 ++++++++++++
+ .../components/h2mux/client/requirements.txt  |  14 +++
+ .../components/h2mux/server/Dockerfile        |   8 ++
+ .../components/h2mux/server/requirements.txt  |  14 +++
+ .../components/h2mux/server/server.py         |  88 ++++++++++++++
+ .../integration/configs/obi-config-h2mux.yml  |  14 +++
+ .../test/integration/docker-compose-h2mux.yml |  59 +++++++++
+ internal/test/integration/h2mux_test.go       | 112 ++++++++++++++++++
+ pkg/ebpf/common/http2grpc_transform_test.go   |  34 ++++++
+ 13 files changed, 465 insertions(+), 5 deletions(-)
+ create mode 100644 internal/test/integration/components/h2mux/client/Dockerfile
+ create mode 100644 internal/test/integration/components/h2mux/client/client.py
+ create mode 100644 internal/test/integration/components/h2mux/client/requirements.txt
+ create mode 100644 internal/test/integration/components/h2mux/server/Dockerfile
+ create mode 100644 internal/test/integration/components/h2mux/server/requirements.txt
+ create mode 100644 internal/test/integration/components/h2mux/server/server.py
+ create mode 100644 internal/test/integration/configs/obi-config-h2mux.yml
+ create mode 100644 internal/test/integration/docker-compose-h2mux.yml
+ create mode 100644 internal/test/integration/h2mux_test.go
+
+diff --git a/SUPPORT_MATRIX.md b/SUPPORT_MATRIX.md
+index eaa41988c7c6da150b4e576a1179f495c2e9e72b..79400cd4494408dbdabbd8b26509a320bc9ff48f 100644
+--- a/SUPPORT_MATRIX.md
++++ b/SUPPORT_MATRIX.md
+@@ -61,7 +61,7 @@ through language-specific library instrumentation documented later in this file.
+ | Protocol | Versions | Methods or operations | Secure | Context propagation | Limitations |
+ |:---------|:---------|:----------------------|:------:|:-------------------:|:------------|
+ | HTTP | `1.0/1.1` | All | Yes | Yes | None documented |
+-| HTTP | `2.0` | All | Yes | No | Context propagation for HTTP/2 is only through Go library instrumentation |
++| HTTP | `2.0` | All | Yes | No | Context propagation for HTTP/2 is only through Go library instrumentation. On the generic path, concurrent (multiplexed) streams are parsed per read/write buffer up to the frame-scan budget (~6 streams grouped in one buffer); beyond that, overflow streams in that buffer are dropped or reported with an unknown status |
+ | gRPC | `1.0+` | All | Yes | No | Long-lived connections started before OBI may use `*` for method names |
+ | MySQL | All | All | Yes | No | Prepared statements created before OBI started may miss query text |
+ | PostgreSQL | All | All | Yes | No | Prepared statements created before OBI started may miss query text |
+diff --git a/bpf/generictracer/protocol_http2.h b/bpf/generictracer/protocol_http2.h
+index 31f445975c4e58563e18954e7e4930e3f021e387..5a7c95522faa11f76d73a95dbb78b2d0b447e75f 100644
+--- a/bpf/generictracer/protocol_http2.h
++++ b/bpf/generictracer/protocol_http2.h
+@@ -460,10 +460,15 @@ handle_headers_frame(void *ctx, grpc_frames_ctx_t *g_ctx, const frame_header_t *
+             http2_poison_hpack(&g_ctx->stream, &g_ctx->prev_info, poison);
+         }
+ 
+-        if (http_grpc_stream_ended(frame)) {
+-            if (h2_next_frame_changes_hpack(g_ctx, frame)) {
+-                http2_poison_hpack(&g_ctx->stream, &g_ctx->prev_info, poison);
+-            }
++        // Emit at the response HEADERS frame instead of deferring to the DATA
++        // end frame: a later stream's HEADERS would overwrite the single
++        // saved_buf_pos slot first, dropping every multiplexed stream but the
++        // last. No poison on a following HEADERS frame either -- the scan now
++        // walks the buffer in wire order, keeping the response HPACK decoder
++        // synced; overflow past the iteration budget is still poisoned at the
++        // end of the frames loop.
++        if (response || http_grpc_stream_ended(frame)) {
++            g_ctx->resume_pos = g_ctx->pos + frame->length + k_frame_header_len;
+             preempt_guarded_tail_call(
+                 ctx, &jump_table, k_tail_protocol_http2_grpc_handle_end_frame);
+             return 0; // normally unreachable
+@@ -481,6 +486,8 @@ handle_headers_frame(void *ctx, grpc_frames_ctx_t *g_ctx, const frame_header_t *
+             if (h2_next_frame_changes_hpack(g_ctx, frame)) {
+                 http2_poison_hpack(&g_ctx->stream, 0, h2_hpack_req_unreliable);
+             }
++            // resume after start_frame so the other multiplexed streams register
++            g_ctx->resume_pos = g_ctx->pos + frame->length + k_frame_header_len;
+             preempt_guarded_tail_call(
+                 ctx, &jump_table, k_tail_protocol_http2_grpc_handle_start_frame);
+             return 0; // normally unreachable
+@@ -490,6 +497,20 @@ handle_headers_frame(void *ctx, grpc_frames_ctx_t *g_ctx, const frame_header_t *
+     return 1;
+ }
+ 
++// mirrors k_max_loop_iterations * k_loop_count in the frames program below
++enum { k_h2_frame_scan_max_iterations = 12 };
++
++// Hands control back to the frame scan after a per-frame handler tail-called
++// away, so the rest of the streams in a multiplexed buffer are still scanned.
++// The caller must set g_ctx->resume_pos to the offset past its frame.
++static __always_inline void resume_frame_scan(void *ctx, grpc_frames_ctx_t *g_ctx) {
++    g_ctx->pos = g_ctx->resume_pos;
++    if (!g_ctx->terminate_search && g_ctx->pos < g_ctx->args.bytes_len &&
++        g_ctx->iterations < k_h2_frame_scan_max_iterations) {
++        preempt_guarded_tail_call(ctx, &jump_table, k_tail_protocol_http2_grpc_frames);
++    }
++}
++
+ static __always_inline void handle_data_frame(void *ctx, grpc_frames_ctx_t *g_ctx) {
+     if (!g_ctx->has_prev_info || !g_ctx->saved_stream_id) {
+         // we haven't found anything useful...
+@@ -527,6 +548,8 @@ int GUARDED_PROG(obi_protocol_http2_grpc_handle_start_frame, void *, ctx) {
+     http2_grpc_start(
+         ctx, &g_ctx->stream, offset, args->bytes_len, args->direction, args->ssl, args->orig_dport);
+ 
++    // reached only on the client path (server path tail-calls away above)
++    resume_frame_scan(ctx, g_ctx);
+     return 0;
+ }
+ 
+@@ -739,6 +762,8 @@ int GUARDED_PROG(obi_protocol_http2_grpc_handle_start_frame_server_commit, void
+     http2_grpc_start_finalize_server(
+         &g_ctx->stream, h2g_info, tp_p, found_tp, g_ctx->args.ssl, g_ctx->args.orig_dport);
+ 
++    // server request registered; scan the rest of the multiplexed streams
++    resume_frame_scan(ctx, g_ctx);
+     return 0;
+ }
+ 
+@@ -764,6 +789,11 @@ int GUARDED_PROG(obi_protocol_http2_grpc_handle_end_frame, void *, ctx) {
+         http2_grpc_end(&g_ctx->stream, &g_ctx->prev_info, offset);
+ 
+         bpf_map_delete_elem(&active_ssl_connections, &g_ctx->args.pid_conn);
++
++        // drop the per-stream latch so the resumed scan looks up the next
++        // stream fresh instead of re-emitting this one
++        g_ctx->has_prev_info = 0;
++        g_ctx->saved_stream_id = 0;
+     } else {
+         // Wrong-direction end flag (e.g. a CLIENT request's own HEADERS
+         // carries END_STREAM=1). Keep ongoing_http2_grpc so the correct
+@@ -774,6 +804,8 @@ int GUARDED_PROG(obi_protocol_http2_grpc_handle_end_frame, void *, ctx) {
+                        g_ctx->prev_info.type);
+     }
+ 
++    // continue scanning the remaining multiplexed streams in this buffer
++    resume_frame_scan(ctx, g_ctx);
+     return 0;
+ }
+ 
+diff --git a/bpf/generictracer/types/grpc_frames_ctx.h b/bpf/generictracer/types/grpc_frames_ctx.h
+index d34edb0c429f6b0064d4390acfa69664378fbcce..8c37171948effa3a385eea856ec8445d873eaee6 100644
+--- a/bpf/generictracer/types/grpc_frames_ctx.h
++++ b/bpf/generictracer/types/grpc_frames_ctx.h
+@@ -18,6 +18,10 @@ typedef struct grpc_frames_ctx {
+     int pos; //FIXME should be size_t equivalent
+     int saved_buf_pos;
+     u32 saved_stream_id;
++    // byte offset past the frame a handler tail-called on, so resume_frame_scan
++    // can continue the scan; _pad keeps 8-byte alignment (-Werror -Wpadded)
++    int resume_pos;
++    u32 _pad_resume;
+     call_protocol_args_t args;
+     http2_conn_stream_t stream;
+ 
+diff --git a/internal/test/integration/components/h2mux/client/Dockerfile b/internal/test/integration/components/h2mux/client/Dockerfile
+new file mode 100644
+index 0000000000000000000000000000000000000000..ffaf2fad98360d05044670087c21a14096cd6256
+--- /dev/null
++++ b/internal/test/integration/components/h2mux/client/Dockerfile
+@@ -0,0 +1,6 @@
++FROM python:3.14.3-slim@sha256:6a27522252aef8432841f224d9baaa6e9fce07b07584154fa0b9a96603af7456
++WORKDIR /app
++COPY requirements.txt .
++RUN pip install --require-hashes -r requirements.txt
++COPY client.py .
++CMD ["python3", "client.py"]
+diff --git a/internal/test/integration/components/h2mux/client/client.py b/internal/test/integration/components/h2mux/client/client.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e3dd8e38f3972ba182d74be3d6009c92a15b10b
+--- /dev/null
++++ b/internal/test/integration/components/h2mux/client/client.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python3
++# h2c client that repeatedly fires bursts of STREAMS requests on one connection,
++# writing all their HEADERS in a single send() to force one multiplexed buffer.
++# Each burst uses a fresh random id and paths /burst/<id>/stream/<i> so the test
++# can group captured spans by burst.
++import os
++import secrets
++import socket
++import sys
++import time
++
++from h2.config import H2Configuration
++from h2.connection import H2Connection
++from h2.events import ResponseReceived
++
++HOST = os.getenv("TARGET_HOST", "h2mux-server")
++PORT = int(os.getenv("TARGET_PORT", "8080"))
++STREAMS = int(os.getenv("STREAMS", "5"))
++ONESHOT = os.getenv("ONESHOT", "").lower() in ("1", "true", "yes")
++
++
++def burst() -> int:
++    burst_id = secrets.randbelow(1_000_000)  # unique per burst; every request in it carries this id
++    sock = socket.create_connection((HOST, PORT))
++    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
++    conn = H2Connection(config=H2Configuration(client_side=True))
++    conn.initiate_connection()
++    sock.sendall(conn.data_to_send())
++
++    want = set()
++    for i in range(STREAMS):
++        sid = conn.get_next_available_stream_id()
++        conn.send_headers(
++            sid,
++            [
++                (b":method", b"GET"),
++                (b":path", f"/burst/{burst_id}/stream/{i}".encode()),
++                (b":scheme", b"http"),
++                (b":authority", HOST.encode()),
++            ],
++            end_stream=True,
++        )
++        want.add(sid)
++    sock.sendall(conn.data_to_send())  # all STREAMS HEADERS in ONE write
++
++    got = set()
++    while len(got) < STREAMS:
++        data = sock.recv(65535)
++        if not data:
++            break
++        for event in conn.receive_data(data):
++            if isinstance(event, ResponseReceived):
++                got.add(event.stream_id)
++        out = conn.data_to_send()
++        if out:
++            sock.sendall(out)
++    sock.close()
++    ok = len(want & got)
++    print(f"burst id={burst_id} streams={STREAMS} responded={ok}", flush=True)
++    return ok
++
++
++def main() -> None:
++    if ONESHOT:
++        sys.exit(0 if burst() == STREAMS else 1)
++    while True:
++        try:
++            burst()
++        except Exception as e:  # keep generating traffic across transient errors
++            print(f"burst error: {e}", flush=True)
++        time.sleep(2)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/internal/test/integration/components/h2mux/client/requirements.txt b/internal/test/integration/components/h2mux/client/requirements.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c234aecf76c700e910cc7ce6df65a7fea7b6280
+--- /dev/null
++++ b/internal/test/integration/components/h2mux/client/requirements.txt
+@@ -0,0 +1,14 @@
++# This file was autogenerated by uv via the following command:
++#    uv pip compile --generate-hashes --strip-extras -o requirements.txt requirements.in
++h2==4.4.1 \
++    --hash=sha256:0e25f1462b23c9cb82d9eb02e28bc706dac2a68cb457c6a0d74d63c8a2a5d0e6 \
++    --hash=sha256:4e866ffb1a869ae14dd9b5e6beb5c24a13da0495ad72b65925ded182521c1516
++    # via -r requirements.in
++hpack==4.2.0 \
++    --hash=sha256:0895cfa3b5531fc65fe439c05eb65144f123bf7a394fcaa56aa423548d8e45c0 \
++    --hash=sha256:858ac0b02280fa582b5080d68db0899c62a80375e0e5413a74970c5e518b6986
++    # via h2
++hyperframe==6.1.0 \
++    --hash=sha256:b03380493a519fce58ea5af42e4a42317bf9bd425596f7a0835ffce80f1a42e5 \
++    --hash=sha256:f630908a00854a7adeabd6382b43923a4c4cd4b821fcb527e6ab9e15382a3b08
++    # via h2
+diff --git a/internal/test/integration/components/h2mux/server/Dockerfile b/internal/test/integration/components/h2mux/server/Dockerfile
+new file mode 100644
+index 0000000000000000000000000000000000000000..767e6ee29f25ab5a4ed8560478e6fe270fc76b39
+--- /dev/null
++++ b/internal/test/integration/components/h2mux/server/Dockerfile
+@@ -0,0 +1,8 @@
++FROM python:3.14.3-slim@sha256:6a27522252aef8432841f224d9baaa6e9fce07b07584154fa0b9a96603af7456
++WORKDIR /app
++COPY requirements.txt .
++RUN pip install --require-hashes -r requirements.txt
++COPY server.py .
++ENV PORT=8080 BATCH=5
++EXPOSE 8080
++CMD ["python3", "server.py"]
+diff --git a/internal/test/integration/components/h2mux/server/requirements.txt b/internal/test/integration/components/h2mux/server/requirements.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c234aecf76c700e910cc7ce6df65a7fea7b6280
+--- /dev/null
++++ b/internal/test/integration/components/h2mux/server/requirements.txt
+@@ -0,0 +1,14 @@
++# This file was autogenerated by uv via the following command:
++#    uv pip compile --generate-hashes --strip-extras -o requirements.txt requirements.in
++h2==4.4.1 \
++    --hash=sha256:0e25f1462b23c9cb82d9eb02e28bc706dac2a68cb457c6a0d74d63c8a2a5d0e6 \
++    --hash=sha256:4e866ffb1a869ae14dd9b5e6beb5c24a13da0495ad72b65925ded182521c1516
++    # via -r requirements.in
++hpack==4.2.0 \
++    --hash=sha256:0895cfa3b5531fc65fe439c05eb65144f123bf7a394fcaa56aa423548d8e45c0 \
++    --hash=sha256:858ac0b02280fa582b5080d68db0899c62a80375e0e5413a74970c5e518b6986
++    # via h2
++hyperframe==6.1.0 \
++    --hash=sha256:b03380493a519fce58ea5af42e4a42317bf9bd425596f7a0835ffce80f1a42e5 \
++    --hash=sha256:f630908a00854a7adeabd6382b43923a4c4cd4b821fcb527e6ab9e15382a3b08
++    # via h2
+diff --git a/internal/test/integration/components/h2mux/server/server.py b/internal/test/integration/components/h2mux/server/server.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..70062d1d86d29a3fa44bbb2594e9407926ea591f
+--- /dev/null
++++ b/internal/test/integration/components/h2mux/server/server.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++# Minimal h2c (cleartext HTTP/2) server that deterministically multiplexes: it
++# withholds responses until BATCH streams have arrived, then writes them all in
++# a single send() so the instrumented process emits one write buffer carrying
++# many streams. /health is answered immediately; any other path returns 200.
++import os
++import socket
++import threading
++
++from h2.config import H2Configuration
++from h2.connection import H2Connection
++from h2.events import RequestReceived, StreamEnded
++
++PORT = int(os.getenv("PORT", "8080"))
++BATCH = int(os.getenv("BATCH", "5"))  # flush responses only once this many streams are pending
++
++
++def send_one_response(conn: H2Connection, stream_id: int) -> None:
++    body = b"ok"
++    conn.send_headers(
++        stream_id,
++        [
++            (b":status", b"200"),
++            (b"content-type", b"text/plain"),
++            (b"content-length", str(len(body)).encode()),
++        ],
++    )
++    conn.send_data(stream_id, body, end_stream=True)
++
++
++def handle(sock: socket.socket) -> None:
++    conn = H2Connection(config=H2Configuration(client_side=False))
++    conn.initiate_connection()
++    sock.sendall(conn.data_to_send())
++
++    paths: dict[int, str] = {}
++    ready: list[int] = []  # streams that have fully arrived (END_STREAM seen)
++
++    try:
++        while True:
++            data = sock.recv(65535)
++            if not data:
++                return
++            for event in conn.receive_data(data):
++                if isinstance(event, RequestReceived):
++                    hdrs = dict(event.headers)
++                    paths[event.stream_id] = hdrs.get(b":path", b"/").decode()
++                elif isinstance(event, StreamEnded):
++                    ready.append(event.stream_id)
++
++            # Flush control frames (SETTINGS ack, etc.) that h2 queued.
++            ctrl = conn.data_to_send()
++            if ctrl:
++                sock.sendall(ctrl)
++
++            # Health probes shouldn't wait for a batch — answer them immediately.
++            for sid in [s for s in ready if paths.get(s) == "/health"]:
++                send_one_response(conn, sid)
++                ready.remove(sid)
++                paths.pop(sid, None)
++                sock.sendall(conn.data_to_send())
++
++            # Once BATCH real requests are queued, answer them ALL in ONE send().
++            if len(ready) >= BATCH:
++                batch = ready[:BATCH]
++                del ready[:BATCH]
++                for sid in batch:
++                    send_one_response(conn, sid)
++                    paths.pop(sid, None)
++                sock.sendall(conn.data_to_send())  # single write, BATCH streams
++    finally:
++        sock.close()
++
++
++def main() -> None:
++    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++    srv.bind(("0.0.0.0", PORT))
++    srv.listen(128)
++    print(f"h2mux server listening on :{PORT} (BATCH={BATCH})", flush=True)
++    while True:
++        client, _ = srv.accept()
++        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
++        threading.Thread(target=handle, args=(client,), daemon=True).start()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/internal/test/integration/configs/obi-config-h2mux.yml b/internal/test/integration/configs/obi-config-h2mux.yml
+new file mode 100644
+index 0000000000000000000000000000000000000000..6701efd649df561c91827a8e2725d897c4385edb
+--- /dev/null
++++ b/internal/test/integration/configs/obi-config-h2mux.yml
+@@ -0,0 +1,14 @@
++trace_printer: text
++routes:
++  unmatched: path
++otel_traces_export:
++  endpoint: http://jaeger:4318
++ebpf:
++  context_propagation: all
++discovery:
++  services:
++    - exe_path: python
++attributes:
++  select:
++    "*":
++      include: ["*"]
+diff --git a/internal/test/integration/docker-compose-h2mux.yml b/internal/test/integration/docker-compose-h2mux.yml
+new file mode 100644
+index 0000000000000000000000000000000000000000..f155cc6e4d6e021c79bd16287924d27de5d6cc92
+--- /dev/null
++++ b/internal/test/integration/docker-compose-h2mux.yml
+@@ -0,0 +1,59 @@
++services:
++  h2mux-server:
++    build:
++      context: ./components/h2mux/server
++    image: hatest-h2mux-server
++    environment:
++      BATCH: "${H2MUX_STREAMS:-5}"
++      OTEL_SERVICE_NAME: h2mux-server
++    ports:
++      - "8080:8080"
++
++  h2mux-client:
++    build:
++      context: ./components/h2mux/client
++    image: hatest-h2mux-client
++    environment:
++      TARGET_HOST: h2mux-server
++      TARGET_PORT: "8080"
++      STREAMS: "${H2MUX_STREAMS:-5}"
++      OTEL_SERVICE_NAME: h2mux-client
++    depends_on:
++      h2mux-server:
++        condition: service_started
++
++  obi:
++    build:
++      context: ../../..
++      dockerfile: ./internal/test/integration/components/obi/Dockerfile
++    command:
++      - --config=/configs/obi-config-h2mux.yml
++    volumes:
++      - ./configs/:/configs
++      - ./system/sys/kernel/security${SECURITY_CONFIG_SUFFIX}:/sys/kernel/security
++      - /sys/fs/bpf:/sys/fs/bpf
++      - /sys/fs/cgroup:/sys/fs/cgroup
++      - /sys/kernel/tracing:/sys/kernel/tracing:ro
++      - ../../../testoutput:/coverage
++      - ../../../testoutput/run-h2mux:/var/run/obi
++    image: hatest-obi
++    privileged: true
++    init: true
++    pid: "host"
++    cgroup: "host"
++    environment:
++      GOCOVERDIR: "/coverage"
++      OTEL_EBPF_HOSTNAME: "beyla"
++      OTEL_EBPF_BPF_CONTEXT_PROPAGATION: "all"
++      OTEL_EBPF_DISCOVERY_POLL_INTERVAL: "1s"
++      OTEL_EBPF_LOG_LEVEL: "DEBUG"
++    depends_on:
++      h2mux-server:
++        condition: service_started
++
++  jaeger:
++    image: jaegertracing/jaeger:2.20.0@sha256:46a886260e04002d8f45e213fc39063fa11a50446048fdaa64786fc0840cb9f8
++    ports:
++      - "16686:16686"
++      - "4317:4317"
++      - "4318:4318"
+diff --git a/internal/test/integration/h2mux_test.go b/internal/test/integration/h2mux_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..bcde620cf470073cc6862cb63b16d8a9ae9533a4
+--- /dev/null
++++ b/internal/test/integration/h2mux_test.go
+@@ -0,0 +1,112 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package integration
++
++import (
++	"encoding/json"
++	"net/http"
++	"path"
++	"regexp"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"go.opentelemetry.io/obi/internal/test/integration/components/docker"
++	"go.opentelemetry.io/obi/internal/test/integration/components/jaeger"
++)
++
++// h2muxStreams is the streams per burst, kept within the frame scanner's
++// per-buffer budget (~6) so a correct scanner captures the whole burst.
++const h2muxStreams = 5
++
++// minFullyCapturedBursts guards against one lucky burst passing the assertion.
++const minFullyCapturedBursts = 5
++
++// TestSuite_HTTP2Multiplexing checks that the generic tracer captures every
++// stream of a densely multiplexed HTTP/2 connection. The client sends
++// h2muxStreams requests in one write and the server replies to them in one
++// write, forcing many streams into a single read/write buffer — the condition
++// that used to collapse span capture. Both the server and client side must show
++// fully-captured bursts and no partially-captured burst.
++func TestSuite_HTTP2Multiplexing(t *testing.T) {
++	compose, err := docker.ComposeSuite("docker-compose-h2mux.yml", path.Join(pathOutput, "test-suite-h2mux.log"))
++	require.NoError(t, err)
++
++	if !KernelLockdownMode() {
++		compose.Env = append(compose.Env, `SECURITY_CONFIG_SUFFIX=_none`)
++	}
++
++	require.NoError(t, compose.Up())
++	t.Cleanup(func() {
++		if err := compose.Close(); err != nil {
++			t.Logf("compose.Close(): %v", err)
++		}
++	})
++
++	require.Eventually(t, func() bool {
++		return hasSpansInJaeger("h2mux-server") && hasSpansInJaeger("h2mux-client")
++	}, 90*time.Second, time.Second, "OBI did not instrument the h2mux workloads")
++
++	// Retrying lets warm-up bursts (uprobe not yet attached) age out of the
++	// lookback window, leaving a clean window of fully-captured bursts.
++	require.EventuallyWithT(t, func(ct *assert.CollectT) {
++		assertBurstsFullyCaptured(ct, "h2mux-server", "server")
++		assertBurstsFullyCaptured(ct, "h2mux-client", "client")
++	}, 90*time.Second, 2*time.Second)
++}
++
++func assertBurstsFullyCaptured(ct *assert.CollectT, service, kind string) {
++	full, partial := capturedBurstStats(ct, service, kind)
++	require.Zero(ct, partial,
++		"%s: %d burst(s) had streams dropped within a multiplexed buffer", service, partial)
++	require.GreaterOrEqual(ct, full, minFullyCapturedBursts,
++		"%s: only %d burst(s) fully captured, want >= %d", service, full, minFullyCapturedBursts)
++}
++
++var burstPathRe = regexp.MustCompile(`/burst/(\d+)/stream/(\d+)`)
++
++// capturedBurstStats groups a side's spans by burst id and counts bursts whose
++// h2muxStreams streams were all captured (full) versus only some (partial).
++func capturedBurstStats(ct *assert.CollectT, service, kind string) (full, partial int) {
++	resp, err := http.Get(jaegerQueryURL + "?service=" + service + "&limit=500&lookback=30s")
++	require.NoError(ct, err)
++	defer resp.Body.Close()
++	require.Equal(ct, http.StatusOK, resp.StatusCode)
++
++	var tq jaeger.TracesQuery
++	require.NoError(ct, json.NewDecoder(resp.Body).Decode(&tq))
++	require.NotEmpty(ct, tq.Data, "no %s traces in jaeger yet", service)
++
++	streamsByBurst := map[string]map[string]struct{}{}
++	for _, trace := range tq.Data {
++		for _, s := range trace.Spans {
++			proc, ok := trace.Processes[s.ProcessID]
++			if !ok || proc.ServiceName != service {
++				continue
++			}
++			if tag, ok := jaeger.FindIn(s.Tags, "span.kind"); !ok || tag.Value != kind {
++				continue
++			}
++			m := burstPathRe.FindStringSubmatch(s.OperationName)
++			if m == nil {
++				continue
++			}
++			burstID, streamIdx := m[1], m[2]
++			if streamsByBurst[burstID] == nil {
++				streamsByBurst[burstID] = map[string]struct{}{}
++			}
++			streamsByBurst[burstID][streamIdx] = struct{}{}
++		}
++	}
++	for _, streams := range streamsByBurst {
++		if len(streams) >= h2muxStreams {
++			full++
++		} else {
++			partial++
++		}
++	}
++	return full, partial
++}
+diff --git a/pkg/ebpf/common/http2grpc_transform_test.go b/pkg/ebpf/common/http2grpc_transform_test.go
+index a50446ac24bd80b4edb9530cf680ebb8906f308d..ded1d8c163b6f66b6e250e4ffb83db67f025464e 100644
+--- a/pkg/ebpf/common/http2grpc_transform_test.go
++++ b/pkg/ebpf/common/http2grpc_transform_test.go
+@@ -305,6 +305,40 @@ func TestHTTP2ResponseDoesNotPolluteRequestTable(t *testing.T) {
+ 	}
+ }
+ 
++// Multiplexed HTTP/2 responses share one connection, and a server dynamic-indexes a repeated
++// non-static :status: the first response inserts it, later ones reference it from the dynamic
++// table. Decoding the blocks in wire order must keep the response decoder in sync so every
++// stream resolves its status; a dropped or out-of-order block would freeze the table and turn
++// every later :status into <BAD INDEX> (status 0). This guards the userspace side of the
++// multiplexed-HTTP/2 fix, which relies on the frame scanner feeding every response HEADERS
++// frame in order.
++func TestHTTP2MultiplexedResponseStatusStaysInSync(t *testing.T) {
++	const status = 512
++
++	// One encoder models one server: the repeated non-static :status is inserted once and then
++	// referenced from the dynamic table on the following streams.
++	var buf bytes.Buffer
++	enc := hpack.NewEncoder(&buf)
++	blocks := make([][]byte, 5)
++	for i := range blocks {
++		buf.Reset()
++		require.NoError(t, enc.WriteField(hpack.HeaderField{Name: ":status", Value: strconv.Itoa(status)}))
++		blocks[i] = append([]byte(nil), buf.Bytes()...)
++	}
++	// A later block must be shorter than the first, proving the encoder dynamic-indexed the
++	// repeated :status; otherwise a desynced table would still pass this test.
++	require.Less(t, len(blocks[len(blocks)-1]), len(blocks[0]),
++		"encoder must dynamic-index the repeated :status for this to exercise table sync")
++
++	parseContext := NewEBPFParseContext(nil, nil, nil)
++	framer := byteFramer(nil)
++	for i, block := range blocks {
++		st, _, ok := readRetMetaFrame(parseContext, 1, framer, headersFrame(t, block))
++		require.Truef(t, ok, "stream %d: response must decode a :status", i)
++		assert.Equalf(t, status, st, "stream %d: :status must stay in sync across multiplexed responses", i)
++	}
++}
++
+ // encodeHPACK writes fields with a real encoder, so the representation each field gets is not
+ // this test's guess. tableSizes are applied first, which makes the encoder emit size updates
+ // ahead of the block.

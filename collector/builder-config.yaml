@@ -1,0 +1,49 @@
+# Standalone eBPF collector distribution (OCB), built from the SAME patched OBI
+# tree as the CloudWatch Agent receiver (build/obi). Use it wherever an
+# OBI-as-receiver collector runs on its own (demos, A/B checks against cwagent),
+# so both binaries carry identical OBI code.
+#
+# Versions are pinned to the collector line that 99-pin-to-cwagent aligns
+# build/obi with (core v0.150.0 / stable v1.56.0); keep them in step with
+# ci/cwagent-*.go.mod when that pin moves.
+#
+# Component set = everything the fork's examples/otel-collector build ever added
+# (otlphttp, sigv4auth, cumulativetodelta for CloudWatch OTLP; spanmetrics +
+# filter + transform for span-derived RED), plus resource for tagging.
+dist:
+  name: otelcol-obi
+  description: OpenTelemetry Collector with the ADOT OBI receiver
+  output_path: ./otelcol-obi
+
+replaces:
+  - go.opentelemetry.io/obi => ../
+
+exporters:
+  - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.150.0
+  - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.150.0
+  - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.150.0
+
+processors:
+  - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.150.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/cumulativetodeltaprocessor v0.150.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourceprocessor v0.150.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor v0.150.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/filterprocessor v0.150.0
+
+connectors:
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/connector/spanmetricsconnector v0.150.0
+
+extensions:
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/sigv4authextension v0.150.0
+
+receivers:
+  - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.150.0
+  - gomod: go.opentelemetry.io/obi v0.5.0
+    import: go.opentelemetry.io/obi/collector
+
+providers:
+  - gomod: go.opentelemetry.io/collector/confmap/provider/envprovider v1.56.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/fileprovider v1.56.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/httpprovider v1.56.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/httpsprovider v1.56.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/yamlprovider v1.56.0

@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wangzlei <66336933+wangzlei@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 12:57:13 -0700
+Subject: [PATCH 3/4] red-attrs: peer.service.name on client spans and HTTP
+ client RED metrics
+
+Emit the downstream's TCP-option-propagated service.name as peer.service.name
+(renamed from tcp.peer.service.name) on client spans, and add it as a default
+attribute of the http client RED metric group (http.client.request.duration).
+
+Source: 5da1826a, f5027fd8.
+Adot-Obi-Patch: 03-peer-service-name-red-attrs
+---
+ pkg/appolly/app/request/span_getters.go | 7 +++++++
+ pkg/export/attributes/attr_defs.go      | 5 +++--
+ pkg/export/attributes/names/attrs.go    | 5 +++++
+ pkg/export/otel/tracesgen/tracesgen.go  | 8 +++-----
+ 4 files changed, 18 insertions(+), 7 deletions(-)
+
+diff --git a/pkg/appolly/app/request/span_getters.go b/pkg/appolly/app/request/span_getters.go
+index 1adb4a7f4be7cfa4547c74c3555d46c8790aaac2..4d7aaed2f5502cbdb56517ef50f3b51a7d4d98c8 100644
+--- a/pkg/appolly/app/request/span_getters.go
++++ b/pkg/appolly/app/request/span_getters.go
+@@ -77,6 +77,13 @@ func spanOTELGetters(name attr.Name) (attributes.Getter[*Span, attribute.KeyValu
+ 		}
+ 	case attr.ServerPort:
+ 		getter = func(s *Span) attribute.KeyValue { return ServerPort(s.HostPort) }
++	case attr.PeerServiceName:
++		getter = func(s *Span) attribute.KeyValue {
++			if s.PeerServiceName == "" {
++				return attribute.KeyValue{}
++			}
++			return attribute.Key(attr.PeerServiceName).String(s.PeerServiceName)
++		}
+ 	case attr.RPCMethod:
+ 		getter = func(s *Span) attribute.KeyValue {
+ 			if s.Type == EventTypeSunRPCClient || s.Type == EventTypeSunRPCServer {
+diff --git a/pkg/export/attributes/attr_defs.go b/pkg/export/attributes/attr_defs.go
+index 5fba4285cafb7c001aa47770f98113cf9a696917..8289d05fd2d7e836fc1e84c743254d71e9b8a005 100644
+--- a/pkg/export/attributes/attr_defs.go
++++ b/pkg/export/attributes/attr_defs.go
+@@ -303,8 +303,9 @@ func getDefinitions(
+ 		false,
+ 		nil,
+ 		map[attr.Name]Default{
+-			attr.ServerAddr: true,
+-			attr.ServerPort: true,
++			attr.ServerAddr:      true,
++			attr.ServerPort:      true,
++			attr.PeerServiceName: true,
+ 		},
+ 		extraGroupAttributes[GroupHTTPClientInfo],
+ 	)
+diff --git a/pkg/export/attributes/names/attrs.go b/pkg/export/attributes/names/attrs.go
+index 89742761a770f24769091d00689cac3e1f107bb8..6e0b37910997e83f7170bfecf54917d7f2f8ac08 100644
+--- a/pkg/export/attributes/names/attrs.go
++++ b/pkg/export/attributes/names/attrs.go
+@@ -96,6 +96,11 @@ const (
+ 	HTTPResponseBodyContent  = Name("http.response.body.content")
+ )
+ 
++// PeerServiceName is the downstream service's own service.name, learned
++// hop-by-hop from a kind-26 TCP option (EXPERIMENTAL — TCP service-name
++// propagation). Client-side only.
++const PeerServiceName = Name("peer.service.name")
++
+ // HTTPRequestHeaderKey returns the attribute key for a request header (lowercased).
+ func HTTPRequestHeaderKey(name string) string {
+ 	return HTTPRequestHeaderPrefix + strings.ToLower(name)
+diff --git a/pkg/export/otel/tracesgen/tracesgen.go b/pkg/export/otel/tracesgen/tracesgen.go
+index cdf92b87315b995633d5b698d822bc71a639ec74..d432709e50b531a4939e4f5772daf2c4f734ec30 100644
+--- a/pkg/export/otel/tracesgen/tracesgen.go
++++ b/pkg/export/otel/tracesgen/tracesgen.go
+@@ -665,12 +665,10 @@ func traceAttributesSelectorInternal(span *request.Span, optionalAttrs map[attr.
+ 			}
+ 		}
+ 
+-		// EXPERIMENTAL — TCP service-name propagation. Distinct from peer.service
+-		// (which is OBI's local k8s-resolved guess): this value is what the
+-		// downstream reported about ITSELF over a kind-26 TCP option, so it is
+-		// emitted under its own key rather than overwriting peer.service.
++		// EXPERIMENTAL — TCP service-name propagation: the downstream service's
++		// own service.name, reported hop-by-hop over a kind-26 TCP option.
+ 		if span.PeerServiceName != "" {
+-			attrs = append(attrs, attribute.String("tcp.peer.service.name", span.PeerServiceName))
++			attrs = append(attrs, attribute.String("peer.service.name", span.PeerServiceName))
+ 		}
+ 
+ 		if span.SubType == request.HTTPSubtypeElasticsearch && span.Elasticsearch != nil {

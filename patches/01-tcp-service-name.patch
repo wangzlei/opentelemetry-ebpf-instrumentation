@@ -1,0 +1,830 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wangzlei <66336933+wangzlei@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 13:28:19 -0700
+Subject: [PATCH 1/4] tcp-service-name: propagate the server's service.name in
+ a TCP option
+
+Upstream OBI cannot tell a client which service it is calling: the downstream
+service.name is configured only on the downstream process. This patch has the
+server write its own service.name (at most 25 bytes) into a TCP option (kind
+26) on its response segments, once per connection; the client side reads it
+and records it as the span's PeerServiceName. Patch 03 exports it as
+peer.service.name on client spans and RED metrics.
+
+Mechanism (tpinjector, sockops + sk_msg):
+- svc_name_by_pid: service.name per instrumented server PID.
+- sk_svc_name_map: name staged per server socket, emitted by the sockops
+  header-option callbacks.
+- svc_peer_name_map: name parsed from response segments, keyed by the sorted
+  connection tuple; read by the generic (http_info_t) and Go
+  (http_request_trace_t) tracers when the client request completes.
+
+Server-response capture fix: a passive socket placed in sock_dir sends through
+the sk_psock path, so tcp_sendmsg does not fire for its responses. The sk_msg
+program therefore pulls the message data and fills msg_buffers on the server
+path too, so the backup kprobe still captures plaintext HTTP/1 responses.
+Without it, non-Go (kprobe-traced) servers lose every server span.
+
+Only the TCP option is added; L7 payloads and headers are never modified.
+Requires CAP_NET_ADMIN (cgroup sockops/sk_msg).
+
+Source (fork wangzlei/opentelemetry-ebpf-instrumentation): f1a30ef2 (TCP
+service-name part only), f876ca4d, 0e69fbc0, 221648bd. The request-head AWS SDK
+parser that f1a30ef2 also carried is intentionally not included: AWS calls are
+handled by upstream payload extraction instead.
+
+Adot-Obi-Patch: 01-tcp-service-name
+---
+ bpf/common/common.h                        |  13 ++
+ bpf/common/http_info.h                     |  13 ++
+ bpf/generictracer/protocol_http.h          |  24 +++
+ bpf/gotracer/go_nethttp.c                  |  15 ++
+ bpf/maps/svc_peer_name_map.h               |  43 ++++
+ bpf/tpinjector/maps/sk_svc_name_map.h      |  36 ++++
+ bpf/tpinjector/maps/svc_name_by_pid.h      |  27 +++
+ bpf/tpinjector/tpinjector.c                | 230 ++++++++++++++++++---
+ pkg/appolly/app/request/span.go            |  21 +-
+ pkg/ebpf/common/http_transform.go          |  16 ++
+ pkg/ebpf/common/spanner.go                 |  12 ++
+ pkg/export/otel/tracesgen/tracesgen.go     |   8 +
+ pkg/internal/ebpf/tpinjector/tpinjector.go |  46 ++++-
+ 13 files changed, 468 insertions(+), 36 deletions(-)
+ create mode 100644 bpf/maps/svc_peer_name_map.h
+ create mode 100644 bpf/tpinjector/maps/sk_svc_name_map.h
+ create mode 100644 bpf/tpinjector/maps/svc_name_by_pid.h
+
+diff --git a/bpf/common/common.h b/bpf/common/common.h
+index ec6e38772ec75e5dc1461759bc053b2dc42cab95..e05e44aa7f615c4e6134753207bb7fdf5d332314 100644
+--- a/bpf/common/common.h
++++ b/bpf/common/common.h
+@@ -18,6 +18,8 @@
+ #include <bpfcore/vmlinux.h>
+ #include <bpfcore/utils.h>
+ 
++#include <common/http_info.h> // HTTP_PEER_SVC_NAME_LEN
++
+ #include <common/connection_info.h>
+ #include <common/event_source.h>
+ #include <common/http_types.h>
+@@ -93,6 +95,17 @@ typedef struct http_request_trace {
+     tp_info_t tp;
+     connection_info_t conn;
+     pid_info pid;
++    // EXPERIMENTAL — TCP service-name propagation: the immediate downstream
++    // service's name, learned from a kind-26 TCP option on the response and
++    // looked up by connection in roundTripReturn. Empty unless the peer is an
++    // OBI-instrumented service on a direct (proxy-free) hop. HTTP_PEER_SVC_NAME_LEN
++    // must match K_SVC_NAME_MAX_LEN in bpf/maps/svc_peer_name_map.h.
++    u8 peer_service_name_len;
++    unsigned char peer_service_name[HTTP_PEER_SVC_NAME_LEN];
++    // BPF is built with -Werror -Wpadded, so tail padding is explicit and must be
++    // recomputed whenever fields change. Tail after pid: 1 + 25 = 26, pad 6 -> 32
++    // (8-aligned).
++    u8 _pad2[6];
+ } http_request_trace_t;
+ 
+ typedef struct sql_request_trace {
+diff --git a/bpf/common/http_info.h b/bpf/common/http_info.h
+index 247b2fba20306a545adff810bd7a5835168e9c95..dc2b45c4a66c407429620939206ec5dab694c682 100644
+--- a/bpf/common/http_info.h
++++ b/bpf/common/http_info.h
+@@ -11,6 +11,11 @@
+ 
+ #define FULL_BUF_SIZE 256
+ 
++// EXPERIMENTAL — TCP service-name propagation. Must match K_SVC_NAME_MAX_LEN in
++// bpf/maps/svc_peer_name_map.h. Defined here (the widely-included event header)
++// so both http_info_t and http_request_trace_t can size their peer-name field.
++#define HTTP_PEER_SVC_NAME_LEN 25
++
+ // Here we keep the information that is sent on the ring buffer
+ typedef struct http_info {
+     u8 flags; // Must be first, we use it to tell what kind of packet we have on the ring buffer
+@@ -31,6 +36,14 @@ typedef struct http_info {
+     u32 lb_res_bytes;
+     u16 status;
+     unsigned char buf[FULL_BUF_SIZE];
++    // EXPERIMENTAL — TCP service-name propagation: downstream service name for a
++    // CLIENT http_info, learned from a kind-26 TCP option on the response and
++    // looked up by connection (see bpf/maps/svc_peer_name_map.h). 32-byte block
++    // (25 + 1 + 6 pad) is a multiple of 8, so it preserves the alignment of every
++    // field below it and the struct size (BPF is built -Werror -Wpadded).
++    unsigned char peer_service_name[HTTP_PEER_SVC_NAME_LEN];
++    u8 peer_service_name_len;
++    u8 _pad_peer[6];
+     u8 has_large_buffers;
+     u8 direction;
+     u8 submitted;
+diff --git a/bpf/generictracer/protocol_http.h b/bpf/generictracer/protocol_http.h
+index c4d04a6913c1d752c7c1b802ed442d760a5147bc..75ba39ce137bf88401b1f2ec9bbc8c00cf859445 100644
+--- a/bpf/generictracer/protocol_http.h
++++ b/bpf/generictracer/protocol_http.h
+@@ -37,11 +37,17 @@
+ #include <maps/active_ssl_connections.h>
+ #include <maps/connection_tracker.h>
+ #include <maps/ongoing_http.h>
++#include <maps/svc_peer_name_map.h>
+ #include <maps/tp_info_mem.h>
+ #include <maps/tp_char_buf_mem.h>
+ 
+ SCRATCH_MEM_SIZED(http_previous_trace_id, TRACE_ID_SIZE_BYTES);
+ 
++// EXPERIMENTAL — TCP service-name propagation: percpu scratch for the sorted
++// connection key used to look up the peer name, kept off the BPF stack (this
++// program is already near the 512-byte stack limit).
++SCRATCH_MEM_TYPED(svc_peer_conn_key, connection_info_t);
++
+ // empty_http_info zeroes and return the unique percpu copy in the map
+ // this function assumes that a given thread is not trying to use many
+ // instances at the same time
+@@ -164,6 +170,24 @@ static __always_inline void submit_http_event(http_info_t *info, pid_connection_
+     }
+ 
+     info->submitted = 1;
++
++    // EXPERIMENTAL — TCP service-name propagation: for a client request, pick up
++    // the downstream service name the peer wrote on the response TCP option (see
++    // bpf/maps/svc_peer_name_map.h). Gated on EVENT_HTTP_CLIENT so a same-host
++    // server http_info on the same connection cannot pick up a stale entry.
++    if (info->type == EVENT_HTTP_CLIENT) {
++        connection_info_t *sorted = svc_peer_conn_key_mem();
++        if (sorted) {
++            *sorted = info->conn_info;
++            sort_connection_info(sorted);
++            const svc_name_value_t *peer = bpf_map_lookup_elem(&svc_peer_name_map, sorted);
++            if (peer && peer->len > 0 && peer->len <= HTTP_PEER_SVC_NAME_LEN) {
++                __builtin_memcpy(info->peer_service_name, peer->name, HTTP_PEER_SVC_NAME_LEN);
++                info->peer_service_name_len = peer->len;
++            }
++        }
++    }
++
+     bpf_map_update_elem(&ongoing_http, pid_conn, info, BPF_ANY);
+     http_info_t *trace = bpf_ringbuf_reserve(&events, sizeof(http_info_t), 0);
+     if (trace) {
+diff --git a/bpf/gotracer/go_nethttp.c b/bpf/gotracer/go_nethttp.c
+index c59eb493d40b86ab4395557af9c5dcad8f29f7fc..186884aa9dba3fb72128e53278bcafdfe112e875 100644
+--- a/bpf/gotracer/go_nethttp.c
++++ b/bpf/gotracer/go_nethttp.c
+@@ -48,6 +48,7 @@
+ #include <maps/go_ongoing_http.h>
+ #include <maps/go_ongoing_http_client_requests.h>
+ #include <maps/outgoing_trace_map.h>
++#include <maps/svc_peer_name_map.h>
+ #include <maps/tp_char_buf_mem.h>
+ 
+ #include <pid/pid_helpers.h>
+@@ -793,6 +794,8 @@ int GUARDED_PROG(obi_uprobe_roundTripReturn, struct pt_regs *, ctx) {
+ 
+     void *resp_ptr = (void *)GO_PARAM1(ctx);
+ 
++    trace->peer_service_name_len = 0;
++
+     connection_info_t *info = bpf_map_lookup_elem(&ongoing_client_connections, &g_key);
+     if (info) {
+         __builtin_memcpy(&trace->conn, info, sizeof(connection_info_t));
+@@ -803,6 +806,18 @@ int GUARDED_PROG(obi_uprobe_roundTripReturn, struct pt_regs *, ctx) {
+         };
+         bpf_map_delete_elem(&outgoing_trace_map, &e_key);
+         bpf_map_delete_elem(&go_ongoing_http, &e_key);
++
++        connection_info_t sorted_conn = *info;
++        sort_connection_info(&sorted_conn);
++
++        // EXPERIMENTAL — TCP service-name propagation: the downstream service's
++        // name, if it wrote a kind-26 TCP option on the response (see
++        // maps/svc_peer_name_map.h). Populated by the tpinjector sockops parser.
++        const svc_name_value_t *peer = bpf_map_lookup_elem(&svc_peer_name_map, &sorted_conn);
++        if (peer && peer->len > 0 && peer->len <= HTTP_PEER_SVC_NAME_LEN) {
++            __builtin_memcpy(trace->peer_service_name, peer->name, HTTP_PEER_SVC_NAME_LEN);
++            trace->peer_service_name_len = peer->len;
++        }
+     } else {
+         // persistConn.conn was unreadable, so take the connection the write side read
+         // from the netFD instead of reporting this call without a peer.
+diff --git a/bpf/maps/svc_peer_name_map.h b/bpf/maps/svc_peer_name_map.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..d753560fcb8184374e7f02e342e8f427093c8b04
+--- /dev/null
++++ b/bpf/maps/svc_peer_name_map.h
+@@ -0,0 +1,43 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include <bpfcore/vmlinux.h>
++#include <bpfcore/bpf_helpers.h>
++
++#include <common/connection_info.h>
++#include <common/map_sizing.h>
++#include <common/pin_internal.h>
++
++// EXPERIMENTAL — TCP service-name propagation (see docs/TCP_SERVICE_NAME_PROPAGATION.md).
++//
++// The peer's OpenTelemetry service.name, learned from a TCP option that the peer
++// wrote on a segment it sent. It carries a hop-by-hop identity: "the agent
++// managing the endpoint that sent this segment calls it <name>". It is NOT the
++// logical HTTP target, the LB-selected backend, or a per-stream identity.
++//
++// Wire limit is 25 bytes (the TCP option is 28 bytes total: kind+len+version+25;
++// established connections leave ~28 bytes of option space with timestamps on).
++// Names longer than 25 bytes are rejected, never truncated, because truncation
++// could merge unrelated services.
++#define K_SVC_NAME_MAX_LEN 25
++
++// All-u8, so alignment is 1 and there is no padding (BPF is built -Werror -Wpadded).
++typedef struct svc_name_value {
++    unsigned char name[K_SVC_NAME_MAX_LEN];
++    u8 len; // valid bytes in name; 0 means "unset"
++} svc_name_value_t;
++
++// Peer service name keyed by the sorted connection tuple. Written by the sockops
++// parse callback on the side that RECEIVES a peer's name (a client reading it off
++// a response segment); read by the client-span producer in the per-language
++// tracers, exactly like incoming_trace_map. Shared+pinned so the tpinjector
++// object and the tracer objects see the same map.
++struct {
++    __uint(type, BPF_MAP_TYPE_LRU_HASH);
++    __type(key, connection_info_t);
++    __type(value, svc_name_value_t);
++    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
++    __uint(pinning, OBI_PIN_INTERNAL);
++} svc_peer_name_map SEC(".maps");
+diff --git a/bpf/tpinjector/maps/sk_svc_name_map.h b/bpf/tpinjector/maps/sk_svc_name_map.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..66ab2e63986a812daba5a5849807c203dc246425
+--- /dev/null
++++ b/bpf/tpinjector/maps/sk_svc_name_map.h
+@@ -0,0 +1,36 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include <bpfcore/vmlinux.h>
++#include <bpfcore/bpf_helpers.h>
++
++#include <maps/svc_peer_name_map.h> // svc_name_value_t
++
++// EXPERIMENTAL — TCP service-name propagation, write side.
++//
++// Per-socket state for emitting the local service name in a TCP option. An entry
++// exists only on SERVER (passive) sockets: it is created at passive-established
++// (marking the socket as a responder) and filled with the resolved local name
++// the first time the server process writes response data through sk_msg.
++//
++// Presence of an entry is also how the sk_msg entry point distinguishes a server
++// socket from a client one, so the client request path is left completely
++// unchanged (it never gets an entry here).
++enum {
++    k_svc_state_server_pending = 1, // passive socket, local name not resolved yet
++    k_svc_state_ready = 2,          // name resolved; opt_len/write_hdr may emit it
++};
++
++typedef struct sk_svc_name_state {
++    svc_name_value_t name; // resolved local service name (valid when state == ready)
++    u8 state;
++} sk_svc_name_state_t;
++
++struct {
++    __uint(type, BPF_MAP_TYPE_SK_STORAGE);
++    __uint(map_flags, BPF_F_NO_PREALLOC);
++    __type(key, u32); // matches sk_tp_info_pid_map style (sk storage, key size 4)
++    __type(value, sk_svc_name_state_t);
++} sk_svc_name_map SEC(".maps");
+diff --git a/bpf/tpinjector/maps/svc_name_by_pid.h b/bpf/tpinjector/maps/svc_name_by_pid.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b35b37e09738fa14465b92885fe4674224c3cdf
+--- /dev/null
++++ b/bpf/tpinjector/maps/svc_name_by_pid.h
+@@ -0,0 +1,27 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++#pragma once
++
++#include <bpfcore/vmlinux.h>
++#include <bpfcore/bpf_helpers.h>
++
++#include <common/map_sizing.h>
++#include <common/pin_internal.h>
++#include <maps/svc_peer_name_map.h> // svc_name_value_t
++
++// EXPERIMENTAL — TCP service-name propagation.
++//
++// The local service.name of each instrumented process, keyed by host PID (the
++// tgid returned by pid_from_pid_tgid). Populated from user space in
++// tpinjector.AllowPID at process discovery (where svc.Attrs is resolved) and
++// removed in BlockPID. The sk_msg send path looks it up with the writing
++// process's PID so the option carries a real service name, not a node-global
++// one. This is the "identity availability" piece the design calls out.
++struct {
++    __uint(type, BPF_MAP_TYPE_HASH);
++    __type(key, u32); // host PID (tgid)
++    __type(value, svc_name_value_t);
++    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
++    __uint(pinning, OBI_PIN_INTERNAL);
++} svc_name_by_pid SEC(".maps");
+diff --git a/bpf/tpinjector/tpinjector.c b/bpf/tpinjector/tpinjector.c
+index e2e4bc676964b0c17a2605f16c4631056678f5a7..e78fbcd37651d240933bdce5165ddd4a62bc1013 100644
+--- a/bpf/tpinjector/tpinjector.c
++++ b/bpf/tpinjector/tpinjector.c
+@@ -36,6 +36,7 @@
+ #include <maps/msg_buffers.h>
+ #include <maps/outgoing_trace_map.h>
+ #include <maps/sock_dir.h>
++#include <maps/svc_peer_name_map.h>
+ #include <maps/tp_info_mem.h>
+ #include <maps/tracked_sock_cookies.h>
+ 
+@@ -45,7 +46,9 @@
+ #include <tpinjector/inject_policy.h>
+ #include <tpinjector/maps/sk_h2_flags.h>
+ #include <tpinjector/maps/sk_h2_conn_flag.h>
++#include <tpinjector/maps/sk_svc_name_map.h>
+ #include <tpinjector/maps/sk_tp_info_pid_map.h>
++#include <tpinjector/maps/svc_name_by_pid.h>
+ 
+ char __license[] SEC("license") = "Dual MIT/GPL";
+ 
+@@ -316,6 +319,23 @@ struct tp_option {
+     unsigned char span_id[SPAN_ID_SIZE_BYTES];
+ };
+ 
++// EXPERIMENTAL — TCP service-name propagation (docs/TCP_SERVICE_NAME_PROPAGATION.md).
++// A SEPARATE option kind from the trace option (25), so the kind-25 trace write
++// and parse paths are left byte-for-byte unchanged. Both kinds are unassigned in
++// the IANA registry. This option is written only on responses (server sockets)
++// and read only on the client, so requests keep carrying just the trace option.
++enum {
++    k_tcp_option_kind_svc_name = 26,
++    k_svc_name_option_version = 1,
++};
++
++struct svc_name_option {
++    u8 kind;
++    u8 len; // always sizeof(struct svc_name_option) == 28
++    u8 version;
++    unsigned char name[K_SVC_NAME_MAX_LEN];
++};
++
+ static __always_inline const char *tp_string_from_opt(const struct tp_option *opt) {
+     unsigned char *buf = tp_str_buf_mem();
+ 
+@@ -515,6 +535,13 @@ static __always_inline void bpf_sock_ops_active_est_cb(struct bpf_sock_ops *skop
+         bpf_map_update_elem(&tracked_sock_cookies, &cookie, &(u8){1}, BPF_ANY);
+     }
+     bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG);
++
++    // EXPERIMENTAL — service-name propagation: the client also PARSES, to read
++    // the server's name off response segments. Reading is idle unless a kind-26
++    // option is present, so this does not affect the existing request path.
++    if (inject_flags & k_inject_tcp_options) {
++        bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG);
++    }
+ }
+ 
+ static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *skops) {
+@@ -523,6 +550,27 @@ static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *sko
+     }
+ 
+     bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG);
++
++    // EXPERIMENTAL — service-name propagation, write side. A server must (a) run
++    // its responses through sk_msg to resolve the writing PID -> local name, so
++    // insert it into sock_dir like active sockets; (b) be able to WRITE a header
++    // option; (c) be marked as a responder. The pending marker is also what makes
++    // the sk_msg entry point treat this as a server socket and skip the
++    // client-side traceparent logic. PID is not reliably available here (passive
++    // established runs in softirq), so the name is resolved later, in sk_msg.
++    const u64 cookie = bpf_get_socket_cookie(skops);
++    bpf_sock_hash_update(skops, &sock_dir, (void *)&cookie, BPF_ANY);
++    bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG);
++
++    struct bpf_sock *sk = skops->sk;
++    if (sk) {
++        sk_svc_name_state_t *st =
++            bpf_sk_storage_get(&sk_svc_name_map, sk, NULL, BPF_SK_STORAGE_GET_F_CREATE);
++        if (st) {
++            st->state = k_svc_state_server_pending;
++            st->name.len = 0;
++        }
++    }
+ }
+ 
+ static __always_inline void bpf_sock_ops_opt_len_cb(struct bpf_sock_ops *skops) {
+@@ -534,15 +582,22 @@ static __always_inline void bpf_sock_ops_opt_len_cb(struct bpf_sock_ops *skops)
+ 
+     tp_info_pid_t *tp_pid = bpf_sk_storage_get(&sk_tp_info_pid_map, sk, NULL, 0);
+ 
+-    if (!tp_pid) {
++    if (tp_pid) {
++        const long ret = bpf_reserve_hdr_opt(skops, sizeof(struct tp_option), 0);
++        if (ret != 0) {
++            bpf_dbg_printk("failed to reserve TCP option: %d", ret);
++        }
+         return;
+     }
+ 
+-    const long ret = bpf_reserve_hdr_opt(skops, sizeof(struct tp_option), 0);
+-
+-    if (ret != 0) {
+-        bpf_dbg_printk("failed to reserve TCP option: %d", ret);
+-        return;
++    // EXPERIMENTAL — reserve space for the service-name option on server sockets
++    // that have a resolved local name ready to emit.
++    sk_svc_name_state_t *st = bpf_sk_storage_get(&sk_svc_name_map, sk, NULL, 0);
++    if (st && st->state == k_svc_state_ready) {
++        const long ret = bpf_reserve_hdr_opt(skops, sizeof(struct svc_name_option), 0);
++        if (ret != 0) {
++            bpf_dbg_printk("failed to reserve svc-name option: %d", ret);
++        }
+     }
+ }
+ 
+@@ -555,40 +610,60 @@ static __always_inline void bpf_sock_ops_write_hdr_cb(struct bpf_sock_ops *skops
+ 
+     const tp_info_pid_t *tp_pid = bpf_sk_storage_get(&sk_tp_info_pid_map, sk, NULL, 0);
+ 
+-    if (!tp_pid) {
+-        bpf_dbg_printk("tp info not found");
+-        return;
+-    }
+-
+-    // cleanup the storage to prevent it from being written more than once
+-    // (including during responses);
+-    bpf_sk_storage_delete(&sk_tp_info_pid_map, sk);
++    if (tp_pid) {
++        // cleanup the storage to prevent it from being written more than once
++        // (including during responses);
++        bpf_sk_storage_delete(&sk_tp_info_pid_map, sk);
+ 
+-    struct tp_option opt = {.kind = k_tcp_option_kind_otel, .len = sizeof(struct tp_option)};
++        struct tp_option opt = {.kind = k_tcp_option_kind_otel, .len = sizeof(struct tp_option)};
+ 
+-    __builtin_memcpy(opt.trace_id, tp_pid->tp.trace_id, sizeof(opt.trace_id));
+-    __builtin_memcpy(opt.span_id, tp_pid->tp.span_id, sizeof(opt.span_id));
++        __builtin_memcpy(opt.trace_id, tp_pid->tp.trace_id, sizeof(opt.trace_id));
++        __builtin_memcpy(opt.span_id, tp_pid->tp.span_id, sizeof(opt.span_id));
+ 
+-    const long ret = bpf_store_hdr_opt(skops, &opt, sizeof(opt), 0);
++        const long ret = bpf_store_hdr_opt(skops, &opt, sizeof(opt), 0);
+ 
+-    if (ret != 0) {
+-        bpf_dbg_printk("failed to store option: %d", ret);
+-    }
++        if (ret != 0) {
++            bpf_dbg_printk("failed to store option: %d", ret);
++        }
+ 
+-    if (g_bpf_debug) {
+-        const char *tp_str = tp_string_from_opt(&opt);
++        if (g_bpf_debug) {
++            const char *tp_str = tp_string_from_opt(&opt);
+ 
+-        if (tp_str) {
+-            bpf_dbg_printk("written TP to TCP options: %s", tp_str);
++            if (tp_str) {
++                bpf_dbg_printk("written TP to TCP options: %s", tp_str);
++            }
+         }
++        return;
+     }
+-}
+ 
+-static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops) {
+-    if (!(inject_flags & k_inject_tcp_options)) {
++    // EXPERIMENTAL — write the service-name option on server responses. Unlike the
++    // trace path above (which deletes unconditionally), keep the pending entry if
++    // the write fails with ENOSPC, so a later, less-crowded segment can carry it.
++    sk_svc_name_state_t *st = bpf_sk_storage_get(&sk_svc_name_map, sk, NULL, 0);
++    if (!st || st->state != k_svc_state_ready || st->name.len == 0) {
+         return;
+     }
+ 
++    struct svc_name_option opt = {
++        .kind = k_tcp_option_kind_svc_name,
++        .len = sizeof(struct svc_name_option),
++        .version = k_svc_name_option_version,
++    };
++    __builtin_memcpy(opt.name, st->name.name, K_SVC_NAME_MAX_LEN);
++
++    const long ret = bpf_store_hdr_opt(skops, &opt, sizeof(opt), 0);
++    if (ret == 0) {
++        bpf_sk_storage_delete(&sk_svc_name_map, sk); // emitted once per connection
++        if (g_bpf_debug) {
++            bpf_dbg_printk("wrote svc-name TCP option (len=%d)", st->name.len);
++        }
++    } else {
++        bpf_dbg_printk("failed to store svc-name option, will retry: %d", ret);
++    }
++}
++
++// Parse the kind-25 trace option carried on request segments (unchanged behaviour).
++static __always_inline void parse_trace_hdr_opt(struct bpf_sock_ops *skops) {
+     struct tp_option opt = {};
+     opt.kind = k_tcp_option_kind_otel;
+ 
+@@ -624,6 +699,56 @@ static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops
+     bpf_map_update_elem(&incoming_trace_map, &conn, &tp, BPF_ANY);
+ }
+ 
++// EXPERIMENTAL — parse the kind-26 service-name option a peer wrote on a segment
++// it sent (a client reading it off a response). Stores the peer's name keyed by
++// the sorted connection, for the client-span producer to pick up.
++static __always_inline void parse_svc_name_hdr_opt(struct bpf_sock_ops *skops) {
++    struct svc_name_option opt = {};
++    opt.kind = k_tcp_option_kind_svc_name;
++
++    const long ret = bpf_load_hdr_opt(skops, &opt, sizeof(opt), 0);
++    if (ret < 0) {
++        return; // -ENOMSG on the common path (no name option present)
++    }
++
++    if (opt.version != k_svc_name_option_version) {
++        return;
++    }
++
++    svc_name_value_t val = {};
++    // Trust the wire only up to the fixed field width; find the NUL-free length.
++    u8 n = 0;
++#pragma unroll
++    for (u8 i = 0; i < K_SVC_NAME_MAX_LEN; i++) {
++        if (opt.name[i] == 0) {
++            break;
++        }
++        n++;
++    }
++    if (n == 0) {
++        return;
++    }
++    __builtin_memcpy(val.name, opt.name, K_SVC_NAME_MAX_LEN);
++    val.len = n;
++
++    connection_info_t conn = get_connection_info_ops(skops);
++    sort_connection_info(&conn);
++    bpf_map_update_elem(&svc_peer_name_map, &conn, &val, BPF_ANY);
++
++    if (g_bpf_debug) {
++        bpf_dbg_printk("parsed peer svc-name from TCP option (len=%d)", n);
++    }
++}
++
++static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops) {
++    if (!(inject_flags & k_inject_tcp_options)) {
++        return;
++    }
++
++    parse_trace_hdr_opt(skops);
++    parse_svc_name_hdr_opt(skops);
++}
++
+ // Tracks all outgoing sockets (BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB)
+ // We don't track incoming, those would be BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB
+ SEC("sockops")
+@@ -1093,6 +1218,42 @@ static __always_inline bool handle_existing_tp_pid(struct sk_msg_md *msg,
+     return false;
+ }
+ 
++// EXPERIMENTAL — service-name propagation, write scheduling.
++// Runs on every sk_msg send. On a SERVER (passive) socket it resolves the writing
++// process's local service.name (from the user-space-populated svc_name_by_pid map)
++// and stages it so the sockops write callbacks emit the kind-26 option on the
++// response. Returns true for server sockets: the caller must then NOT run the
++// client-oriented traceparent logic (which is only correct for outgoing requests).
++// Client sockets have no sk_svc_name_map entry, so they return false and the
++// existing request path is untouched.
++static __always_inline bool schedule_service_name_option(struct sk_msg_md *msg, u64 id) {
++    struct bpf_sock *sk = msg->sk;
++    if (!sk) {
++        return false;
++    }
++
++    sk_svc_name_state_t *st = bpf_sk_storage_get(&sk_svc_name_map, sk, NULL, 0);
++    if (!st) {
++        return false; // not a server socket
++    }
++
++    if (st->state == k_svc_state_server_pending) {
++        const u32 pid = pid_from_pid_tgid(id);
++        const svc_name_value_t *name = bpf_map_lookup_elem(&svc_name_by_pid, &pid);
++        if (name && name->len > 0 && name->len <= K_SVC_NAME_MAX_LEN) {
++            __builtin_memcpy(st->name.name, name->name, K_SVC_NAME_MAX_LEN);
++            st->name.len = name->len;
++            st->state = k_svc_state_ready;
++            if (g_bpf_debug) {
++                bpf_dbg_printk("staged local svc-name for response pid=%d len=%d", pid, name->len);
++            }
++        }
++        // Name unknown yet: leave pending; a later response segment retries.
++    }
++
++    return true; // server socket — skip client traceparent logic
++}
++
+ // Sock_msg program which detects packets where it should add space for
+ // the 'Traceparent' string. It extends the HTTP header and writes the
+ // Traceparent string.
+@@ -1123,6 +1284,19 @@ int obi_packet_extender(struct sk_msg_md *msg) {
+     t_ctx->h2_tp_retries = 0;
+     t_ctx->go_grpc_conn = false;
+ 
++    // EXPERIMENTAL — service-name propagation. Server sockets only stage their own
++    // name here and return; they must not run the client request logic below.
++    // A passive socket in sock_dir sends via the sk_psock path, so tcp_sendmsg
++    // does not fire and the generic tracer captures the response from msg_buffers
++    // via its backup kprobe (tcp_rate_check_app_limited). Populate that buffer
++    // here too — otherwise the server response is never captured (plaintext
++    // HTTP/1 -> status 499), just as the client request path below does.
++    if (schedule_service_name_option(msg, id)) {
++        bpf_msg_pull_data(msg, 0, msg->size, 0);
++        fill_msg_buffers(msg, &t_ctx->p_conn, &e_key);
++        return SK_PASS;
++    }
++
+     // skip H2 here — it uses HPACK for per-stream traceparents
+     tp_info_pid_t *tp_pid = get_tp_info_pid(&e_key);
+     if (tp_pid && !is_h2_socket(msg) &&
+diff --git a/pkg/appolly/app/request/span.go b/pkg/appolly/app/request/span.go
+index 6d1156fa23d105d219cd00e63eda81abaf5b93ad..beb746815ed2b5dfc88ded1573eb62919fe46f24 100644
+--- a/pkg/appolly/app/request/span.go
++++ b/pkg/appolly/app/request/span.go
+@@ -1327,12 +1327,18 @@ type Span struct {
+ 	// ParentConditional marks a parent that may already have finished when this
+ 	// span started: BPF cannot tell at that moment, so the pipeline settles the
+ 	// link against the parent span's real end timestamp before export.
+-	ParentConditional bool           `json:"-"`
+-	TraceFlags        uint8          `json:"traceFlags,string"`
+-	Links             []SpanLink     `json:"links,omitempty"`
+-	Pid               PidInfo        `json:"-"`
+-	PeerName          string         `json:"peerName"`
+-	HostName          string         `json:"hostName"`
++	ParentConditional bool       `json:"-"`
++	TraceFlags        uint8      `json:"traceFlags,string"`
++	Links             []SpanLink `json:"links,omitempty"`
++	Pid               PidInfo    `json:"-"`
++	PeerName          string     `json:"peerName"`
++	HostName          string     `json:"hostName"`
++	// PeerServiceName is the immediate downstream service's OpenTelemetry
++	// service.name, learned hop-by-hop from a TCP option the peer wrote on the
++	// response (EXPERIMENTAL — TCP service-name propagation). Set on client spans
++	// only, and only when the downstream is an OBI-instrumented service reached
++	// over a direct, proxy-free connection.
++	PeerServiceName   string         `json:"peerServiceName,omitempty"`
+ 	OtherNamespace    string         `json:"-"`
+ 	OtherK8SNamespace string         `json:"-"`
+ 	Statement         string         `json:"-"`
+@@ -1421,6 +1427,9 @@ func spanAttributes(s *Span) SpanAttributes {
+ 			"serverAddr": SpanHost(s),
+ 			"serverPort": strconv.Itoa(s.HostPort),
+ 		}
++		if s.PeerServiceName != "" {
++			attrs["peerServiceName"] = s.PeerServiceName
++		}
+ 		if s.SubType == HTTPSubtypeElasticsearch && s.Elasticsearch != nil {
+ 			attrs["dbCollectionName"] = s.Elasticsearch.DBCollectionName
+ 			attrs["nodeName"] = s.Elasticsearch.NodeName
+diff --git a/pkg/ebpf/common/http_transform.go b/pkg/ebpf/common/http_transform.go
+index 730b570e7c5e0954f7a9725ec1d4f936a286e2fe..e9127108730a12671021e62e13567692879db1e6 100644
+--- a/pkg/ebpf/common/http_transform.go
++++ b/pkg/ebpf/common/http_transform.go
+@@ -94,9 +94,23 @@ func httpInfoToSpanLegacy(info *HTTPInfo) request.Span {
+ 			Namespace: info.Pid.Ns,
+ 		},
+ 		Statement: scheme + request.SchemeHostSeparator + info.HeaderHost,
++		// EXPERIMENTAL — TCP service-name propagation: downstream service name the
++		// peer wrote on the response TCP option (client spans only; empty otherwise).
++		PeerServiceName: peerSvcNameFromInfo(&info.BPFHTTPInfo),
+ 	}
+ }
+ 
++// peerSvcNameFromInfo extracts the NUL-free service name the kernel copied from
++// the kind-26 TCP option (EXPERIMENTAL — TCP service-name propagation). Takes the
++// embedded BPF struct so both the legacy and large-buffer span builders can use it.
++func peerSvcNameFromInfo(info *BPFHTTPInfo) string {
++	n := int(info.PeerServiceNameLen)
++	if n <= 0 || n > len(info.PeerServiceName) {
++		return ""
++	}
++	return string(info.PeerServiceName[:n])
++}
++
+ func httpRequestResponseToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo, req *http.Request, resp *http.Response) request.Span {
+ 	defer req.Body.Close()
+ 	defer resp.Body.Close()
+@@ -158,6 +172,8 @@ func httpRequestResponseToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo, r
+ 			Namespace: event.Pid.Ns,
+ 		},
+ 		Statement: scheme + request.SchemeHostSeparator + headerHost,
++		// EXPERIMENTAL — TCP service-name propagation (large-buffer path).
++		PeerServiceName: peerSvcNameFromInfo(event),
+ 	}
+ 
+ 	return postProcessHTTPSpan(parseCtx, &httpSpan, req, resp)
+diff --git a/pkg/ebpf/common/spanner.go b/pkg/ebpf/common/spanner.go
+index 4fa5057f27af628596f6bb995955ba4606683723..2c1b74524071b1895062c4d8dd907c9d97f33e51 100644
+--- a/pkg/ebpf/common/spanner.go
++++ b/pkg/ebpf/common/spanner.go
+@@ -96,6 +96,18 @@ func HTTPRequestTraceToSpan(parseCtx *EBPFParseContext, trace *HTTPRequestTrace)
+ 		SubType:   subType,
+ 	}
+ 
++	// EXPERIMENTAL — TCP service-name propagation: downstream service name learned
++	// from a kind-26 TCP option the peer wrote on the response (see
++	// bpf/maps/svc_peer_name_map.h). Set before enrichment so it survives regardless
++	// of which path builds the final span.
++	if trace.PeerServiceNameLen > 0 {
++		n := int(trace.PeerServiceNameLen)
++		if n > len(trace.PeerServiceName) {
++			n = len(trace.PeerServiceName)
++		}
++		span.PeerServiceName = string(trace.PeerServiceName[:n])
++	}
++
+ 	if parseCtx != nil && parseCtx.payloadExtraction.Enabled() && (!span.IsClientSpan() || !parseCtx.defersGoHTTPClientRequests()) {
+ 		span = enrichedGoHTTPSpan(parseCtx, trace.Conn, &span)
+ 	}
+diff --git a/pkg/export/otel/tracesgen/tracesgen.go b/pkg/export/otel/tracesgen/tracesgen.go
+index 341145095768d6cb43ba6d5d3c6d67b4ba871e21..cdf92b87315b995633d5b698d822bc71a639ec74 100644
+--- a/pkg/export/otel/tracesgen/tracesgen.go
++++ b/pkg/export/otel/tracesgen/tracesgen.go
+@@ -665,6 +665,14 @@ func traceAttributesSelectorInternal(span *request.Span, optionalAttrs map[attr.
+ 			}
+ 		}
+ 
++		// EXPERIMENTAL — TCP service-name propagation. Distinct from peer.service
++		// (which is OBI's local k8s-resolved guess): this value is what the
++		// downstream reported about ITSELF over a kind-26 TCP option, so it is
++		// emitted under its own key rather than overwriting peer.service.
++		if span.PeerServiceName != "" {
++			attrs = append(attrs, attribute.String("tcp.peer.service.name", span.PeerServiceName))
++		}
++
+ 		if span.SubType == request.HTTPSubtypeElasticsearch && span.Elasticsearch != nil {
+ 			attrs = append(attrs, request.DBCollectionName(span.Elasticsearch.DBCollectionName))
+ 			attrs = append(attrs, request.ElasticsearchNodeName(span.Elasticsearch.NodeName))
+diff --git a/pkg/internal/ebpf/tpinjector/tpinjector.go b/pkg/internal/ebpf/tpinjector/tpinjector.go
+index 72dfdcd318974e37ddbca08c3f91fbf4efcd8b4f..c2ad6183fea5aaad265b0057930437fc81e20ad9 100644
+--- a/pkg/internal/ebpf/tpinjector/tpinjector.go
++++ b/pkg/internal/ebpf/tpinjector/tpinjector.go
+@@ -77,7 +77,43 @@ func New(cfg *obi.Config) *Tracer {
+ }
+ 
+ // AllowPID backfills sock_dir with pre-existing sockets: iter/tcp only walks the opener's netns
+-func (p *Tracer) AllowPID(pid app.PID, _ uint32, _ *exec.FileInfo) {
++// svcNameMaxLen mirrors K_SVC_NAME_MAX_LEN in bpf/maps/svc_peer_name_map.h.
++// The BPF map value svc_name_value_t is name[25] + u8 len = 26 bytes, written
++// here as a raw fixed-size array to avoid coupling to the bpf2go-generated type.
++const svcNameMaxLen = 25
++
++// recordServiceName records this process's service.name into svc_name_by_pid,
++// keyed by host PID (matching pid_from_pid_tgid on the BPF side). The sk_msg send
++// path looks it up to stamp the real service name into a TCP option on responses
++// (EXPERIMENTAL — TCP service-name propagation).
++func (p *Tracer) recordServiceName(pid app.PID, fi *exec.FileInfo) {
++	if fi == nil || p.bpfObjects.SvcNameByPid == nil {
++		return
++	}
++	name := fi.ServiceAttrs().UID.Name
++	if name == "" {
++		return
++	}
++	if len(name) > svcNameMaxLen {
++		// Never truncate: a truncated name could merge unrelated services.
++		p.log.Debug("service name exceeds TCP-option limit, not propagating",
++			"name", name, "len", len(name), "limit", svcNameMaxLen)
++		return
++	}
++
++	var val [svcNameMaxLen + 1]byte
++	copy(val[:svcNameMaxLen], name)
++	val[svcNameMaxLen] = byte(len(name))
++
++	key := uint32(pid)
++	if err := p.bpfObjects.SvcNameByPid.Update(&key, &val, ebpf.UpdateAny); err != nil {
++		p.log.Debug("failed to record service name for pid", "pid", pid, "error", err)
++	}
++}
++
++func (p *Tracer) AllowPID(pid app.PID, _ uint32, fi *exec.FileInfo) {
++	p.recordServiceName(pid, fi)
++
+ 	p.iterMu.Lock()
+ 	defer p.iterMu.Unlock()
+ 
+@@ -131,7 +167,13 @@ func (p *Tracer) AllowPID(pid app.PID, _ uint32, _ *exec.FileInfo) {
+ 	p.seenNetns.Add(inode, struct{}{})
+ }
+ 
+-func (p *Tracer) BlockPID(app.PID, uint32) {}
++func (p *Tracer) BlockPID(pid app.PID, _ uint32) {
++	if p.bpfObjects.SvcNameByPid == nil {
++		return
++	}
++	key := uint32(pid)
++	_ = p.bpfObjects.SvcNameByPid.Delete(&key)
++}
+ 
+ func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
+ 	spec, err := LoadBpf()

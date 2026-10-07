@@ -1,0 +1,184 @@
+name: Build images (eBPF collector + CloudWatch Agent)
+
+# On every push to this branch:
+#   prepare    obi/ snapshot check; upstream OBI + patches/ -> build/obi; BPF
+#              generated (twice, reproducibility); OBI build/vet/tests
+#   collector  standalone OTel Collector + OBI receiver -> image   } in parallel,
+#   cwagent    cwagent version gate + build (+ windows, linux/arm64 } both from the
+#              compile checks) -> image                            } same build/obi
+#   publish    branch adot/<upstream tag> = upstream tag + one commit per patch
+#
+# Images (both labelled io.adot-obi.source = upstream tag + patch-stack hash):
+#   ghcr.io/<owner>/adot-obi-collector:<sha>|latest
+#   ghcr.io/<owner>/adot-obi-cwagent:<sha>|latest
+# Jobs share only the generated BPF bindings (a small tarball); each re-applies
+# the patches itself (seconds), so no job depends on another's working tree.
+# The runtime e2e (sudo + capsh on a known kernel) stays in ci/run.sh locally.
+
+on:
+  push:
+    branches: [adot-obi]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  COLLECTOR_IMAGE: ghcr.io/${{ github.repository_owner }}/adot-obi-collector
+  CWAGENT_IMAGE: ghcr.io/${{ github.repository_owner }}/adot-obi-cwagent
+  CWAGENT_REF: v1.300074.0
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      upstream: ${{ steps.tags.outputs.upstream }}
+      source: ${{ steps.tags.outputs.source }}
+      short: ${{ steps.tags.outputs.short }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { path: adot-obi, submodules: true, fetch-depth: 0, persist-credentials: false }
+
+      # obi/ (committed, generated) must be exactly upstream/ + patches/.
+      - name: Check obi/ snapshot matches upstream + patches
+        run: adot-obi/scripts/check-obi.sh
+
+      - name: Apply patches
+        run: adot-obi/scripts/apply-patches.sh
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: adot-obi/build/obi/go.mod, cache: false }
+
+      - name: CI gates (apply, bpf, obi)
+        run: adot-obi/ci/run.sh apply bpf obi
+
+      - name: Package generated BPF bindings
+        run: |
+          cd adot-obi/build/obi
+          git ls-files --others --ignored --exclude-standard | grep -E '_bpfel\.(go|o)$' \
+            | tar -czf "$GITHUB_WORKSPACE/bpf-bindings.tgz" -T -
+          tar -tzf "$GITHUB_WORKSPACE/bpf-bindings.tgz" | wc -l
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: bpf-bindings, path: bpf-bindings.tgz, if-no-files-found: error }
+
+      - name: Image tags
+        id: tags
+        run: |
+          # pinned upstream tag; .gitmodules records it in case the submodule
+          # checkout did not fetch tags
+          up=$(git -C adot-obi/upstream describe --tags --exact-match HEAD 2>/dev/null \
+               || git -C adot-obi config -f .gitmodules submodule.upstream.branch \
+               || git -C adot-obi/upstream rev-parse --short HEAD)
+          ph=$(cat adot-obi/patches/[0-9][0-9]-*.patch | sha256sum | cut -c1-12)
+          echo "upstream=$up" >> "$GITHUB_OUTPUT"
+          echo "source=obi-${up}+patches-${ph}" >> "$GITHUB_OUTPUT"
+          echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with: { name: ci-logs-prepare, path: adot-obi/ci/logs/, if-no-files-found: ignore }
+
+  collector:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { path: adot-obi, submodules: true, fetch-depth: 0, persist-credentials: false }
+      - name: Apply patches
+        run: adot-obi/scripts/apply-patches.sh
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: adot-obi/build/obi/go.mod, cache: false }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { name: bpf-bindings }
+      - name: Restore BPF bindings
+        run: tar -xzf bpf-bindings.tgz -C adot-obi/build/obi
+
+      - name: Build collector (ci stage)
+        env: { COLLECTOR_GOPROXY: "https://proxy.golang.org,direct" }
+        run: adot-obi/ci/run.sh collector
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - name: Tag and push collector image
+        run: |
+          src=$(docker images --format '{{.Repository}}:{{.Tag}}' otelcol-obi | head -1)
+          for t in "${{ needs.prepare.outputs.short }}" latest; do
+            docker tag "$src" "$COLLECTOR_IMAGE:$t"; docker push "$COLLECTOR_IMAGE:$t"
+          done
+          echo "- \`$COLLECTOR_IMAGE:${{ needs.prepare.outputs.short }}\` (${{ needs.prepare.outputs.source }})" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with: { name: ci-logs-collector, path: adot-obi/ci/logs/, if-no-files-found: ignore }
+
+  cwagent:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { path: adot-obi, submodules: true, fetch-depth: 0, persist-credentials: false }
+      - name: Apply patches
+        run: adot-obi/scripts/apply-patches.sh
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: adot-obi/build/obi/go.mod, cache: false }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { name: bpf-bindings }
+      - name: Restore BPF bindings
+        run: tar -xzf bpf-bindings.tgz -C adot-obi/build/obi
+
+      - name: Check out cwagent and register the OBI receiver
+        run: |
+          git clone --quiet --depth 1 --branch "$CWAGENT_REF" \
+            https://github.com/aws/amazon-cloudwatch-agent.git cwagent
+          git -C cwagent -c user.name=ci -c user.email=ci@localhost \
+            am --quiet "$GITHUB_WORKSPACE"/adot-obi/cwagent/0001-*.patch
+
+      - name: cwagent gates and build (ci stage)
+        env: { CWAGENT: "${{ github.workspace }}/cwagent" }
+        run: adot-obi/ci/run.sh cwagent
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - name: Build and push cwagent image
+        run: |
+          docker build -f adot-obi/cwagent/Dockerfile \
+            --build-arg OBI_SOURCE="${{ needs.prepare.outputs.source }}" \
+            -t "$CWAGENT_IMAGE:${{ needs.prepare.outputs.short }}" -t "$CWAGENT_IMAGE:latest" \
+            adot-obi/build/cwagent/bin/linux_amd64
+          for t in "${{ needs.prepare.outputs.short }}" latest; do docker push "$CWAGENT_IMAGE:$t"; done
+          echo "- \`$CWAGENT_IMAGE:${{ needs.prepare.outputs.short }}\` (${{ needs.prepare.outputs.source }})" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with: { name: ci-logs-cwagent, path: adot-obi/ci/logs/, if-no-files-found: ignore }
+
+  publish:
+    # Only after both images built: the readable branch never runs ahead of a
+    # patch stack that failed to build.
+    needs: [prepare, collector, cwagent]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { path: adot-obi, submodules: true, fetch-depth: 0, persist-credentials: false }
+      - name: Publish patched source branch adot/${{ needs.prepare.outputs.upstream }}
+        env:
+          GIT_AUTHOR_NAME: wangzlei
+          GIT_AUTHOR_EMAIL: 66336933+wangzlei@users.noreply.github.com
+          GIT_COMMITTER_NAME: wangzlei
+          GIT_COMMITTER_EMAIL: 66336933+wangzlei@users.noreply.github.com
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd adot-obi/upstream
+          git checkout --quiet -B adot-publish HEAD
+          git am --quiet --committer-date-is-author-date ../patches/[0-9][0-9]-*.patch
+          git push --force --quiet \
+            "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/adot/${{ needs.prepare.outputs.upstream }}"
+          echo "- branch \`adot/${{ needs.prepare.outputs.upstream }}\`" >> "$GITHUB_STEP_SUMMARY"
