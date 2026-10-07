@@ -77,7 +77,43 @@ func New(cfg *obi.Config) *Tracer {
 }
 
 // AllowPID backfills sock_dir with pre-existing sockets: iter/tcp only walks the opener's netns
-func (p *Tracer) AllowPID(pid app.PID, _ uint32, _ *exec.FileInfo) {
+// svcNameMaxLen mirrors K_SVC_NAME_MAX_LEN in bpf/maps/svc_peer_name_map.h.
+// The BPF map value svc_name_value_t is name[25] + u8 len = 26 bytes, written
+// here as a raw fixed-size array to avoid coupling to the bpf2go-generated type.
+const svcNameMaxLen = 25
+
+// recordServiceName records this process's service.name into svc_name_by_pid,
+// keyed by host PID (matching pid_from_pid_tgid on the BPF side). The sk_msg send
+// path looks it up to stamp the real service name into a TCP option on responses
+// (EXPERIMENTAL — TCP service-name propagation).
+func (p *Tracer) recordServiceName(pid app.PID, fi *exec.FileInfo) {
+	if fi == nil || p.bpfObjects.SvcNameByPid == nil {
+		return
+	}
+	name := fi.ServiceAttrs().UID.Name
+	if name == "" {
+		return
+	}
+	if len(name) > svcNameMaxLen {
+		// Never truncate: a truncated name could merge unrelated services.
+		p.log.Debug("service name exceeds TCP-option limit, not propagating",
+			"name", name, "len", len(name), "limit", svcNameMaxLen)
+		return
+	}
+
+	var val [svcNameMaxLen + 1]byte
+	copy(val[:svcNameMaxLen], name)
+	val[svcNameMaxLen] = byte(len(name))
+
+	key := uint32(pid)
+	if err := p.bpfObjects.SvcNameByPid.Update(&key, &val, ebpf.UpdateAny); err != nil {
+		p.log.Debug("failed to record service name for pid", "pid", pid, "error", err)
+	}
+}
+
+func (p *Tracer) AllowPID(pid app.PID, _ uint32, fi *exec.FileInfo) {
+	p.recordServiceName(pid, fi)
+
 	p.iterMu.Lock()
 	defer p.iterMu.Unlock()
 
@@ -131,7 +167,13 @@ func (p *Tracer) AllowPID(pid app.PID, _ uint32, _ *exec.FileInfo) {
 	p.seenNetns.Add(inode, struct{}{})
 }
 
-func (p *Tracer) BlockPID(app.PID, uint32) {}
+func (p *Tracer) BlockPID(pid app.PID, _ uint32) {
+	if p.bpfObjects.SvcNameByPid == nil {
+		return
+	}
+	key := uint32(pid)
+	_ = p.bpfObjects.SvcNameByPid.Delete(&key)
+}
 
 func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
 	spec, err := LoadBpf()

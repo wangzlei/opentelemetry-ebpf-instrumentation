@@ -94,7 +94,21 @@ func httpInfoToSpanLegacy(info *HTTPInfo) request.Span {
 			Namespace: info.Pid.Ns,
 		},
 		Statement: scheme + request.SchemeHostSeparator + info.HeaderHost,
+		// EXPERIMENTAL — TCP service-name propagation: downstream service name the
+		// peer wrote on the response TCP option (client spans only; empty otherwise).
+		PeerServiceName: peerSvcNameFromInfo(&info.BPFHTTPInfo),
 	}
+}
+
+// peerSvcNameFromInfo extracts the NUL-free service name the kernel copied from
+// the kind-26 TCP option (EXPERIMENTAL — TCP service-name propagation). Takes the
+// embedded BPF struct so both the legacy and large-buffer span builders can use it.
+func peerSvcNameFromInfo(info *BPFHTTPInfo) string {
+	n := int(info.PeerServiceNameLen)
+	if n <= 0 || n > len(info.PeerServiceName) {
+		return ""
+	}
+	return string(info.PeerServiceName[:n])
 }
 
 func httpRequestResponseToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo, req *http.Request, resp *http.Response) request.Span {
@@ -158,6 +172,8 @@ func httpRequestResponseToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo, r
 			Namespace: event.Pid.Ns,
 		},
 		Statement: scheme + request.SchemeHostSeparator + headerHost,
+		// EXPERIMENTAL — TCP service-name propagation (large-buffer path).
+		PeerServiceName: peerSvcNameFromInfo(event),
 	}
 
 	return postProcessHTTPSpan(parseCtx, &httpSpan, req, resp)

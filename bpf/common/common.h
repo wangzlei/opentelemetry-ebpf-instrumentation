@@ -18,6 +18,8 @@
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/utils.h>
 
+#include <common/http_info.h> // HTTP_PEER_SVC_NAME_LEN
+
 #include <common/connection_info.h>
 #include <common/event_source.h>
 #include <common/http_types.h>
@@ -93,6 +95,17 @@ typedef struct http_request_trace {
     tp_info_t tp;
     connection_info_t conn;
     pid_info pid;
+    // EXPERIMENTAL — TCP service-name propagation: the immediate downstream
+    // service's name, learned from a kind-26 TCP option on the response and
+    // looked up by connection in roundTripReturn. Empty unless the peer is an
+    // OBI-instrumented service on a direct (proxy-free) hop. HTTP_PEER_SVC_NAME_LEN
+    // must match K_SVC_NAME_MAX_LEN in bpf/maps/svc_peer_name_map.h.
+    u8 peer_service_name_len;
+    unsigned char peer_service_name[HTTP_PEER_SVC_NAME_LEN];
+    // BPF is built with -Werror -Wpadded, so tail padding is explicit and must be
+    // recomputed whenever fields change. Tail after pid: 1 + 25 = 26, pad 6 -> 32
+    // (8-aligned).
+    u8 _pad2[6];
 } http_request_trace_t;
 
 typedef struct sql_request_trace {
