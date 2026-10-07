@@ -96,6 +96,18 @@ func HTTPRequestTraceToSpan(parseCtx *EBPFParseContext, trace *HTTPRequestTrace)
 		SubType:   subType,
 	}
 
+	// EXPERIMENTAL — TCP service-name propagation: downstream service name learned
+	// from a kind-26 TCP option the peer wrote on the response (see
+	// bpf/maps/svc_peer_name_map.h). Set before enrichment so it survives regardless
+	// of which path builds the final span.
+	if trace.PeerServiceNameLen > 0 {
+		n := int(trace.PeerServiceNameLen)
+		if n > len(trace.PeerServiceName) {
+			n = len(trace.PeerServiceName)
+		}
+		span.PeerServiceName = string(trace.PeerServiceName[:n])
+	}
+
 	if parseCtx != nil && parseCtx.payloadExtraction.Enabled() && (!span.IsClientSpan() || !parseCtx.defersGoHTTPClientRequests()) {
 		span = enrichedGoHTTPSpan(parseCtx, trace.Conn, &span)
 	}

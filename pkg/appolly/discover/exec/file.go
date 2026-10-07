@@ -48,6 +48,10 @@ type FileInfo struct {
 	dev            uint64
 	ino            uint64
 	ns             uint32
+
+	// nameListeners run after SetUID or SetAutoServiceName changed the service
+	// name (EXPERIMENTAL — TCP service-name propagation).
+	nameListeners []func()
 }
 
 func New(init Init) *FileInfo {
@@ -174,15 +178,47 @@ func (fi *FileInfo) SetHostName(h string) {
 
 func (fi *FileInfo) SetAutoServiceName(name string) {
 	fi.mu.Lock()
-	defer fi.mu.Unlock()
+	changed := fi.service.UID.Name != name
 	fi.service.UID.Name = name
 	fi.service.SetAutoName()
+	listeners := fi.nameListenersIf(changed)
+	fi.mu.Unlock()
+	notify(listeners)
 }
 
 func (fi *FileInfo) SetUID(uid svc.UID) {
 	fi.mu.Lock()
-	defer fi.mu.Unlock()
+	changed := fi.service.UID.Name != uid.Name
 	fi.service.UID = uid
+	listeners := fi.nameListenersIf(changed)
+	fi.mu.Unlock()
+	notify(listeners)
+}
+
+// OnServiceNameChange registers fn to run, without fi's lock held, every time
+// SetUID or SetAutoServiceName changes the service name. The Kubernetes,
+// Docker and process-context decorators rename a process after it was
+// instrumented, so consumers that copy the name elsewhere (the tpinjector
+// svc_name_by_pid map) use this to stay in sync.
+func (fi *FileInfo) OnServiceNameChange(fn func()) {
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+	fi.nameListeners = append(fi.nameListeners, fn)
+}
+
+// nameListenersIf returns a copy of the listeners when changed is true.
+// Caller holds fi.mu.
+func (fi *FileInfo) nameListenersIf(changed bool) []func() {
+	if !changed || len(fi.nameListeners) == 0 {
+		return nil
+	}
+	return append([]func(){}, fi.nameListeners...)
+}
+
+func notify(listeners []func()) {
+	for _, fn := range listeners {
+		fn()
+	}
 }
 
 func (fi *FileInfo) AutoName() bool {

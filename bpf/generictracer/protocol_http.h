@@ -37,10 +37,16 @@
 #include <maps/active_ssl_connections.h>
 #include <maps/connection_tracker.h>
 #include <maps/ongoing_http.h>
+#include <maps/svc_peer_name_map.h>
 #include <maps/tp_info_mem.h>
 #include <maps/tp_char_buf_mem.h>
 
 SCRATCH_MEM_SIZED(http_previous_trace_id, TRACE_ID_SIZE_BYTES);
+
+// EXPERIMENTAL — TCP service-name propagation: percpu scratch for the sorted
+// connection key used to look up the peer name, kept off the BPF stack (this
+// program is already near the 512-byte stack limit).
+SCRATCH_MEM_TYPED(svc_peer_conn_key, connection_info_t);
 
 // empty_http_info zeroes and return the unique percpu copy in the map
 // this function assumes that a given thread is not trying to use many
@@ -164,6 +170,24 @@ static __always_inline void submit_http_event(http_info_t *info, pid_connection_
     }
 
     info->submitted = 1;
+
+    // EXPERIMENTAL — TCP service-name propagation: for a client request, pick up
+    // the downstream service name the peer wrote on the response TCP option (see
+    // bpf/maps/svc_peer_name_map.h). Gated on EVENT_HTTP_CLIENT so a same-host
+    // server http_info on the same connection cannot pick up a stale entry.
+    if (info->type == EVENT_HTTP_CLIENT) {
+        connection_info_t *sorted = svc_peer_conn_key_mem();
+        if (sorted) {
+            *sorted = info->conn_info;
+            sort_connection_info(sorted);
+            const svc_name_value_t *peer = bpf_map_lookup_elem(&svc_peer_name_map, sorted);
+            if (peer && peer->len > 0 && peer->len <= HTTP_PEER_SVC_NAME_LEN) {
+                __builtin_memcpy(info->peer_service_name, peer->name, HTTP_PEER_SVC_NAME_LEN);
+                info->peer_service_name_len = peer->len;
+            }
+        }
+    }
+
     bpf_map_update_elem(&ongoing_http, pid_conn, info, BPF_ANY);
     http_info_t *trace = bpf_ringbuf_reserve(&events, sizeof(http_info_t), 0);
     if (trace) {

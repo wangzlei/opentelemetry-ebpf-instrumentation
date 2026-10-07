@@ -1327,12 +1327,18 @@ type Span struct {
 	// ParentConditional marks a parent that may already have finished when this
 	// span started: BPF cannot tell at that moment, so the pipeline settles the
 	// link against the parent span's real end timestamp before export.
-	ParentConditional bool           `json:"-"`
-	TraceFlags        uint8          `json:"traceFlags,string"`
-	Links             []SpanLink     `json:"links,omitempty"`
-	Pid               PidInfo        `json:"-"`
-	PeerName          string         `json:"peerName"`
-	HostName          string         `json:"hostName"`
+	ParentConditional bool       `json:"-"`
+	TraceFlags        uint8      `json:"traceFlags,string"`
+	Links             []SpanLink `json:"links,omitempty"`
+	Pid               PidInfo    `json:"-"`
+	PeerName          string     `json:"peerName"`
+	HostName          string     `json:"hostName"`
+	// PeerServiceName is the immediate downstream service's OpenTelemetry
+	// service.name, learned hop-by-hop from a TCP option the peer wrote on the
+	// response (EXPERIMENTAL — TCP service-name propagation). Set on client spans
+	// only, and only when the downstream is an OBI-instrumented service reached
+	// over a direct, proxy-free connection.
+	PeerServiceName   string         `json:"peerServiceName,omitempty"`
 	OtherNamespace    string         `json:"-"`
 	OtherK8SNamespace string         `json:"-"`
 	Statement         string         `json:"-"`
@@ -1420,6 +1426,9 @@ func spanAttributes(s *Span) SpanAttributes {
 			"clientAddr": SpanPeer(s),
 			"serverAddr": SpanHost(s),
 			"serverPort": strconv.Itoa(s.HostPort),
+		}
+		if s.PeerServiceName != "" {
+			attrs["peerServiceName"] = s.PeerServiceName
 		}
 		if s.SubType == HTTPSubtypeElasticsearch && s.Elasticsearch != nil {
 			attrs["dbCollectionName"] = s.Elasticsearch.DBCollectionName

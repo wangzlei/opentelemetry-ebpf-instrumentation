@@ -665,6 +665,14 @@ func traceAttributesSelectorInternal(span *request.Span, optionalAttrs map[attr.
 			}
 		}
 
+		// EXPERIMENTAL — TCP service-name propagation. Distinct from peer.service
+		// (which is OBI's local k8s-resolved guess): this value is what the
+		// downstream reported about ITSELF over a kind-26 TCP option, so it is
+		// emitted under its own key rather than overwriting peer.service.
+		if span.PeerServiceName != "" {
+			attrs = append(attrs, attribute.String("tcp.peer.service.name", span.PeerServiceName))
+		}
+
 		if span.SubType == request.HTTPSubtypeElasticsearch && span.Elasticsearch != nil {
 			attrs = append(attrs, request.DBCollectionName(span.Elasticsearch.DBCollectionName))
 			attrs = append(attrs, request.ElasticsearchNodeName(span.Elasticsearch.NodeName))

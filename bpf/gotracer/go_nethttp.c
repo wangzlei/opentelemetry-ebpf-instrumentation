@@ -48,6 +48,7 @@
 #include <maps/go_ongoing_http.h>
 #include <maps/go_ongoing_http_client_requests.h>
 #include <maps/outgoing_trace_map.h>
+#include <maps/svc_peer_name_map.h>
 #include <maps/tp_char_buf_mem.h>
 
 #include <pid/pid_helpers.h>
@@ -793,6 +794,8 @@ int GUARDED_PROG(obi_uprobe_roundTripReturn, struct pt_regs *, ctx) {
 
     void *resp_ptr = (void *)GO_PARAM1(ctx);
 
+    trace->peer_service_name_len = 0;
+
     connection_info_t *info = bpf_map_lookup_elem(&ongoing_client_connections, &g_key);
     if (info) {
         __builtin_memcpy(&trace->conn, info, sizeof(connection_info_t));
@@ -803,6 +806,18 @@ int GUARDED_PROG(obi_uprobe_roundTripReturn, struct pt_regs *, ctx) {
         };
         bpf_map_delete_elem(&outgoing_trace_map, &e_key);
         bpf_map_delete_elem(&go_ongoing_http, &e_key);
+
+        connection_info_t sorted_conn = *info;
+        sort_connection_info(&sorted_conn);
+
+        // EXPERIMENTAL — TCP service-name propagation: the downstream service's
+        // name, if it wrote a kind-26 TCP option on the response (see
+        // maps/svc_peer_name_map.h). Populated by the tpinjector sockops parser.
+        const svc_name_value_t *peer = bpf_map_lookup_elem(&svc_peer_name_map, &sorted_conn);
+        if (peer && peer->len > 0 && peer->len <= HTTP_PEER_SVC_NAME_LEN) {
+            __builtin_memcpy(trace->peer_service_name, peer->name, HTTP_PEER_SVC_NAME_LEN);
+            trace->peer_service_name_len = peer->len;
+        }
     } else {
         // persistConn.conn was unreadable, so take the connection the write side read
         // from the netFD instead of reporting this call without a peer.
