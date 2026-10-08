@@ -17,6 +17,8 @@ patches/                  git format-patch stack applied in order on top of upst
                                        (tpinjector), incl. the server-response capture fix for kprobe-traced servers
   02-http2-multiplex.patch             capture every HTTP/2 stream on a multiplexed connection (+ unit/integration test)
   03-peer-service-name-red-attrs.patch peer.service.name on client spans and on http.client.request.duration
+  04-forwarded-host.patch              server spans: X-Forwarded-Host (else Host) as x-forwarded-host, and without
+                                       the port as peer.service.name on HTTP server RED (topology through L7 LBs)
   99-pin-to-cwagent.patch              go.mod pinned to cwagent's dependency versions + forced code adaptations (ALWAYS LAST)
 obi/                      GENERATED, committed: upstream/ + patches/ as plain code (minus .github/ and
                           internal/test/integration/). Committed together with patches/ so every commit shows
