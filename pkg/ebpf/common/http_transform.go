@@ -175,6 +175,12 @@ func httpRequestResponseToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo, r
 		// EXPERIMENTAL — TCP service-name propagation (large-buffer path).
 		PeerServiceName: peerSvcNameFromInfo(event),
 	}
+	if reqType == request.EventTypeHTTP {
+		httpSpan.ForwardedHost = req.Header.Get("X-Forwarded-Host")
+		if httpSpan.ForwardedHost == "" {
+			httpSpan.ForwardedHost = req.Host
+		}
+	}
 
 	return postProcessHTTPSpan(parseCtx, &httpSpan, req, resp)
 }
@@ -587,7 +593,51 @@ func httpRequestToSpan(event *BPFHTTPInfo, requestBuffer *largebuf.LargeBuffer) 
 
 	result.HeaderHost = bufHost
 
-	return httpInfoToSpanLegacy(&result)
+	span := httpInfoToSpanLegacy(&result)
+	if span.Type == request.EventTypeHTTP {
+		span.ForwardedHost = forwardedHostFromBuf(raw)
+	}
+	return span
+}
+
+// forwardedHostFromBuf returns the X-Forwarded-Host header value of a raw
+// HTTP/1.x request, or the Host header value when X-Forwarded-Host is absent
+// (EXPERIMENTAL). Header names match case-insensitively; a value cut off by the
+// end of the captured buffer is ignored rather than reported truncated.
+func forwardedHostFromBuf(req []byte) string {
+	if end := bytes.IndexByte(req, 0); end >= 0 {
+		req = req[:end]
+	}
+	// Only the header block: stop at the blank line when it was captured.
+	if end := bytes.Index(req, []byte("\r\n\r\n")); end >= 0 {
+		req = req[:end+2]
+	}
+	if v, ok := headerFromBuf(req, "x-forwarded-host"); ok {
+		return v
+	}
+	v, _ := headerFromBuf(req, "host")
+	return v
+}
+
+// headerFromBuf finds a complete "\r\n<name>:" header line (name lowercase).
+func headerFromBuf(req []byte, name string) (string, bool) {
+	for line := 0; ; {
+		nl := bytes.Index(req[line:], []byte("\r\n"))
+		if nl < 0 {
+			return "", false
+		}
+		start := line + nl + 2
+		rest := req[start:]
+		if len(rest) > len(name) && rest[len(name)] == ':' &&
+			strings.EqualFold(string(rest[:len(name)]), name) {
+			end := bytes.Index(rest, []byte("\r"))
+			if end < 0 {
+				return "", false
+			}
+			return strings.TrimSpace(string(rest[len(name)+1 : end])), true
+		}
+		line = start
+	}
 }
 
 func httpURLFromBuf(req []byte) string {

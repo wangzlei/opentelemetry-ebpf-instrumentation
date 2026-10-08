@@ -1338,7 +1338,13 @@ type Span struct {
 	// response (EXPERIMENTAL — TCP service-name propagation). Set on client spans
 	// only, and only when the downstream is an OBI-instrumented service reached
 	// over a direct, proxy-free connection.
-	PeerServiceName   string         `json:"peerServiceName,omitempty"`
+	PeerServiceName string `json:"peerServiceName,omitempty"`
+	// ForwardedHost is the raw X-Forwarded-Host request header of a server span,
+	// or its Host header when X-Forwarded-Host is absent (EXPERIMENTAL — front-door
+	// name of a request that may have come through a load balancer). Server spans
+	// only. Exported as the x-forwarded-host span attribute and, without the port,
+	// as peer.service.name on HTTP server RED metrics.
+	ForwardedHost     string         `json:"forwardedHost,omitempty"`
 	OtherNamespace    string         `json:"-"`
 	OtherK8SNamespace string         `json:"-"`
 	Statement         string         `json:"-"`

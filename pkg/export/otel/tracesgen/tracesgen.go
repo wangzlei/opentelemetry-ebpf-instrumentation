@@ -561,6 +561,10 @@ func traceAttributesSelectorInternal(span *request.Span, optionalAttrs map[attr.
 		if span.Route != "" {
 			attrs = append(attrs, semconv.HTTPRoute(span.Route))
 		}
+		// EXPERIMENTAL — X-Forwarded-Host (or Host) of the incoming request.
+		if span.ForwardedHost != "" {
+			attrs = append(attrs, attribute.String(string(attr.XForwardedHost), span.ForwardedHost))
+		}
 		if span.SubType == request.HTTPSubtypeGraphQL && span.GraphQL != nil {
 			if _, ok := optionalAttrs[attr.GraphQLDocument]; ok {
 				attrs = append(attrs, semconv.GraphQLDocument(span.GraphQL.Document))

@@ -79,10 +79,15 @@ func spanOTELGetters(name attr.Name) (attributes.Getter[*Span, attribute.KeyValu
 		getter = func(s *Span) attribute.KeyValue { return ServerPort(s.HostPort) }
 	case attr.PeerServiceName:
 		getter = func(s *Span) attribute.KeyValue {
-			if s.PeerServiceName == "" {
+			name := s.PeerServiceName
+			if s.Type == EventTypeHTTP {
+				// Server side: the front-door name the request was addressed to.
+				name = ForwardedHostName(s.ForwardedHost)
+			}
+			if name == "" {
 				return attribute.KeyValue{}
 			}
-			return attribute.Key(attr.PeerServiceName).String(s.PeerServiceName)
+			return attribute.Key(attr.PeerServiceName).String(name)
 		}
 	case attr.RPCMethod:
 		getter = func(s *Span) attribute.KeyValue {
