@@ -17,9 +17,12 @@ RUN go build -buildvcs=false -trimpath -o /otelcol .
 FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /otelcol /otelcol
+# Default config (config/otel.yaml, copied into the context by build-collector.sh).
+COPY --from=builder /app/otelcol-obi/default-config.yaml /etc/otelcol/config.yaml
 ARG OBI_SOURCE=unknown
 # Identifies the exact patched OBI tree, so an image can be matched to the
 # cwagent build that carries the same code (see scripts/build-collector.sh).
 LABEL org.opencontainers.image.title="otelcol-obi" \
       io.adot-obi.source="${OBI_SOURCE}"
 ENTRYPOINT ["/otelcol"]
+CMD ["--config=/etc/otelcol/config.yaml"]

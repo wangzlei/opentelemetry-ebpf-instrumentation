@@ -26,6 +26,10 @@ obi/                      GENERATED, committed: upstream/ + patches/ as plain co
 receiver/obireceiver/     Go module github.com/aws-observability/adot-obi/receiver/obireceiver - the factory cwagent
                           registers; thin wrapper over go.opentelemetry.io/obi/collector with cwagent defaults
 processor/                config-only replacement for collector-side bits (aws.vpc.id / aws.subnet.id via resource processor)
+config/otel.yaml          default OTel config baked into BOTH images (/etc/otelcol/config.yaml = the collector's
+                          default --config; /etc/cwagent/otel.yaml for cwagent). OBI -> X-Ray traces + CloudWatch
+                          OTLP metrics, AWS SDK spans on. AWS_REGION overrides the region; mount your own file over
+                          that path to replace it. CI validates it inside the collector image
 collector/                standalone eBPF collector distribution (OCB builder-config + Dockerfile) built from the same
                           build/obi as cwagent - for demos and A/B checks; image label io.adot-obi.source = tag+patch hash
 cwagent/                  the cwagent change (format-patch of branch exp/obi-receiver on v1.300074.0)

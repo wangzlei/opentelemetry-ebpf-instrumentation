@@ -19,4 +19,6 @@ case $MODE in
       -ldflags="-s -w -X github.com/aws/amazon-cloudwatch-agent/cfg/agentinfo.VersionStr=1.300074.0-obi-exp" \
       -o "$ROOT/build/cwagent/bin/linux_amd64/amazon-cloudwatch-agent" ./cmd/amazon-cloudwatch-agent;;
 esac
+# Default OTel config for the image (cwagent/Dockerfile copies it from this dir).
+cp "$ROOT/config/otel.yaml" "$ROOT/build/cwagent/bin/linux_amd64/otel.yaml"
 ls -la "$ROOT/build/cwagent/bin/linux_amd64/"

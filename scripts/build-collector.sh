@@ -24,6 +24,7 @@ GOBIN=$(go env GOPATH)/bin
 go install "go.opentelemetry.io/collector/cmd/builder@${ver}"
 cp "$ROOT/collector/builder-config.yaml" "$O/otelcol-obi-builder.yaml"
 (cd "$O" && GOFLAGS=-mod=mod "$GOBIN/builder" --skip-compilation --config ./otelcol-obi-builder.yaml)
+cp "$ROOT/config/otel.yaml" "$O/otelcol-obi/default-config.yaml"
 
 docker build -f "$ROOT/collector/Dockerfile" \
   --build-arg GOPROXY="${GOPROXY:-https://proxy.golang.org,direct}" \
