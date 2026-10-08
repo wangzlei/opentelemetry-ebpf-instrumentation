@@ -1,0 +1,423 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wangzlei <66336933+wangzlei@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 20:38:15 -0700
+Subject: [PATCH 4/5] forwarded-host: X-Forwarded-Host / Host on server spans
+ and HTTP server RED
+
+Record the front-door name an incoming HTTP request was addressed to: the
+X-Forwarded-Host request header, or the Host header when X-Forwarded-Host is
+absent. It is exported as the x-forwarded-host attribute on server spans, and
+(first entry, without the port) as peer.service.name on the HTTP server RED
+metrics (http.server.request.duration / request.body.size / response.body.size).
+
+Why: behind an L7 load balancer (e.g. ALB) the TCP-option service name
+(patch 01/03) cannot cross the hop, so the caller side loses peer.service.name.
+The request headers still carry the name the client used. Upstream OBI only
+uses Host for the span's Statement field and never reads X-Forwarded-Host.
+
+Paths: kprobe HTTP/1.x legacy buffer (header scan of the captured request,
+case-insensitive, truncated values ignored), kprobe large-buffer path
+(req.Header / req.Host) and the Go uprobe tracer (req.Host only). RPC/DB server
+metrics keep the shared serverInfo group unchanged.
+
+Adot-Obi-Patch: 04-forwarded-host
+---
+ pkg/appolly/app/request/forwarded_host.go     | 26 +++++++++
+ .../app/request/forwarded_host_test.go        | 25 +++++++++
+ pkg/appolly/app/request/span.go               |  8 ++-
+ pkg/appolly/app/request/span_getters.go       |  9 +++-
+ pkg/ebpf/common/forwarded_host_test.go        | 31 +++++++++++
+ pkg/ebpf/common/http_transform.go             | 52 +++++++++++++++++-
+ pkg/ebpf/common/http_transform_test.go        | 54 ++++++++++---------
+ pkg/ebpf/common/spanner.go                    |  4 ++
+ pkg/export/attributes/attr_defs.go            | 20 +++++--
+ pkg/export/attributes/attr_selector_test.go   |  1 +
+ pkg/export/attributes/names/attrs.go          |  4 ++
+ pkg/export/otel/tracesgen/tracesgen.go        |  4 ++
+ 12 files changed, 205 insertions(+), 33 deletions(-)
+ create mode 100644 pkg/appolly/app/request/forwarded_host.go
+ create mode 100644 pkg/appolly/app/request/forwarded_host_test.go
+ create mode 100644 pkg/ebpf/common/forwarded_host_test.go
+
+diff --git a/pkg/appolly/app/request/forwarded_host.go b/pkg/appolly/app/request/forwarded_host.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..1cfe1f840ec33b92862747f8dd101ca0c758506a
+--- /dev/null
++++ b/pkg/appolly/app/request/forwarded_host.go
+@@ -0,0 +1,26 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package request // import "go.opentelemetry.io/obi/pkg/appolly/app/request"
++
++import (
++	"net"
++	"strings"
++)
++
++// ForwardedHostName turns a raw X-Forwarded-Host / Host header value into a bare
++// host name: the first entry of a comma-separated proxy chain, without the port
++// or IPv6 brackets. Returns "" for an empty value.
++func ForwardedHostName(v string) string {
++	if i := strings.IndexByte(v, ','); i >= 0 {
++		v = v[:i]
++	}
++	v = strings.TrimSpace(v)
++	if v == "" {
++		return ""
++	}
++	if host, _, err := net.SplitHostPort(v); err == nil {
++		return host
++	}
++	return strings.Trim(v, "[]")
++}
+diff --git a/pkg/appolly/app/request/forwarded_host_test.go b/pkg/appolly/app/request/forwarded_host_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9041e92c3886fdfc93a9e221f42c20de3533819
+--- /dev/null
++++ b/pkg/appolly/app/request/forwarded_host_test.go
+@@ -0,0 +1,25 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package request
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++)
++
++func TestForwardedHostName(t *testing.T) {
++	for in, want := range map[string]string{
++		"":                           "",
++		"payment.ping.internal":      "payment.ping.internal",
++		"payment.ping.internal:8000": "payment.ping.internal",
++		"a.example.com, proxy.local": "a.example.com",
++		" spaced.example.com ":       "spaced.example.com",
++		"[2001:db8::1]:443":          "2001:db8::1",
++		"[2001:db8::1]":              "2001:db8::1",
++		"10.0.10.246:8000":           "10.0.10.246",
++	} {
++		assert.Equal(t, want, ForwardedHostName(in), in)
++	}
++}
+diff --git a/pkg/appolly/app/request/span.go b/pkg/appolly/app/request/span.go
+index beb746815ed2b5dfc88ded1573eb62919fe46f24..173ef5dde0f51c2e8f8ed1043b3739ace91cb70a 100644
+--- a/pkg/appolly/app/request/span.go
++++ b/pkg/appolly/app/request/span.go
+@@ -1338,7 +1338,13 @@ type Span struct {
+ 	// response (EXPERIMENTAL — TCP service-name propagation). Set on client spans
+ 	// only, and only when the downstream is an OBI-instrumented service reached
+ 	// over a direct, proxy-free connection.
+-	PeerServiceName   string         `json:"peerServiceName,omitempty"`
++	PeerServiceName string `json:"peerServiceName,omitempty"`
++	// ForwardedHost is the raw X-Forwarded-Host request header of a server span,
++	// or its Host header when X-Forwarded-Host is absent (EXPERIMENTAL — front-door
++	// name of a request that may have come through a load balancer). Server spans
++	// only. Exported as the x-forwarded-host span attribute and, without the port,
++	// as peer.service.name on HTTP server RED metrics.
++	ForwardedHost     string         `json:"forwardedHost,omitempty"`
+ 	OtherNamespace    string         `json:"-"`
+ 	OtherK8SNamespace string         `json:"-"`
+ 	Statement         string         `json:"-"`
+diff --git a/pkg/appolly/app/request/span_getters.go b/pkg/appolly/app/request/span_getters.go
+index 4d7aaed2f5502cbdb56517ef50f3b51a7d4d98c8..b6b82f5c7337d241bcf62d46c20c19cf02c40f2c 100644
+--- a/pkg/appolly/app/request/span_getters.go
++++ b/pkg/appolly/app/request/span_getters.go
+@@ -79,10 +79,15 @@ func spanOTELGetters(name attr.Name) (attributes.Getter[*Span, attribute.KeyValu
+ 		getter = func(s *Span) attribute.KeyValue { return ServerPort(s.HostPort) }
+ 	case attr.PeerServiceName:
+ 		getter = func(s *Span) attribute.KeyValue {
+-			if s.PeerServiceName == "" {
++			name := s.PeerServiceName
++			if s.Type == EventTypeHTTP {
++				// Server side: the front-door name the request was addressed to.
++				name = ForwardedHostName(s.ForwardedHost)
++			}
++			if name == "" {
+ 				return attribute.KeyValue{}
+ 			}
+-			return attribute.Key(attr.PeerServiceName).String(s.PeerServiceName)
++			return attribute.Key(attr.PeerServiceName).String(name)
+ 		}
+ 	case attr.RPCMethod:
+ 		getter = func(s *Span) attribute.KeyValue {
+diff --git a/pkg/ebpf/common/forwarded_host_test.go b/pkg/ebpf/common/forwarded_host_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..c2c725819e5fb8e53dee18b0dd5da325479d7713
+--- /dev/null
++++ b/pkg/ebpf/common/forwarded_host_test.go
+@@ -0,0 +1,31 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package ebpfcommon
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++)
++
++func TestForwardedHostFromBuf(t *testing.T) {
++	for _, tc := range []struct {
++		name, req, want string
++	}{
++		{"host only", "POST /charges HTTP/1.1\r\nHost: payment.ping.internal:8000\r\nAccept: */*\r\n\r\n", "payment.ping.internal:8000"},
++		{"x-forwarded-host wins", "GET / HTTP/1.1\r\nHost: 10.0.10.246:8000\r\nX-Forwarded-Host: shop.example.com\r\n\r\n", "shop.example.com"},
++		{"case-insensitive", "GET / HTTP/1.1\r\nx-forwarded-host: a.b\r\nhost: c.d\r\n\r\n", "a.b"},
++		{"alb header order", "POST /charges HTTP/1.1\r\nX-Forwarded-For: 10.0.6.247\r\nX-Forwarded-Proto: http\r\nX-Forwarded-Port: 80\r\nHost: payment.ping.internal\r\nX-Amzn-Trace-Id: Root=1-abc\r\n\r\n", "payment.ping.internal"},
++		{"truncated value ignored", "GET / HTTP/1.1\r\nHost: payment.ping.inter", ""},
++		{"truncated x-forwarded-host falls back to host", "GET / HTTP/1.1\r\nHost: a.b\r\nX-Forwarded-Host: c.", "a.b"},
++		{"header in body ignored", "POST / HTTP/1.1\r\nHost: a.b\r\n\r\nX-Forwarded-Host: evil\r\n", "a.b"},
++		{"similar header name", "GET / HTTP/1.1\r\nHostname: x\r\nHost: a.b\r\n\r\n", "a.b"},
++		{"nul padded buffer", "GET / HTTP/1.1\r\nHost: a.b\r\n\x00\x00\x00", "a.b"},
++		{"no host", "GET / HTTP/1.1\r\nAccept: */*\r\n\r\n", ""},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			assert.Equal(t, tc.want, forwardedHostFromBuf([]byte(tc.req)))
++		})
++	}
++}
+diff --git a/pkg/ebpf/common/http_transform.go b/pkg/ebpf/common/http_transform.go
+index e9127108730a12671021e62e13567692879db1e6..aba484983f80b10894549c6c11c0da71a0c844b9 100644
+--- a/pkg/ebpf/common/http_transform.go
++++ b/pkg/ebpf/common/http_transform.go
+@@ -175,6 +175,12 @@ func httpRequestResponseToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo, r
+ 		// EXPERIMENTAL — TCP service-name propagation (large-buffer path).
+ 		PeerServiceName: peerSvcNameFromInfo(event),
+ 	}
++	if reqType == request.EventTypeHTTP {
++		httpSpan.ForwardedHost = req.Header.Get("X-Forwarded-Host")
++		if httpSpan.ForwardedHost == "" {
++			httpSpan.ForwardedHost = req.Host
++		}
++	}
+ 
+ 	return postProcessHTTPSpan(parseCtx, &httpSpan, req, resp)
+ }
+@@ -587,7 +593,51 @@ func httpRequestToSpan(event *BPFHTTPInfo, requestBuffer *largebuf.LargeBuffer)
+ 
+ 	result.HeaderHost = bufHost
+ 
+-	return httpInfoToSpanLegacy(&result)
++	span := httpInfoToSpanLegacy(&result)
++	if span.Type == request.EventTypeHTTP {
++		span.ForwardedHost = forwardedHostFromBuf(raw)
++	}
++	return span
++}
++
++// forwardedHostFromBuf returns the X-Forwarded-Host header value of a raw
++// HTTP/1.x request, or the Host header value when X-Forwarded-Host is absent
++// (EXPERIMENTAL). Header names match case-insensitively; a value cut off by the
++// end of the captured buffer is ignored rather than reported truncated.
++func forwardedHostFromBuf(req []byte) string {
++	if end := bytes.IndexByte(req, 0); end >= 0 {
++		req = req[:end]
++	}
++	// Only the header block: stop at the blank line when it was captured.
++	if end := bytes.Index(req, []byte("\r\n\r\n")); end >= 0 {
++		req = req[:end+2]
++	}
++	if v, ok := headerFromBuf(req, "x-forwarded-host"); ok {
++		return v
++	}
++	v, _ := headerFromBuf(req, "host")
++	return v
++}
++
++// headerFromBuf finds a complete "\r\n<name>:" header line (name lowercase).
++func headerFromBuf(req []byte, name string) (string, bool) {
++	for line := 0; ; {
++		nl := bytes.Index(req[line:], []byte("\r\n"))
++		if nl < 0 {
++			return "", false
++		}
++		start := line + nl + 2
++		rest := req[start:]
++		if len(rest) > len(name) && rest[len(name)] == ':' &&
++			strings.EqualFold(string(rest[:len(name)]), name) {
++			end := bytes.Index(rest, []byte("\r"))
++			if end < 0 {
++				return "", false
++			}
++			return strings.TrimSpace(string(rest[len(name)+1 : end])), true
++		}
++		line = start
++	}
+ }
+ 
+ func httpURLFromBuf(req []byte) string {
+diff --git a/pkg/ebpf/common/http_transform_test.go b/pkg/ebpf/common/http_transform_test.go
+index c49782cb1e88e52ab5b258e3146ef3fa6c16e0e4..c7e3c3804bd0157d35767a75ecf4f0883212f8ae 100644
+--- a/pkg/ebpf/common/http_transform_test.go
++++ b/pkg/ebpf/common/http_transform_test.go
+@@ -197,19 +197,20 @@ func TestToRequestTrace(t *testing.T) {
+ 	require.NoError(t, err)
+ 
+ 	expected := request.Span{
+-		Host:         "8.8.8.8",
+-		Peer:         "192.168.0.1",
+-		Path:         "/hello",
+-		FullPath:     "/hello",
+-		Method:       "GET",
+-		Status:       200,
+-		Type:         request.EventTypeHTTP,
+-		RequestStart: 123450,
+-		Start:        123456,
+-		End:          789012,
+-		HostPort:     1,
+-		Service:      svc.Attrs{},
+-		Statement:    "http;",
++		Host:          "8.8.8.8",
++		Peer:          "192.168.0.1",
++		Path:          "/hello",
++		FullPath:      "/hello",
++		Method:        "GET",
++		Status:        200,
++		Type:          request.EventTypeHTTP,
++		RequestStart:  123450,
++		Start:         123456,
++		End:           789012,
++		HostPort:      1,
++		Service:       svc.Attrs{},
++		Statement:     "http;",
++		ForwardedHost: "example.com",
+ 	}
+ 	assert.Equal(t, expected, result)
+ }
+@@ -236,19 +237,20 @@ func TestToRequestTraceNoConnection(t *testing.T) {
+ 
+ 	// change the expected port just before testing
+ 	expected := request.Span{
+-		Host:         "localhost",
+-		Peer:         "",
+-		Path:         "/hello",
+-		FullPath:     "/hello",
+-		Method:       "GET",
+-		Type:         request.EventTypeHTTP,
+-		Start:        123456,
+-		RequestStart: 123450,
+-		End:          789012,
+-		Status:       200,
+-		HostPort:     7033,
+-		Service:      svc.Attrs{},
+-		Statement:    "http;localhost",
++		Host:          "localhost",
++		Peer:          "",
++		Path:          "/hello",
++		FullPath:      "/hello",
++		Method:        "GET",
++		Type:          request.EventTypeHTTP,
++		Start:         123456,
++		RequestStart:  123450,
++		End:           789012,
++		Status:        200,
++		HostPort:      7033,
++		Service:       svc.Attrs{},
++		Statement:     "http;localhost",
++		ForwardedHost: "localhost:7033",
+ 	}
+ 	assert.Equal(t, expected, result)
+ }
+diff --git a/pkg/ebpf/common/spanner.go b/pkg/ebpf/common/spanner.go
+index 2c1b74524071b1895062c4d8dd907c9d97f33e51..a2025eb9c57a3ea249d5ace0bc6b87b28a1e709e 100644
+--- a/pkg/ebpf/common/spanner.go
++++ b/pkg/ebpf/common/spanner.go
+@@ -95,6 +95,10 @@ func HTTPRequestTraceToSpan(parseCtx *EBPFParseContext, trace *HTTPRequestTrace)
+ 		JSONRPC:   jsonRPC,
+ 		SubType:   subType,
+ 	}
++	if span.Type == request.EventTypeHTTP {
++		// EXPERIMENTAL: Go's server trace carries req.Host only, no other headers.
++		span.ForwardedHost = origHost
++	}
+ 
+ 	// EXPERIMENTAL — TCP service-name propagation: downstream service name learned
+ 	// from a kind-26 TCP option the peer wrote on the response (see
+diff --git a/pkg/export/attributes/attr_defs.go b/pkg/export/attributes/attr_defs.go
+index 8289d05fd2d7e836fc1e84c743254d71e9b8a005..12e8507575b70d0492b3f984169d5daf3f20643a 100644
+--- a/pkg/export/attributes/attr_defs.go
++++ b/pkg/export/attributes/attr_defs.go
+@@ -299,6 +299,20 @@ func getDefinitions(
+ 		extraGroupAttributes[GroupServerInfo],
+ 	)
+ 
++	// HTTP server metrics only (RPC/DB servers keep serverInfo): adds
++	// peer.service.name taken from X-Forwarded-Host / Host (EXPERIMENTAL).
++	httpServerInfo := NewAttrReportGroup(
++		false,
++		nil,
++		map[attr.Name]Default{
++			attr.ClientAddr:      false,
++			attr.ServerAddr:      true,
++			attr.ServerPort:      true,
++			attr.PeerServiceName: true,
++		},
++		extraGroupAttributes[GroupServerInfo],
++	)
++
+ 	httpClientInfo := NewAttrReportGroup(
+ 		false,
+ 		nil,
+@@ -354,13 +368,13 @@ func getDefinitions(
+ 			SubGroups: []*AttrReportGroup{&networkInterZone, &networkInterZoneCIDR, &networkGeoIP, &networkInterZoneKube},
+ 		},
+ 		HTTPServerDuration.Section: {
+-			SubGroups: []*AttrReportGroup{&appAttributes, &httpCommon, &serverInfo},
++			SubGroups: []*AttrReportGroup{&appAttributes, &httpCommon, &httpServerInfo},
+ 		},
+ 		HTTPServerRequestSize.Section: {
+-			SubGroups: []*AttrReportGroup{&appAttributes, &httpCommon, &serverInfo},
++			SubGroups: []*AttrReportGroup{&appAttributes, &httpCommon, &httpServerInfo},
+ 		},
+ 		HTTPServerResponseSize.Section: {
+-			SubGroups: []*AttrReportGroup{&appAttributes, &httpCommon, &serverInfo},
++			SubGroups: []*AttrReportGroup{&appAttributes, &httpCommon, &httpServerInfo},
+ 		},
+ 		HTTPClientDuration.Section: {
+ 			SubGroups: []*AttrReportGroup{&appAttributes, &httpCommon, &httpClientInfo},
+diff --git a/pkg/export/attributes/attr_selector_test.go b/pkg/export/attributes/attr_selector_test.go
+index 9255ebfcc9da8e832b8d7abccd79e87bc9feb361..347660329366bdd0eb2a1e32113b1b798e52971a 100644
+--- a/pkg/export/attributes/attr_selector_test.go
++++ b/pkg/export/attributes/attr_selector_test.go
+@@ -233,6 +233,7 @@ func TestExtraGroupAttributes(t *testing.T) {
+ 		"k8s.statefulset.name",
+ 		"server.address",
+ 		"server.port",
++		"peer.service.name",
+ 		"service.name",
+ 		"url.scheme",
+ 		"service.namespace",
+diff --git a/pkg/export/attributes/names/attrs.go b/pkg/export/attributes/names/attrs.go
+index 6e0b37910997e83f7170bfecf54917d7f2f8ac08..a767923e50ef451799f5bc844a58ac31a27e43a1 100644
+--- a/pkg/export/attributes/names/attrs.go
++++ b/pkg/export/attributes/names/attrs.go
+@@ -101,6 +101,10 @@ const (
+ // propagation). Client-side only.
+ const PeerServiceName = Name("peer.service.name")
+ 
++// XForwardedHost is the server span's X-Forwarded-Host request header, or its
++// Host header when X-Forwarded-Host is absent (EXPERIMENTAL). Server spans only.
++const XForwardedHost = Name("x-forwarded-host")
++
+ // HTTPRequestHeaderKey returns the attribute key for a request header (lowercased).
+ func HTTPRequestHeaderKey(name string) string {
+ 	return HTTPRequestHeaderPrefix + strings.ToLower(name)
+diff --git a/pkg/export/otel/tracesgen/tracesgen.go b/pkg/export/otel/tracesgen/tracesgen.go
+index d432709e50b531a4939e4f5772daf2c4f734ec30..10e2814d409629f2b3a14ed73e358c7bc81b28f2 100644
+--- a/pkg/export/otel/tracesgen/tracesgen.go
++++ b/pkg/export/otel/tracesgen/tracesgen.go
+@@ -561,6 +561,10 @@ func traceAttributesSelectorInternal(span *request.Span, optionalAttrs map[attr.
+ 		if span.Route != "" {
+ 			attrs = append(attrs, semconv.HTTPRoute(span.Route))
+ 		}
++		// EXPERIMENTAL — X-Forwarded-Host (or Host) of the incoming request.
++		if span.ForwardedHost != "" {
++			attrs = append(attrs, attribute.String(string(attr.XForwardedHost), span.ForwardedHost))
++		}
+ 		if span.SubType == request.HTTPSubtypeGraphQL && span.GraphQL != nil {
+ 			if _, ok := optionalAttrs[attr.GraphQLDocument]; ok {
+ 				attrs = append(attrs, semconv.GraphQLDocument(span.GraphQL.Document))

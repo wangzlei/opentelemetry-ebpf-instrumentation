@@ -95,6 +95,10 @@ func HTTPRequestTraceToSpan(parseCtx *EBPFParseContext, trace *HTTPRequestTrace)
 		JSONRPC:   jsonRPC,
 		SubType:   subType,
 	}
+	if span.Type == request.EventTypeHTTP {
+		// EXPERIMENTAL: Go's server trace carries req.Host only, no other headers.
+		span.ForwardedHost = origHost
+	}
 
 	// EXPERIMENTAL — TCP service-name propagation: downstream service name learned
 	// from a kind-26 TCP option the peer wrote on the response (see

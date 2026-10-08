@@ -101,6 +101,10 @@ const (
 // propagation). Client-side only.
 const PeerServiceName = Name("peer.service.name")
 
+// XForwardedHost is the server span's X-Forwarded-Host request header, or its
+// Host header when X-Forwarded-Host is absent (EXPERIMENTAL). Server spans only.
+const XForwardedHost = Name("x-forwarded-host")
+
 // HTTPRequestHeaderKey returns the attribute key for a request header (lowercased).
 func HTTPRequestHeaderKey(name string) string {
 	return HTTPRequestHeaderPrefix + strings.ToLower(name)

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: wangzlei <66336933+wangzlei@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 12:57:03 -0700
-Subject: [PATCH 2/4] http2: capture every stream on a multiplexed connection
+Subject: [PATCH 2/5] http2: capture every stream on a multiplexed connection
 
 Fixes OBI dropping all but one HTTP/2 stream per multiplexed connection, plus a
 unit test and an h2mux integration test (docker-compose fixture).

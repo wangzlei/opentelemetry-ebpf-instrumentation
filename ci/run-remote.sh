@@ -9,6 +9,6 @@ CW=${CWAGENT:-"$ROOT/../adot-obi-work/cwagent"}
 R=${REMOTE_DIR:-adot-obi-work}
 rsync -a --delete --exclude build --exclude ci/logs "$ROOT/" "$H:$R/adot-obi/"
 rsync -a --delete --exclude .git "$CW/" "$H:$R/cwagent/"
-ssh "$H" "cd $R/adot-obi && CWAGENT=$R/cwagent ${GOPROXY:+GOPROXY=$GOPROXY} ${GOSUMDB:+GOSUMDB=$GOSUMDB} ci/run.sh $*" ; rc=$?
+ssh "$H" "cd $R/adot-obi && CWAGENT=\$HOME/$R/cwagent ${GOPROXY:+GOPROXY=$GOPROXY} ${GOSUMDB:+GOSUMDB=$GOSUMDB} ci/run.sh $*" ; rc=$?
 rsync -a "$H:$R/adot-obi/ci/logs/" "$ROOT/ci/logs/"
 exit $rc

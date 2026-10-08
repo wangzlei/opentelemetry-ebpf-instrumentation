@@ -197,19 +197,20 @@ func TestToRequestTrace(t *testing.T) {
 	require.NoError(t, err)
 
 	expected := request.Span{
-		Host:         "8.8.8.8",
-		Peer:         "192.168.0.1",
-		Path:         "/hello",
-		FullPath:     "/hello",
-		Method:       "GET",
-		Status:       200,
-		Type:         request.EventTypeHTTP,
-		RequestStart: 123450,
-		Start:        123456,
-		End:          789012,
-		HostPort:     1,
-		Service:      svc.Attrs{},
-		Statement:    "http;",
+		Host:          "8.8.8.8",
+		Peer:          "192.168.0.1",
+		Path:          "/hello",
+		FullPath:      "/hello",
+		Method:        "GET",
+		Status:        200,
+		Type:          request.EventTypeHTTP,
+		RequestStart:  123450,
+		Start:         123456,
+		End:           789012,
+		HostPort:      1,
+		Service:       svc.Attrs{},
+		Statement:     "http;",
+		ForwardedHost: "example.com",
 	}
 	assert.Equal(t, expected, result)
 }
@@ -236,19 +237,20 @@ func TestToRequestTraceNoConnection(t *testing.T) {
 
 	// change the expected port just before testing
 	expected := request.Span{
-		Host:         "localhost",
-		Peer:         "",
-		Path:         "/hello",
-		FullPath:     "/hello",
-		Method:       "GET",
-		Type:         request.EventTypeHTTP,
-		Start:        123456,
-		RequestStart: 123450,
-		End:          789012,
-		Status:       200,
-		HostPort:     7033,
-		Service:      svc.Attrs{},
-		Statement:    "http;localhost",
+		Host:          "localhost",
+		Peer:          "",
+		Path:          "/hello",
+		FullPath:      "/hello",
+		Method:        "GET",
+		Type:          request.EventTypeHTTP,
+		Start:         123456,
+		RequestStart:  123450,
+		End:           789012,
+		Status:        200,
+		HostPort:      7033,
+		Service:       svc.Attrs{},
+		Statement:     "http;localhost",
+		ForwardedHost: "localhost:7033",
 	}
 	assert.Equal(t, expected, result)
 }

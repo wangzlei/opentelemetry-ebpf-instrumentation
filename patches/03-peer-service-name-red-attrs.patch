@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: wangzlei <66336933+wangzlei@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 12:57:13 -0700
-Subject: [PATCH 3/4] red-attrs: peer.service.name on client spans and HTTP
+Subject: [PATCH 3/5] red-attrs: peer.service.name on client spans and HTTP
  client RED metrics
 
 Emit the downstream's TCP-option-propagated service.name as peer.service.name
