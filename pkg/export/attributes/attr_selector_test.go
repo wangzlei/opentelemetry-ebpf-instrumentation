@@ -233,6 +233,7 @@ func TestExtraGroupAttributes(t *testing.T) {
 		"k8s.statefulset.name",
 		"server.address",
 		"server.port",
+		"peer.service.name",
 		"service.name",
 		"url.scheme",
 		"service.namespace",

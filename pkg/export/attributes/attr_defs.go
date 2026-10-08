@@ -299,6 +299,20 @@ func getDefinitions(
 		extraGroupAttributes[GroupServerInfo],
 	)
 
+	// HTTP server metrics only (RPC/DB servers keep serverInfo): adds
+	// peer.service.name taken from X-Forwarded-Host / Host (EXPERIMENTAL).
+	httpServerInfo := NewAttrReportGroup(
+		false,
+		nil,
+		map[attr.Name]Default{
+			attr.ClientAddr:      false,
+			attr.ServerAddr:      true,
+			attr.ServerPort:      true,
+			attr.PeerServiceName: true,
+		},
+		extraGroupAttributes[GroupServerInfo],
+	)
+
 	httpClientInfo := NewAttrReportGroup(
 		false,
 		nil,
@@ -354,13 +368,13 @@ func getDefinitions(
 			SubGroups: []*AttrReportGroup{&networkInterZone, &networkInterZoneCIDR, &networkGeoIP, &networkInterZoneKube},
 		},
 		HTTPServerDuration.Section: {
-			SubGroups: []*AttrReportGroup{&appAttributes, &httpCommon, &serverInfo},
+			SubGroups: []*AttrReportGroup{&appAttributes, &httpCommon, &httpServerInfo},
 		},
 		HTTPServerRequestSize.Section: {
-			SubGroups: []*AttrReportGroup{&appAttributes, &httpCommon, &serverInfo},
+			SubGroups: []*AttrReportGroup{&appAttributes, &httpCommon, &httpServerInfo},
 		},
 		HTTPServerResponseSize.Section: {
-			SubGroups: []*AttrReportGroup{&appAttributes, &httpCommon, &serverInfo},
+			SubGroups: []*AttrReportGroup{&appAttributes, &httpCommon, &httpServerInfo},
 		},
 		HTTPClientDuration.Section: {
 			SubGroups: []*AttrReportGroup{&appAttributes, &httpCommon, &httpClientInfo},
