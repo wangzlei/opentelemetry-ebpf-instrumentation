@@ -57,7 +57,8 @@ if want collector; then : > "$LOGS/collector.log"; RESULT[collector]=PASS
   run collector env GOPROXY="${COLLECTOR_GOPROXY:-direct}" GOSUMDB=off "$ROOT/scripts/build-collector.sh"
   run collector bash -c "docker run --rm \$(docker images --format '{{.Repository}}:{{.Tag}}' otelcol-obi | head -1) components | grep -E '^ *- (name: )?(obi|otlphttp|sigv4auth|cumulativetodelta|spanmetrics)' "
   # The baked-in default config (config/otel.yaml) must load in the image as shipped.
-  run collector bash -c "docker run --rm \$(docker images --format '{{.Repository}}:{{.Tag}}' otelcol-obi | head -1) validate --config=/etc/otelcol/config.yaml"
+  # Dummy credentials: sigv4auth resolves a credential provider during validate.
+  run collector bash -c "docker run --rm -e AWS_ACCESS_KEY_ID=ci -e AWS_SECRET_ACCESS_KEY=ci \$(docker images --format '{{.Repository}}:{{.Tag}}' otelcol-obi | head -1) validate --config=/etc/otelcol/config.yaml"
 fi
 
 # 5. cwagent compat build (the key gate): replaces resolve, no collector bump
