@@ -34,7 +34,7 @@ receivers:
         # On in EKS, off on plain EC2 ("true" would fail without a cluster).
         enable: "autodetect"
     metrics:
-      features: "application,application_service_graph"
+      features: "application"
 
 extensions:
   sigv4auth/xray:
