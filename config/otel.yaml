@@ -24,7 +24,6 @@ receivers:
           aws:
             enabled: true
     discovery:
-      bpf_pid_filter_off: true
       instrument:
         # ping: 8000; eks-auto apps: 8080-8083, 8443. Not an env var: a single-port
         # value would be typed as an int and rejected by OBI.
