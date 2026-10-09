@@ -84,12 +84,12 @@ processors:
 exporters:
   debug:
     verbosity: basic
-  # otlphttp compresses with gzip by default.
-  otlphttp/xray:
+  # otlp_http compresses with gzip by default.
+  otlp_http/xray:
     traces_endpoint: https://xray.${env:AWS_REGION:-us-west-2}.amazonaws.com/v1/traces
     auth:
       authenticator: sigv4auth/xray
-  otlphttp/cloudwatch:
+  otlp_http/cloudwatch:
     metrics_endpoint: https://monitoring.${env:AWS_REGION:-us-west-2}.amazonaws.com/v1/metrics
     auth:
       authenticator: sigv4auth/monitoring
@@ -105,8 +105,8 @@ service:
     traces:
       receivers: [obi]
       processors: [transform/aws, batch]
-      exporters: [otlphttp/xray, debug]
+      exporters: [otlp_http/xray, debug]
     metrics:
       receivers: [obi]
       processors: [transform/aws, cumulativetodelta, batch]
-      exporters: [otlphttp/cloudwatch, debug]
+      exporters: [otlp_http/cloudwatch, debug]
