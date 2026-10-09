@@ -32,7 +32,9 @@ config/otel.yaml          default OTel config baked into BOTH images (/etc/otelc
                           that path to replace it. CI validates it inside the collector image
 collector/                standalone eBPF collector distribution (OCB builder-config + Dockerfile) built from the same
                           build/obi as cwagent - for demos and A/B checks; image label io.adot-obi.source = tag+patch hash
-cwagent/                  the cwagent change (format-patch of branch exp/obi-receiver on v1.300074.0)
+cwagent/                  the cwagent change (format-patch of branch exp/obi-receiver on v1.300074.0): 0001 registers
+                          the obi receiver; 0002-0003 make the RPM run the agent as cwagent with 7 ambient caps
+                          (systemd drop-in service.d/ebpf.conf, no SYS_ADMIN). CI applies all of them
 scripts/
   apply-patches.sh        upstream/ + patches/ -> build/obi (git repo, one commit per patch, tag `upstream`)
   generate-bpf.sh         `make docker-generate` in build/obi, twice, sha256-compared (reproducibility)

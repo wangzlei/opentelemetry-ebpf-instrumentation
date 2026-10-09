@@ -164,7 +164,7 @@ jobs:
           git clone --quiet --depth 1 --branch "$CWAGENT_REF" \
             https://github.com/aws/amazon-cloudwatch-agent.git cwagent
           git -C cwagent -c user.name=ci -c user.email=ci@localhost \
-            am --quiet "$GITHUB_WORKSPACE"/adot-obi/cwagent/0001-*.patch
+            am --quiet "$GITHUB_WORKSPACE"/adot-obi/cwagent/0*.patch
 
       - name: cwagent gates and build (ci stage)
         env: { CWAGENT: "${{ github.workspace }}/cwagent" }

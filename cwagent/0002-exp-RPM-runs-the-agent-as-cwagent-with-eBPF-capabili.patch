@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wangzlei <66336933+wangzlei@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 20:48:09 -0700
+Subject: [PATCH 2/3] exp: RPM runs the agent as cwagent with eBPF capabilities
+ (systemd drop-in)
+
+Adds /etc/systemd/system/amazon-cloudwatch-agent.service.d/ebpf.conf: User=cwagent
+plus the 7 ambient capabilities the OBI receiver needs (BPF, PERFMON, SYS_PTRACE,
+DAC_READ_SEARCH, CHECKPOINT_RESTORE, NET_RAW, NET_ADMIN; no SYS_ADMIN), and a
+root ExecStartPre that chowns logs/ var/ etc/.
+
+start-amazon-cloudwatch-agent skips ChangeUser when it is not started as root:
+the setuid it would do is unnecessary, and its chown/setgroups need root.
+---
+ Makefile                                          |  2 ++
+ Tools/src/create_rpm.sh                           |  2 ++
+ cmd/start-amazon-cloudwatch-agent/path.go         |  8 ++++++--
+ .../amazon-cloudwatch-agent-ebpf.conf             | 15 +++++++++++++++
+ packaging/linux/amazon-cloudwatch-agent.spec      |  2 ++
+ 5 files changed, 27 insertions(+), 2 deletions(-)
+ create mode 100644 packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf
+
+diff --git a/Makefile b/Makefile
+index 7532815a..2b9cc81d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -266,6 +266,7 @@ package-prepare-rpm: amazon-cloudwatch-agent-linux copy-tools
+ 	cp $(BUILD_SPACE)/bin/CWAGENT_VERSION $(BUILD_SPACE)/private/linux/amd64/rpm/amazon-cloudwatch-agent-pre-pkg/
+ 	cp $(BASE_SPACE)/packaging/dependencies/amazon-cloudwatch-agent-ctl $(BUILD_SPACE)/private/linux/amd64/rpm/amazon-cloudwatch-agent-pre-pkg/
+ 	cp $(BASE_SPACE)/packaging/dependencies/amazon-cloudwatch-agent.service $(BUILD_SPACE)/private/linux/amd64/rpm/amazon-cloudwatch-agent-pre-pkg/
++	cp $(BASE_SPACE)/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf $(BUILD_SPACE)/private/linux/amd64/rpm/amazon-cloudwatch-agent-pre-pkg/
+ 	cp $(BASE_SPACE)/cfg/commonconfig/common-config.toml $(BUILD_SPACE)/private/linux/amd64/rpm/amazon-cloudwatch-agent-pre-pkg/
+ 	cp $(BASE_SPACE)/packaging/linux/amazon-cloudwatch-agent.conf $(BUILD_SPACE)/private/linux/amd64/rpm/amazon-cloudwatch-agent-pre-pkg/
+ 	cp $(BASE_SPACE)/packaging/linux/amazon-cloudwatch-agent.spec $(BUILD_SPACE)/private/linux/amd64/rpm/amazon-cloudwatch-agent-pre-pkg/
+@@ -280,6 +281,7 @@ package-prepare-rpm: amazon-cloudwatch-agent-linux copy-tools
+ 	cp $(BUILD_SPACE)/bin/CWAGENT_VERSION $(BUILD_SPACE)/private/linux/arm64/rpm/amazon-cloudwatch-agent-pre-pkg/
+ 	cp $(BASE_SPACE)/packaging/dependencies/amazon-cloudwatch-agent-ctl $(BUILD_SPACE)/private/linux/arm64/rpm/amazon-cloudwatch-agent-pre-pkg/
+ 	cp $(BASE_SPACE)/packaging/dependencies/amazon-cloudwatch-agent.service $(BUILD_SPACE)/private/linux/arm64/rpm/amazon-cloudwatch-agent-pre-pkg/
++	cp $(BASE_SPACE)/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf $(BUILD_SPACE)/private/linux/arm64/rpm/amazon-cloudwatch-agent-pre-pkg/
+ 	cp $(BASE_SPACE)/cfg/commonconfig/common-config.toml $(BUILD_SPACE)/private/linux/arm64/rpm/amazon-cloudwatch-agent-pre-pkg/
+ 	cp $(BASE_SPACE)/packaging/linux/amazon-cloudwatch-agent.conf $(BUILD_SPACE)/private/linux/arm64/rpm/amazon-cloudwatch-agent-pre-pkg/
+ 	cp $(BASE_SPACE)/packaging/linux/amazon-cloudwatch-agent.spec $(BUILD_SPACE)/private/linux/arm64/rpm/amazon-cloudwatch-agent-pre-pkg/
+diff --git a/Tools/src/create_rpm.sh b/Tools/src/create_rpm.sh
+index c55aec26..c488cdb9 100755
+--- a/Tools/src/create_rpm.sh
++++ b/Tools/src/create_rpm.sh
+@@ -32,6 +32,8 @@ cp ${PREPKGPATH}/CWAGENT_VERSION ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch
+ cp ${PREPKGPATH}/amazon-cloudwatch-agent ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/bin/
+ cp ${PREPKGPATH}/amazon-cloudwatch-agent-ctl ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/bin/
+ cp ${PREPKGPATH}/amazon-cloudwatch-agent.service ${BUILD_ROOT}/SOURCES/etc/systemd/system/
++mkdir -p ${BUILD_ROOT}/SOURCES/etc/systemd/system/amazon-cloudwatch-agent.service.d
++cp ${PREPKGPATH}/amazon-cloudwatch-agent-ebpf.conf ${BUILD_ROOT}/SOURCES/etc/systemd/system/amazon-cloudwatch-agent.service.d/ebpf.conf
+ cp ${PREPKGPATH}/config-translator ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/bin/
+ cp ${PREPKGPATH}/config-downloader ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/bin/
+ cp ${PREPKGPATH}/amazon-cloudwatch-agent-config-wizard ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/bin/
+diff --git a/cmd/start-amazon-cloudwatch-agent/path.go b/cmd/start-amazon-cloudwatch-agent/path.go
+index ff6904e3..a6c8032a 100644
+--- a/cmd/start-amazon-cloudwatch-agent/path.go
++++ b/cmd/start-amazon-cloudwatch-agent/path.go
+@@ -48,8 +48,12 @@ func startAgent(writer io.WriteCloser) error {
+ 	runAsUser, _ := user.DetectRunAsUser(configMap)
+ 	log.Printf("I! Detected runAsUser: %v", runAsUser)
+ 
+-	_, err = user.ChangeUser(runAsUser)
+-	if err != nil {
++	if os.Geteuid() != 0 {
++		// Started unprivileged (e.g. systemd User=cwagent with ambient capabilities
++		// for the eBPF receiver): there is no user to switch to, and the chown and
++		// setgroups that ChangeUser does would fail without root.
++		log.Printf("I! Running as uid %d, not root: skipping run_as_user %q", os.Geteuid(), runAsUser)
++	} else if _, err = user.ChangeUser(runAsUser); err != nil {
+ 		log.Printf("E! Failed to ChangeUser: %v ", err)
+ 		return err
+ 	}
+diff --git a/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf b/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf
+new file mode 100644
+index 00000000..4a598474
+--- /dev/null
++++ b/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf
+@@ -0,0 +1,15 @@
++# systemd drop-in installed as
++#   /etc/systemd/system/amazon-cloudwatch-agent.service.d/ebpf.conf
++# Runs the agent as the unprivileged cwagent user with only the capabilities the
++# ADOT OBI eBPF receiver needs (raised as ambient, so they survive the exec of the
++# agent binary). No CAP_SYS_ADMIN. start-amazon-cloudwatch-agent skips its own
++# run_as_user switch when it is not started as root.
++[Service]
++User=cwagent
++Group=cwagent
++AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_CHECKPOINT_RESTORE CAP_NET_RAW CAP_NET_ADMIN
++CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_CHECKPOINT_RESTORE CAP_NET_RAW CAP_NET_ADMIN
++LimitMEMLOCK=infinity
++# The agent writes logs/ and var/ and reads etc/ (written by the ctl as root).
++# "+" runs this one step as root.
++ExecStartPre=+/bin/chown -R cwagent:cwagent /opt/aws/amazon-cloudwatch-agent/logs /opt/aws/amazon-cloudwatch-agent/var /opt/aws/amazon-cloudwatch-agent/etc
+diff --git a/packaging/linux/amazon-cloudwatch-agent.spec b/packaging/linux/amazon-cloudwatch-agent.spec
+index 82c9b375..498815d5 100644
+--- a/packaging/linux/amazon-cloudwatch-agent.spec
++++ b/packaging/linux/amazon-cloudwatch-agent.spec
+@@ -66,6 +66,8 @@ ln -f -s /opt/aws/amazon-cloudwatch-agent/var ${RPM_BUILD_ROOT}/var/run/amazon/a
+ /opt/aws/amazon-cloudwatch-agent/RELEASE_NOTES
+ /etc/init/amazon-cloudwatch-agent.conf
+ /etc/systemd/system/amazon-cloudwatch-agent.service
++%dir /etc/systemd/system/amazon-cloudwatch-agent.service.d
++/etc/systemd/system/amazon-cloudwatch-agent.service.d/ebpf.conf
+ 
+ /usr/bin/amazon-cloudwatch-agent-ctl
+ /etc/amazon/amazon-cloudwatch-agent

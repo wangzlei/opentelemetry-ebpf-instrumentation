@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wangzlei <66336933+wangzlei@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 21:37:00 -0700
+Subject: [PATCH 3/3] exp: ebpf drop-in prepares /sys/fs/bpf/otel for cwagent
+
+OBI pins shared maps under /sys/fs/bpf/otel; /sys/fs/bpf is root-only. Without
+this the unprivileged agent fails on a root-owned pin dir left by an earlier root
+run, or runs with pinning disabled when the dir does not exist.
+---
+ packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf b/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf
+index 4a598474..221eb446 100644
+--- a/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf
++++ b/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf
+@@ -13,3 +13,9 @@ LimitMEMLOCK=infinity
+ # The agent writes logs/ and var/ and reads etc/ (written by the ctl as root).
+ # "+" runs this one step as root.
+ ExecStartPre=+/bin/chown -R cwagent:cwagent /opt/aws/amazon-cloudwatch-agent/logs /opt/aws/amazon-cloudwatch-agent/var /opt/aws/amazon-cloudwatch-agent/etc
++# OBI pins maps shared with other OTel eBPF components under /sys/fs/bpf/otel.
++# /sys/fs/bpf is root-only: prepare that one directory (and any pins a previous
++# root run left there) for cwagent, or OBI fails with "load pinned map: permission
++# denied" (existing root-owned dir) or runs with pinning disabled (no dir).
++ExecStartPre=+/bin/mkdir -p /sys/fs/bpf/otel
++ExecStartPre=+/bin/chown -R cwagent:cwagent /sys/fs/bpf/otel
