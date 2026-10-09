@@ -33,8 +33,13 @@ config/otel.yaml          default OTel config baked into BOTH images (/etc/otelc
 collector/                standalone eBPF collector distribution (OCB builder-config + Dockerfile) built from the same
                           build/obi as cwagent - for demos and A/B checks; image label io.adot-obi.source = tag+patch hash
 cwagent/                  the cwagent change (format-patch of branch exp/obi-receiver on v1.300074.0): 0001 registers
-                          the obi receiver; 0002-0003 make the RPM run the agent as cwagent with 7 ambient caps
-                          (systemd drop-in service.d/ebpf.conf, no SYS_ADMIN). CI applies all of them
+                          the obi receiver; 0002-0004 make the RPM run the agent as cwagent with 8 ambient caps
+                          (systemd drop-in service.d/ebpf.conf, incl. SYS_ADMIN for the FIONREAD compensation on
+                          kernels 6.6.128+/6.12.75+/6.18.14+/6.19+); 0005 ships config/otel.yaml as
+                          etc/ebpf/obi.yaml (%config(noreplace), outside amazon-cloudwatch-agent.d so fetch-config
+                          keeps it), loaded first by start-agent. Edit that file to change it (a .d YAML cannot:
+                          the agent rejects duplicate receivers/processors/exporters/extensions/service::pipelines
+                          keys); etc/ebpf/disabled turns it off. CI applies all of them
 scripts/
   apply-patches.sh        upstream/ + patches/ -> build/obi (git repo, one commit per patch, tag `upstream`)
   generate-bpf.sh         `make docker-generate` in build/obi, twice, sha256-compared (reproducibility)
@@ -131,7 +136,10 @@ The YAML block under `receivers: obi:` is OBI's standard config schema. Nothing 
 instrumented until `discovery` selects targets.
 
 Required capabilities: CAP_BPF, CAP_PERFMON, CAP_SYS_PTRACE, CAP_DAC_READ_SEARCH,
-CAP_CHECKPOINT_RESTORE, CAP_NET_RAW, + CAP_NET_ADMIN for context propagation. No CAP_SYS_ADMIN.
+CAP_CHECKPOINT_RESTORE, CAP_NET_RAW, + CAP_NET_ADMIN for context propagation, + CAP_SYS_ADMIN
+for context propagation on kernels with commit 929e30f93125 (6.6.128+, 6.12.75+, 6.18.14+, 6.19+):
+there OBI loads a FIONREAD compensation program that uses bpf_probe_write_user (CAP_SYS_ADMIN only);
+without it OBI logs "context propagation is disabled". The RPM drop-in grants all 8.
 Caveats: kernels < 5.11 also want CAP_SYS_RESOURCE (or a high RLIMIT_MEMLOCK set by the
 service manager); on cgroup-v1 hosts (Amazon Linux 2) TCP propagation needs a cgroup2
 hierarchy at /sys/fs/cgroup/unified, otherwise OBI's fallback (fsmount) needs CAP_SYS_ADMIN
