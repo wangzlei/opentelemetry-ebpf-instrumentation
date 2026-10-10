@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: wangzlei <66336933+wangzlei@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 15:16:20 -0700
-Subject: [PATCH 5/5] exp: RPM ships the default eBPF config in
+Subject: [PATCH 5/6] exp: RPM ships the default eBPF config in
  etc/ebpf/obi.yaml
 
 fetch-config (ManageAgent configure) empties amazon-cloudwatch-agent.d, so a
