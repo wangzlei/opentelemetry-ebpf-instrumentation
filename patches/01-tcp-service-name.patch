@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: wangzlei <66336933+wangzlei@users.noreply.github.com>
 Date: Wed, 7 Oct 2026 13:28:19 -0700
-Subject: [PATCH 1/5] tcp-service-name: propagate the server's service.name in
+Subject: [PATCH 1/6] tcp-service-name: propagate the server's service.name in
  a TCP option
 
 Upstream OBI cannot tell a client which service it is calling: the downstream
@@ -25,6 +25,14 @@ program therefore pulls the message data and fills msg_buffers on the server
 path too, so the backup kprobe still captures plaintext HTTP/1 responses.
 Without it, non-Go (kprobe-traced) servers lose every server span.
 
+Renames after instrumentation: AllowPID runs in the discovery pipeline before
+the Kubernetes / Docker process-event decorators (pkg/internal/appolly), so the
+first svc_name_by_pid entry of a pod holds its pre-Kubernetes name. The
+tpinjector registers exec.FileInfo.OnServiceNameChange per PID and re-records
+the entry whenever SetUID / SetAutoServiceName changes the name; a name that
+cannot be propagated (empty, > 25 bytes) deletes the entry instead of leaving a
+stale one.
+
 Only the TCP option is added; L7 payloads and headers are never modified.
 Requires CAP_NET_ADMIN (cgroup sockops/sk_msg).
 
@@ -35,23 +43,26 @@ handled by upstream payload extraction instead.
 
 Adot-Obi-Patch: 01-tcp-service-name
 ---
- bpf/common/common.h                        |  13 ++
- bpf/common/http_info.h                     |  13 ++
- bpf/generictracer/protocol_http.h          |  24 +++
- bpf/gotracer/go_nethttp.c                  |  15 ++
- bpf/maps/svc_peer_name_map.h               |  43 ++++
- bpf/tpinjector/maps/sk_svc_name_map.h      |  36 ++++
- bpf/tpinjector/maps/svc_name_by_pid.h      |  27 +++
- bpf/tpinjector/tpinjector.c                | 230 ++++++++++++++++++---
- pkg/appolly/app/request/span.go            |  21 +-
- pkg/ebpf/common/http_transform.go          |  16 ++
- pkg/ebpf/common/spanner.go                 |  12 ++
- pkg/export/otel/tracesgen/tracesgen.go     |   8 +
- pkg/internal/ebpf/tpinjector/tpinjector.go |  46 ++++-
- 13 files changed, 468 insertions(+), 36 deletions(-)
+ bpf/common/common.h                           |  13 +
+ bpf/common/http_info.h                        |  13 +
+ bpf/generictracer/protocol_http.h             |  24 ++
+ bpf/gotracer/go_nethttp.c                     |  15 ++
+ bpf/maps/svc_peer_name_map.h                  |  43 ++++
+ bpf/tpinjector/maps/sk_svc_name_map.h         |  36 +++
+ bpf/tpinjector/maps/svc_name_by_pid.h         |  27 ++
+ bpf/tpinjector/tpinjector.c                   | 230 +++++++++++++++---
+ pkg/appolly/app/request/span.go               |  21 +-
+ pkg/appolly/discover/exec/file.go             |  40 ++-
+ .../discover/exec/file_listener_test.go       |  26 ++
+ pkg/ebpf/common/http_transform.go             |  16 ++
+ pkg/ebpf/common/spanner.go                    |  12 +
+ pkg/export/otel/tracesgen/tracesgen.go        |   8 +
+ pkg/internal/ebpf/tpinjector/tpinjector.go    |  69 +++++-
+ 15 files changed, 555 insertions(+), 38 deletions(-)
  create mode 100644 bpf/maps/svc_peer_name_map.h
  create mode 100644 bpf/tpinjector/maps/sk_svc_name_map.h
  create mode 100644 bpf/tpinjector/maps/svc_name_by_pid.h
+ create mode 100644 pkg/appolly/discover/exec/file_listener_test.go
 
 diff --git a/bpf/common/common.h b/bpf/common/common.h
 index ec6e38772ec75e5dc1461759bc053b2dc42cab95..e05e44aa7f615c4e6134753207bb7fdf5d332314 100644
@@ -685,6 +696,103 @@ index 6d1156fa23d105d219cd00e63eda81abaf5b93ad..beb746815ed2b5dfc88ded1573eb6291
  		if s.SubType == HTTPSubtypeElasticsearch && s.Elasticsearch != nil {
  			attrs["dbCollectionName"] = s.Elasticsearch.DBCollectionName
  			attrs["nodeName"] = s.Elasticsearch.NodeName
+diff --git a/pkg/appolly/discover/exec/file.go b/pkg/appolly/discover/exec/file.go
+index eabf55c5dd76f74766d2f0415165b46a59fb48a6..d7b7f7ebdafc443c092953f596a6a97be732d074 100644
+--- a/pkg/appolly/discover/exec/file.go
++++ b/pkg/appolly/discover/exec/file.go
+@@ -48,6 +48,10 @@ type FileInfo struct {
+ 	dev            uint64
+ 	ino            uint64
+ 	ns             uint32
++
++	// nameListeners run after SetUID or SetAutoServiceName changed the service
++	// name (EXPERIMENTAL — TCP service-name propagation).
++	nameListeners []func()
+ }
+ 
+ func New(init Init) *FileInfo {
+@@ -174,15 +178,47 @@ func (fi *FileInfo) SetHostName(h string) {
+ 
+ func (fi *FileInfo) SetAutoServiceName(name string) {
+ 	fi.mu.Lock()
+-	defer fi.mu.Unlock()
++	changed := fi.service.UID.Name != name
+ 	fi.service.UID.Name = name
+ 	fi.service.SetAutoName()
++	listeners := fi.nameListenersIf(changed)
++	fi.mu.Unlock()
++	notify(listeners)
+ }
+ 
+ func (fi *FileInfo) SetUID(uid svc.UID) {
+ 	fi.mu.Lock()
+-	defer fi.mu.Unlock()
++	changed := fi.service.UID.Name != uid.Name
+ 	fi.service.UID = uid
++	listeners := fi.nameListenersIf(changed)
++	fi.mu.Unlock()
++	notify(listeners)
++}
++
++// OnServiceNameChange registers fn to run, without fi's lock held, every time
++// SetUID or SetAutoServiceName changes the service name. The Kubernetes,
++// Docker and process-context decorators rename a process after it was
++// instrumented, so consumers that copy the name elsewhere (the tpinjector
++// svc_name_by_pid map) use this to stay in sync.
++func (fi *FileInfo) OnServiceNameChange(fn func()) {
++	fi.mu.Lock()
++	defer fi.mu.Unlock()
++	fi.nameListeners = append(fi.nameListeners, fn)
++}
++
++// nameListenersIf returns a copy of the listeners when changed is true.
++// Caller holds fi.mu.
++func (fi *FileInfo) nameListenersIf(changed bool) []func() {
++	if !changed || len(fi.nameListeners) == 0 {
++		return nil
++	}
++	return append([]func(){}, fi.nameListeners...)
++}
++
++func notify(listeners []func()) {
++	for _, fn := range listeners {
++		fn()
++	}
+ }
+ 
+ func (fi *FileInfo) AutoName() bool {
+diff --git a/pkg/appolly/discover/exec/file_listener_test.go b/pkg/appolly/discover/exec/file_listener_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..8e6e82f6beca00cf0089e608385ce8563a4e6c86
+--- /dev/null
++++ b/pkg/appolly/discover/exec/file_listener_test.go
+@@ -0,0 +1,26 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package exec
++
++import (
++	"testing"
++
++	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
++)
++
++func TestOnServiceNameChange(t *testing.T) {
++	fi := New(Init{Service: svc.Attrs{UID: svc.UID{Name: "python3"}}})
++	var seen []string
++	fi.OnServiceNameChange(func() { seen = append(seen, fi.ServiceAttrs().UID.Name) })
++
++	fi.SetUID(svc.UID{Name: "python3", Namespace: "ns"}) // same name: no call
++	fi.SetUID(svc.UID{Name: "orders", Namespace: "ns"})  // Kubernetes rename
++	fi.SetAutoServiceName("orders")                      // same name: no call
++	fi.SetAutoServiceName("billing")
++
++	want := []string{"orders", "billing"}
++	if len(seen) != len(want) || seen[0] != want[0] || seen[1] != want[1] {
++		t.Fatalf("listener calls = %v, want %v", seen, want)
++	}
++}
 diff --git a/pkg/ebpf/common/http_transform.go b/pkg/ebpf/common/http_transform.go
 index 730b570e7c5e0954f7a9725ec1d4f936a286e2fe..e9127108730a12671021e62e13567692879db1e6 100644
 --- a/pkg/ebpf/common/http_transform.go
@@ -765,10 +873,20 @@ index 341145095768d6cb43ba6d5d3c6d67b4ba871e21..cdf92b87315b995633d5b698d822bc71
  			attrs = append(attrs, request.DBCollectionName(span.Elasticsearch.DBCollectionName))
  			attrs = append(attrs, request.ElasticsearchNodeName(span.Elasticsearch.NodeName))
 diff --git a/pkg/internal/ebpf/tpinjector/tpinjector.go b/pkg/internal/ebpf/tpinjector/tpinjector.go
-index 72dfdcd318974e37ddbca08c3f91fbf4efcd8b4f..c2ad6183fea5aaad265b0057930437fc81e20ad9 100644
+index 72dfdcd318974e37ddbca08c3f91fbf4efcd8b4f..a3f3f04b70014cf5d885a0b683e3628b2c79dcc4 100644
 --- a/pkg/internal/ebpf/tpinjector/tpinjector.go
 +++ b/pkg/internal/ebpf/tpinjector/tpinjector.go
-@@ -77,7 +77,43 @@ func New(cfg *obi.Config) *Tracer {
+@@ -53,6 +53,9 @@ type Tracer struct {
+ 	seenNetns               *expirable.LRU[uint64, struct{}]
+ 	netnsAttempts           *expirable.LRU[uint64, int]
+ 	backfillDisabled        bool
++	// svcNamePIDs maps each allowed PID to its *exec.FileInfo, so a rename
++	// after AllowPID (Kubernetes / Docker decoration) refreshes svc_name_by_pid.
++	svcNamePIDs sync.Map
+ }
+ 
+ const (
+@@ -77,7 +80,62 @@ func New(cfg *obi.Config) *Tracer {
  }
  
  // AllowPID backfills sock_dir with pre-existing sockets: iter/tcp only walks the opener's netns
@@ -781,19 +899,21 @@ index 72dfdcd318974e37ddbca08c3f91fbf4efcd8b4f..c2ad6183fea5aaad265b0057930437fc
 +// recordServiceName records this process's service.name into svc_name_by_pid,
 +// keyed by host PID (matching pid_from_pid_tgid on the BPF side). The sk_msg send
 +// path looks it up to stamp the real service name into a TCP option on responses
-+// (EXPERIMENTAL — TCP service-name propagation).
++// (EXPERIMENTAL — TCP service-name propagation). A name that cannot be propagated
++// (empty or too long) removes the entry, so a stale earlier name is never sent.
 +func (p *Tracer) recordServiceName(pid app.PID, fi *exec.FileInfo) {
 +	if fi == nil || p.bpfObjects.SvcNameByPid == nil {
 +		return
 +	}
++	key := uint32(pid)
 +	name := fi.ServiceAttrs().UID.Name
-+	if name == "" {
-+		return
-+	}
-+	if len(name) > svcNameMaxLen {
-+		// Never truncate: a truncated name could merge unrelated services.
-+		p.log.Debug("service name exceeds TCP-option limit, not propagating",
-+			"name", name, "len", len(name), "limit", svcNameMaxLen)
++	if name == "" || len(name) > svcNameMaxLen {
++		if name != "" {
++			// Never truncate: a truncated name could merge unrelated services.
++			p.log.Debug("service name exceeds TCP-option limit, not propagating",
++				"name", name, "len", len(name), "limit", svcNameMaxLen)
++		}
++		_ = p.bpfObjects.SvcNameByPid.Delete(&key)
 +		return
 +	}
 +
@@ -801,24 +921,42 @@ index 72dfdcd318974e37ddbca08c3f91fbf4efcd8b4f..c2ad6183fea5aaad265b0057930437fc
 +	copy(val[:svcNameMaxLen], name)
 +	val[svcNameMaxLen] = byte(len(name))
 +
-+	key := uint32(pid)
 +	if err := p.bpfObjects.SvcNameByPid.Update(&key, &val, ebpf.UpdateAny); err != nil {
 +		p.log.Debug("failed to record service name for pid", "pid", pid, "error", err)
 +	}
 +}
 +
-+func (p *Tracer) AllowPID(pid app.PID, _ uint32, fi *exec.FileInfo) {
++// trackServiceName records the current name and re-records it whenever the
++// FileInfo is renamed later. AllowPID runs in the discovery pipeline BEFORE the
++// Kubernetes / Docker process-event decorators (pkg/internal/appolly), so
++// without the refresh an EKS pod would propagate its pre-Kubernetes name.
++func (p *Tracer) trackServiceName(pid app.PID, fi *exec.FileInfo) {
++	if fi == nil || p.bpfObjects.SvcNameByPid == nil {
++		return
++	}
++	if prev, loaded := p.svcNamePIDs.Swap(pid, fi); !loaded || prev != fi {
++		fi.OnServiceNameChange(func() {
++			if cur, ok := p.svcNamePIDs.Load(pid); ok && cur == fi {
++				p.recordServiceName(pid, fi)
++			}
++		})
++	}
 +	p.recordServiceName(pid, fi)
++}
++
++func (p *Tracer) AllowPID(pid app.PID, _ uint32, fi *exec.FileInfo) {
++	p.trackServiceName(pid, fi)
 +
  	p.iterMu.Lock()
  	defer p.iterMu.Unlock()
  
-@@ -131,7 +167,13 @@ func (p *Tracer) AllowPID(pid app.PID, _ uint32, _ *exec.FileInfo) {
+@@ -131,7 +189,14 @@ func (p *Tracer) AllowPID(pid app.PID, _ uint32, _ *exec.FileInfo) {
  	p.seenNetns.Add(inode, struct{}{})
  }
  
 -func (p *Tracer) BlockPID(app.PID, uint32) {}
 +func (p *Tracer) BlockPID(pid app.PID, _ uint32) {
++	p.svcNamePIDs.Delete(pid)
 +	if p.bpfObjects.SvcNameByPid == nil {
 +		return
 +	}

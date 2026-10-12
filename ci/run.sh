@@ -38,7 +38,8 @@ if want obi; then : > "$LOGS/obi.log"; RESULT[obi]=PASS
   O="$ROOT/build/obi"
   PKGS=(./pkg/ebpf/common/... ./pkg/internal/ebpf/tpinjector/... ./pkg/internal/ebpf/gotracer/...
         ./pkg/export/otel/tracesgen/... ./pkg/export/attributes/... ./pkg/appolly/app/request/...
-        ./pkg/appolly/meta/... ./pkg/appolly/discover/... ./pkg/internal/processcontext/... ./pkg/obi/... ./collector/...)
+        ./pkg/appolly/meta/... ./pkg/appolly/discover/... ./pkg/internal/processcontext/...
+        ./pkg/internal/procname/... ./pkg/internal/jvmtools/... ./pkg/obi/... ./collector/...)
   run obi bash -c "cd '$O' && go build ./..."
   run obi bash -c "cd '$O' && go vet ${PKGS[*]}"
   # Known environment-dependent upstream test: tpinjector TestTracer_Constants

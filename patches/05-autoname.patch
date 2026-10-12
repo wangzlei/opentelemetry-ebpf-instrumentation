@@ -1,0 +1,1254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wangzlei <66336933+wangzlei@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 16:22:38 -0700
+Subject: [PATCH 5/6] autoname: service name from project metadata / command
+ line
+
+A process without OTEL_SERVICE_NAME (or service.name in
+OTEL_RESOURCE_ATTRIBUTES), without a discovery criteria name and without
+Kubernetes metadata is named after its executable: python3, node, dotnet,
+java. Several services on one host then share one name, and patch 01
+propagates that useless name to their callers as peer.service.name.
+
+With discovery.service_name_from_cmdline: true (env
+OTEL_EBPF_SERVICE_NAME_FROM_CMDLINE), the trace attacher derives a name before
+the process is instrumented (attacher.go resolveServiceMetadata, which runs
+before getTracer -> monitorPIDs -> AllowPID), so it is also the name the
+tpinjector writes into svc_name_by_pid and sends in the TCP option:
+
+1. Project metadata, read inside /proc/<pid>/root (openat2 RESOLVE_IN_ROOT):
+   - Node.js: package.json "name" from the script's directory up to the
+     working directory, npm scope removed (@acme/orders-api -> orders-api);
+     for a tool under node_modules (npm, next) only the working directory.
+   - Python: [project].name (or [tool.poetry].name) of ./pyproject.toml.
+   - Java (jvmtools, after spring.application.name and Implementation-Title):
+     JAR name without its version (order-service-1.4.2.jar -> order-service),
+     Start-Class behind a Spring Boot JarLauncher / WarLauncher /
+     PropertiesLauncher (also the exploded /app/META-INF/MANIFEST.MF layout),
+     else the main class's simple name (-cp/-p/--add-opens values, -D, -X,
+     -javaagent skipped; -m module/Main -> Main).
+   - .NET: dotnet X.dll -> X.
+2. The entry argument, only for python*, node, ruby, php* (native binaries keep
+   their executable name): the Python script, the last non-generic component
+   of -m X, or the module of a gunicorn / uvicorn / hypercorn / waitress /
+   daphne / celery target (also the setproctitle "gunicorn: worker [m:app]"
+   form); the Node.js script (node options skipped); the Ruby / PHP script.
+3. Never worse than before: names are sanitised to [A-Za-z0-9._-], a trailing
+   -1.2.3 / -SNAPSHOT version is stripped, the length is capped at 63, and a
+   generic result (main, app, index, server, run, start, wsgi, asgi, manage,
+   application, dist, src, bin, lib, build; case-insensitive) or an empty one
+   keeps the executable-name fallback (Java: the upstream JAR name).
+
+The name is stored as an automatic name, so Kubernetes metadata still replaces
+it, and environment / criteria names are never touched. ExecutableName() is
+unchanged (it also labels OBI's internal metrics).
+
+Why upstream does not do it: OBI names services from explicit configuration
+(env, criteria, Kubernetes) and treats the executable name as a placeholder;
+only Java has a resolver. Guessing names from command lines is a policy
+choice, so it is opt-in here too.
+
+Turn it off: discovery.service_name_from_cmdline: false (the default in code)
+or OTEL_EBPF_SERVICE_NAME_FROM_CMDLINE=false. The adot-obi default configs
+(config/otel.yaml, cwagent etc/ebpf) enable it.
+
+Adot-Obi-Patch: 05-autoname
+---
+ devdocs/config/CONFIG.md                      |   1 +
+ devdocs/config/config-schema.json             |   6 +
+ pkg/appolly/discover/attacher.go              |  12 +-
+ pkg/appolly/services/criteria.go              |   7 +
+ pkg/internal/jvmtools/service_metadata.go     |  31 +-
+ pkg/internal/jvmtools/service_name_cmdline.go | 147 +++++++
+ .../jvmtools/service_name_cmdline_test.go     |  86 ++++
+ pkg/internal/procname/procname.go             | 409 ++++++++++++++++++
+ pkg/internal/procname/procname_test.go        | 161 +++++++
+ pkg/internal/procname/read_linux.go           |  82 ++++
+ pkg/internal/procname/read_linux_test.go      |  36 ++
+ pkg/internal/procname/read_other.go           |  12 +
+ pkg/internal/procname/resolve.go              |  45 ++
+ 13 files changed, 1030 insertions(+), 5 deletions(-)
+ create mode 100644 pkg/internal/jvmtools/service_name_cmdline.go
+ create mode 100644 pkg/internal/jvmtools/service_name_cmdline_test.go
+ create mode 100644 pkg/internal/procname/procname.go
+ create mode 100644 pkg/internal/procname/procname_test.go
+ create mode 100644 pkg/internal/procname/read_linux.go
+ create mode 100644 pkg/internal/procname/read_linux_test.go
+ create mode 100644 pkg/internal/procname/read_other.go
+ create mode 100644 pkg/internal/procname/resolve.go
+
+diff --git a/devdocs/config/CONFIG.md b/devdocs/config/CONFIG.md
+index 7d6269d2dc5125b6097a5ecacaae9e0eee6a3928..902920513e59fa3f4081b7f3c250f21a9df82d05 100644
+--- a/devdocs/config/CONFIG.md
++++ b/devdocs/config/CONFIG.md
+@@ -141,6 +141,7 @@ DiscoveryConfig for the discover.ProcessFinder pipeline
+ | `discovery.poll_interval` | `duration` | `OTEL_EBPF_DISCOVERY_POLL_INTERVAL` | `0s` | `30s`, `5m`, `1ms`, etc |  | Specifies, for the poll service watcher, the interval time between process inspections. 0 is treated as a default (5s) by the process watcher. |
+ | `discovery.process_context_poll_interval` | `duration` | `OTEL_EBPF_PROCESS_CONTEXT_POLL_INTERVAL` | `1s` | `30s`, `5m`, `1ms`, etc |  | Controls how often OBI re-reads the OTEL_CTX mapping of each discovered process.  Polling handles both SDKs that publish the mapping after startup and context updates published later. 0 disables polling; only the initial enrichment on process creation runs. |
+ | `discovery.route_harvester_timeout` | `duration` | `OTEL_EBPF_ROUTE_HARVESTER_TIMEOUT` | `10s` | `30s`, `5m`, `1ms`, etc |  |  |
++| `discovery.service_name_from_cmdline` | `boolean` | `OTEL_EBPF_SERVICE_NAME_FROM_CMDLINE` | `false` |  |  | Derives the automatic service name of a process without OTEL_SERVICE_NAME / service.name from its project metadata or command line (package.json, pyproject.toml, script, WSGI/ASGI target, JAR, main class, .NET assembly) instead of the executable name (python3, node, java, ...). Kubernetes metadata still overrides it. Default false. |
+ | `discovery.services` | [`RegexSelector`](#regexselector)[] |  |  |  | Yes | Selection. If the user defined the OTEL_EBPF_EXECUTABLE_PATH or OTEL_EBPF_OPEN_PORT variables, they will be automatically added to the services definition criteria, with the lowest preference.  Use Instrument instead |
+ | `discovery.skip_go_specific_tracers` | `boolean` | `OTEL_EBPF_SKIP_GO_SPECIFIC_TRACERS` | `false` |  |  | This can be enabled to use generic HTTP tracers only, no Go-specifics will be used: |
+ 
+diff --git a/devdocs/config/config-schema.json b/devdocs/config/config-schema.json
+index 8b517c598419c7b58a1a9314c7afa219618e2092..a9dba687ee7a97f883443b2fe001a4924f6d6cec 100644
+--- a/devdocs/config/config-schema.json
++++ b/devdocs/config/config-schema.json
+@@ -558,6 +558,12 @@
+           ],
+           "x-env-var": "OTEL_EBPF_ROUTE_HARVESTER_TIMEOUT"
+         },
++        "service_name_from_cmdline": {
++          "type": "boolean",
++          "description": "Derives the automatic service name of a process without OTEL_SERVICE_NAME / service.name from its project metadata or command line (package.json, pyproject.toml, script, WSGI/ASGI target, JAR, main class, .NET assembly) instead of the executable name (python3, node, java, ...). Kubernetes metadata still overrides it. Default false.",
++          "default": false,
++          "x-env-var": "OTEL_EBPF_SERVICE_NAME_FROM_CMDLINE"
++        },
+         "services": {
+           "$ref": "#/$defs/RegexDefinitionCriteria",
+           "description": "Selection. If the user defined the OTEL_EBPF_EXECUTABLE_PATH or OTEL_EBPF_OPEN_PORT variables, they will be automatically added to the services definition criteria, with the lowest preference.  Use Instrument instead",
+diff --git a/pkg/appolly/discover/attacher.go b/pkg/appolly/discover/attacher.go
+index c7ecf6896ed6c678d214994b7ad494dd95aa1096..77545434a2e2e730f8ca0ff8ad0957fa8c25afe1 100644
+--- a/pkg/appolly/discover/attacher.go
++++ b/pkg/appolly/discover/attacher.go
+@@ -24,6 +24,7 @@ import (
+ 	javaagent "go.opentelemetry.io/obi/pkg/internal/java"
+ 	"go.opentelemetry.io/obi/pkg/internal/jvmtools"
+ 	"go.opentelemetry.io/obi/pkg/internal/nodejs"
++	"go.opentelemetry.io/obi/pkg/internal/procname"
+ 	"go.opentelemetry.io/obi/pkg/internal/transform/route/harvest"
+ 	"go.opentelemetry.io/obi/pkg/obi"
+ 	"go.opentelemetry.io/obi/pkg/pipe/msg"
+@@ -155,13 +156,22 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error)
+ 	}, nil
+ }
+ 
++// resolveServiceMetadata runs before getTracer -> monitorPIDs -> AllowPID, so a
++// name derived here is the one the tpinjector writes into svc_name_by_pid and
++// propagates in the TCP option.
+ func (ta *traceAttacher) resolveServiceMetadata(ie *ebpf.Instrumentable) {
++	fromCmdline := ta.Cfg.Discovery.ServiceNameFromCmdline
+ 	if ie.Type == svc.InstrumentableJava {
+-		err := jvmtools.ResolveServiceMetadata(ie.FileInfo)
++		err := jvmtools.ResolveServiceMetadataWithOptions(ie.FileInfo, jvmtools.Options{NameFromCmdline: fromCmdline})
+ 		if err != nil {
+ 			ta.log.Debug("unable to resolve Java service metadata", "pid", ie.FileInfo.Pid(), "error", err)
+ 		}
+ 	}
++	if fromCmdline {
++		if name := procname.Resolve(ie.FileInfo); name != "" {
++			ta.log.Debug("service name from command line", "pid", ie.FileInfo.Pid(), "name", name)
++		}
++	}
+ }
+ 
+ //nolint:cyclop
+diff --git a/pkg/appolly/services/criteria.go b/pkg/appolly/services/criteria.go
+index b4445029edbc4d309d1161af3d9b8461323858da..bdf0b1285879c234ae778306f8a9b99e424f8815 100644
+--- a/pkg/appolly/services/criteria.go
++++ b/pkg/appolly/services/criteria.go
+@@ -141,6 +141,13 @@ type DiscoveryConfig struct {
+ 	// Executable path prefixes for which preliminary language detection is
+ 	// skipped. Processes can still be selected using non-language criteria.
+ 	ExcludedLinuxSystemPaths []string `yaml:"excluded_linux_system_paths"`
++
++	// ServiceNameFromCmdline derives the automatic service name of a process
++	// without OTEL_SERVICE_NAME / service.name from its project metadata or
++	// command line (package.json, pyproject.toml, script, WSGI/ASGI target, JAR,
++	// main class, .NET assembly) instead of the executable name (python3, node,
++	// java, ...). Kubernetes metadata still overrides it. Default false.
++	ServiceNameFromCmdline bool `yaml:"service_name_from_cmdline" env:"OTEL_EBPF_SERVICE_NAME_FROM_CMDLINE"`
+ }
+ 
+ type RouteHarvestingConfig struct {
+diff --git a/pkg/internal/jvmtools/service_metadata.go b/pkg/internal/jvmtools/service_metadata.go
+index 2875a98ccc4ac2b58a4fbe155bd00951d1c0c775..f8969bfcefc5a4c203b9eaf29816aaa9c5d102f2 100644
+--- a/pkg/internal/jvmtools/service_metadata.go
++++ b/pkg/internal/jvmtools/service_metadata.go
+@@ -53,9 +53,23 @@ var springResourceNames = []string{
+ 	"bootstrap.yaml",
+ }
+ 
++// Options tune ResolveServiceMetadataWithOptions.
++type Options struct {
++	// NameFromCmdline (discovery.service_name_from_cmdline) adds, after the
++	// Spring and manifest names: the launch JAR name without its version, the
++	// Spring Boot Start-Class behind a Boot launcher, and the main class's
++	// simple name. Generic results (Main, Application, app, ...) are dropped.
++	NameFromCmdline bool
++}
++
+ // ResolveServiceMetadata derives missing Java service metadata from Spring configuration,
+ // the application manifest, and the launch JAR name.
+ func ResolveServiceMetadata(fileInfo *exec.FileInfo) error {
++	return ResolveServiceMetadataWithOptions(fileInfo, Options{})
++}
++
++// ResolveServiceMetadataWithOptions is ResolveServiceMetadata with options.
++func ResolveServiceMetadataWithOptions(fileInfo *exec.FileInfo, opts Options) error {
+ 	if fileInfo == nil {
+ 		return errors.New("java service metadata requires process file info")
+ 	}
+@@ -114,6 +128,9 @@ func ResolveServiceMetadata(fileInfo *exec.FileInfo) error {
+ 	if resolveName && name == "" {
+ 		name = manifest.Name
+ 	}
++	if resolveName && name == "" && opts.NameFromCmdline {
++		name = cmdlineServiceName(args, launch, mainJarPath, roots)
++	}
+ 	if resolveName && name == "" {
+ 		name = serviceNameFromJar(launch.Jar)
+ 	}
+@@ -297,6 +314,15 @@ func readZipEntry(file *zip.File) ([]byte, bool) {
+ }
+ 
+ func parseManifest(data []byte) ServiceMetadata {
++	values := parseManifestAttributes(data)
++	return ServiceMetadata{
++		Name:    values["Implementation-Title"],
++		Version: values["Implementation-Version"],
++	}
++}
++
++// parseManifestAttributes returns the main-section attributes of a MANIFEST.MF.
++func parseManifestAttributes(data []byte) map[string]string {
+ 	values := map[string]string{}
+ 	scanner := bufio.NewScanner(bytes.NewReader(data))
+ 	scanner.Buffer(make([]byte, 1024), int(maxServiceResourceBytes))
+@@ -318,10 +344,7 @@ func parseManifest(data []byte) ServiceMetadata {
+ 		key = line[:separator]
+ 		values[key] = strings.TrimPrefix(line[separator+1:], " ")
+ 	}
+-	return ServiceMetadata{
+-		Name:    values["Implementation-Title"],
+-		Version: values["Implementation-Version"],
+-	}
++	return values
+ }
+ 
+ func propertyValue(data []byte, wanted string) string {
+diff --git a/pkg/internal/jvmtools/service_name_cmdline.go b/pkg/internal/jvmtools/service_name_cmdline.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..3b4516705ee778024f5bbfe10733eb3bd27d349b
+--- /dev/null
++++ b/pkg/internal/jvmtools/service_name_cmdline.go
+@@ -0,0 +1,147 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package jvmtools // import "go.opentelemetry.io/obi/pkg/internal/jvmtools"
++
++import (
++	"path/filepath"
++	"strings"
++
++	"go.opentelemetry.io/obi/pkg/internal/procname"
++)
++
++// cmdlineServiceName is the Options.NameFromCmdline step of
++// ResolveServiceMetadataWithOptions. It returns "" when nothing better than the
++// upstream fallback was found.
++//
++//   - java -jar order-service-1.4.2.jar             -> order-service
++//   - java -jar app.jar (Boot launcher Main-Class)  -> simple name of Start-Class
++//   - java -cp /app org.springframework.boot.loader.launch.JarLauncher
++//     (exploded /app/META-INF/MANIFEST.MF)          -> Implementation-Title, else Start-Class
++//   - java [options] com.acme.ProcessService        -> ProcessService
++//   - java -m orders/com.acme.Main                  -> "" (Main is generic)
++func cmdlineServiceName(args []string, launch JavaLaunch, mainJarPath string, roots []ScanRoot) string {
++	if launch.Jar != "" {
++		if name := procname.Clean(serviceNameFromJar(launch.Jar)); name != "" {
++			return name
++		}
++		if mainJarPath == "" {
++			return ""
++		}
++		attrs := archiveManifest(mainJarPath)
++		if isSpringBootLauncher(attrs["Main-Class"]) {
++			return procname.Clean(simpleClassName(attrs["Start-Class"]))
++		}
++		return ""
++	}
++
++	mainClass := javaMainClass(args)
++	if mainClass == "" {
++		return ""
++	}
++	if !isSpringBootLauncher(mainClass) {
++		return procname.Clean(simpleClassName(mainClass))
++	}
++	for _, root := range roots {
++		var attrs map[string]string
++		if root.Directory {
++			data, ok := readRegularFile(filepath.Join(root.Path, "META-INF", "MANIFEST.MF"))
++			if !ok {
++				continue
++			}
++			attrs = parseManifestAttributes(data)
++		} else {
++			attrs = archiveManifest(root.Path)
++		}
++		if name := procname.Clean(attrs["Implementation-Title"]); name != "" {
++			return name
++		}
++		if startClass := attrs["Start-Class"]; startClass != "" {
++			return procname.Clean(simpleClassName(startClass))
++		}
++	}
++	return ""
++}
++
++func archiveManifest(path string) map[string]string {
++	reader, ok := openArchive(path)
++	if !ok {
++		return nil
++	}
++	defer reader.Close()
++	for _, file := range reader.File {
++		if filepath.ToSlash(file.Name) == "META-INF/MANIFEST.MF" {
++			if data, ok := readZipEntry(file); ok {
++				return parseManifestAttributes(data)
++			}
++			return nil
++		}
++	}
++	return nil
++}
++
++// javaOptionsWithValue are the java launcher options whose value is the next
++// argument.
++var javaOptionsWithValue = map[string]bool{
++	"-cp": true, "-classpath": true, "--class-path": true,
++	"-p": true, "--module-path": true, "--upgrade-module-path": true,
++	"--add-opens": true, "--add-exports": true, "--add-reads": true,
++	"--add-modules": true, "--limit-modules": true, "--patch-module": true,
++	"--enable-native-access": true, "--source": true,
++}
++
++// javaMainClass returns the main class of a "java [options] MainClass [args]"
++// or "java [options] -m module[/MainClass]" launch, or "" for -jar launches.
++func javaMainClass(args []string) string {
++	for i := 0; i < len(args); i++ {
++		arg := args[i]
++		switch {
++		case arg == "-jar":
++			return ""
++		case arg == "-m" || arg == "--module":
++			if i+1 < len(args) {
++				return moduleMainClass(args[i+1])
++			}
++			return ""
++		case strings.HasPrefix(arg, "--module="):
++			return moduleMainClass(strings.TrimPrefix(arg, "--module="))
++		case javaOptionsWithValue[arg]:
++			i++
++		case strings.HasPrefix(arg, "-") || strings.HasPrefix(arg, "@"):
++			// -D..., -X..., -XX:..., -javaagent:..., --opt=value, @argfile
++		default:
++			return arg
++		}
++	}
++	return ""
++}
++
++// moduleMainClass: "orders/com.acme.Main" -> com.acme.Main; "com.acme.orders" -> com.acme.orders.
++func moduleMainClass(module string) string {
++	if _, mainClass, ok := strings.Cut(module, "/"); ok {
++		return mainClass
++	}
++	return module
++}
++
++// simpleClassName: com.acme.OrdersApplication -> OrdersApplication; Orders.java -> Orders.
++func simpleClassName(class string) string {
++	if strings.HasSuffix(class, ".java") {
++		class = strings.TrimSuffix(filepath.Base(class), ".java")
++	}
++	if dot := strings.LastIndexByte(class, '.'); dot >= 0 {
++		class = class[dot+1:]
++	}
++	return class
++}
++
++func isSpringBootLauncher(class string) bool {
++	if !strings.HasPrefix(class, "org.springframework.boot.loader.") {
++		return false
++	}
++	switch simpleClassName(class) {
++	case "JarLauncher", "WarLauncher", "PropertiesLauncher":
++		return true
++	}
++	return false
++}
+diff --git a/pkg/internal/jvmtools/service_name_cmdline_test.go b/pkg/internal/jvmtools/service_name_cmdline_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..5d20fc7ab84474a49d9db093366a66babcf23685
+--- /dev/null
++++ b/pkg/internal/jvmtools/service_name_cmdline_test.go
+@@ -0,0 +1,86 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package jvmtools
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
++)
++
++func TestResolveServiceNameFromCmdline(t *testing.T) {
++	tests := []struct {
++		name  string
++		cmd   string            // java arguments (after the executable)
++		files map[string]string // files under the process root (cwd is /app)
++		jars  map[string]map[string]string
++		env   map[string]string
++		want  string // "" = no name set, the "java" fallback applies
++	}{
++		{name: "-cp /app Main is generic", cmd: "-XX:+UseSerialGC -cp /app Main", want: ""},
++		{name: "plain main class", cmd: "ProcessService", want: "ProcessService"},
++		{name: "main class options skipped", cmd: "-Xmx512m -Dfoo=bar -javaagent:/otel.jar --add-opens java.base/java.lang=ALL-UNNAMED -cp /app:/lib/* com.acme.billing.BillingWorker --port 8080", want: "BillingWorker"},
++		{name: "module main class", cmd: "-p /mods -m orders/com.acme.orders.OrdersMain", want: "OrdersMain"},
++		{name: "module with generic main class", cmd: "--module-path /mods -m orders/com.acme.Main", want: ""},
++		{name: "jar version stripped", cmd: "-jar /app/order-service-1.4.2.jar", want: "order-service"},
++		{name: "jar SNAPSHOT version stripped", cmd: "-jar /app/order-service-1.4.2-SNAPSHOT.jar", want: "order-service"},
++		{
++			name:  "exploded Spring Boot JarLauncher reads Start-Class",
++			cmd:   "-cp /app org.springframework.boot.loader.launch.JarLauncher",
++			files: map[string]string{"app/META-INF/MANIFEST.MF": "Manifest-Version: 1.0\r\nMain-Class: org.springframework.boot.loader.launch.JarLauncher\r\nStart-Class: com.acme.OrdersApplication\r\n\r\n"},
++			want:  "OrdersApplication",
++		},
++		{
++			name: "app.jar with Boot launcher reads Start-Class",
++			cmd:  "-jar /app/app.jar",
++			jars: map[string]map[string]string{"app/app.jar": {"META-INF/MANIFEST.MF": "Main-Class: org.springframework.boot.loader.JarLauncher\r\nStart-Class: com.acme.inventory.InventoryApplication\r\n\r\n"}},
++			want: "InventoryApplication",
++		},
++		{
++			name: "generic app.jar without launcher keeps the upstream jar name",
++			cmd:  "-jar /app/app.jar",
++			jars: map[string]map[string]string{"app/app.jar": {"META-INF/MANIFEST.MF": "Main-Class: com.acme.Main\r\n\r\n"}},
++			want: "app",
++		},
++		{name: "spring.application.name still wins", cmd: "-Dspring.application.name=payments -jar /app/order-service-1.4.2.jar", want: "payments"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			root := t.TempDir()
++			for p, content := range tt.files {
++				require.NoError(t, os.MkdirAll(filepath.Join(root, filepath.Dir(p)), 0o755))
++				require.NoError(t, os.WriteFile(filepath.Join(root, p), []byte(content), 0o644))
++			}
++			for p, entries := range tt.jars {
++				writeArchive(t, filepath.Join(root, p), entries)
++			}
++			fi := mockJavaProcess(t, root, strings.Fields(tt.cmd), tt.env)
++			require.NoError(t, ResolveServiceMetadataWithOptions(fi, Options{NameFromCmdline: true}))
++			assert.Equal(t, tt.want, fi.ServiceAttrs().UID.Name)
++		})
++	}
++}
++
++func TestResolveServiceNameFromCmdlineDisabledKeepsUpstream(t *testing.T) {
++	fi := mockJavaProcess(t, t.TempDir(), []string{"-jar", "/app/order-service-1.4.2.jar"}, nil)
++	require.NoError(t, ResolveServiceMetadata(fi))
++	assert.Equal(t, "order-service-1.4.2", fi.ServiceAttrs().UID.Name)
++
++	fi = mockJavaProcess(t, t.TempDir(), []string{"ProcessService"}, nil)
++	require.NoError(t, ResolveServiceMetadata(fi))
++	assert.Empty(t, fi.ServiceAttrs().UID.Name)
++}
++
++func TestResolveServiceNameFromCmdlineKeepsEnvName(t *testing.T) {
++	fi := mockJavaProcess(t, t.TempDir(), []string{"-jar", "/app/order-service-1.4.2.jar"}, nil)
++	fi.SetUID(svc.UID{Name: "from-env"})
++	require.NoError(t, ResolveServiceMetadataWithOptions(fi, Options{NameFromCmdline: true}))
++	assert.Equal(t, "from-env", fi.ServiceAttrs().UID.Name)
++}
+diff --git a/pkg/internal/procname/procname.go b/pkg/internal/procname/procname.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..74589983d093388ef66ca97cca4af95cce01f7c5
+--- /dev/null
++++ b/pkg/internal/procname/procname.go
+@@ -0,0 +1,409 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++// Package procname derives a service name for an interpreted process
++// (Python, Node.js, .NET, Ruby, PHP) from its project metadata or its command
++// line, for processes that set neither OTEL_SERVICE_NAME nor service.name in
++// OTEL_RESOURCE_ATTRIBUTES. Without it, every such process is named after its
++// interpreter (python3, node, dotnet, ...).
++//
++// Enabled by discovery.service_name_from_cmdline. The name is stored as an
++// automatic name, so Kubernetes metadata still overrides it. Java has its own
++// resolver in pkg/internal/jvmtools, which uses Clean from this package.
++package procname // import "go.opentelemetry.io/obi/pkg/internal/procname"
++
++import (
++	"encoding/json"
++	"path"
++	"regexp"
++	"strings"
++)
++
++// MaxLen caps a derived name (a DNS label is at most 63 characters).
++const MaxLen = 63
++
++// maxFileBytes bounds the project files read from a process (package.json,
++// pyproject.toml).
++const maxFileBytes = 1 << 20
++
++// genericNames carry no service identity; a derived name equal to one of them
++// (case-insensitive) is discarded so the executable-name fallback is kept.
++var genericNames = map[string]struct{}{}
++
++func init() {
++	for _, n := range []string{
++		"main", "app", "index", "server", "run", "start", "wsgi", "asgi", "manage",
++		"application", "dist", "src", "bin", "lib", "build",
++	} {
++		genericNames[n] = struct{}{}
++	}
++}
++
++// GenericNames returns the names that are never used as a derived name.
++func GenericNames() []string {
++	out := make([]string, 0, len(genericNames))
++	for n := range genericNames {
++		out = append(out, n)
++	}
++	return out
++}
++
++// IsGeneric reports whether name carries no service identity.
++func IsGeneric(name string) bool {
++	_, ok := genericNames[strings.ToLower(name)]
++	return ok
++}
++
++var versionSuffix = regexp.MustCompile(`-\d+(\.\d+)*(-SNAPSHOT)?$`)
++
++// Clean turns a raw candidate into a service name: characters outside
++// [A-Za-z0-9._-] become '-', a trailing version (-1.4.2, -1.4.2-SNAPSHOT) is
++// removed, leading and trailing separators are trimmed and the result is capped
++// at MaxLen. It returns "" when nothing meaningful is left (empty or generic).
++func Clean(name string) string {
++	b := []byte(name)
++	for i, c := range b {
++		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-') {
++			b[i] = '-'
++		}
++	}
++	name = versionSuffix.ReplaceAllString(string(b), "")
++	name = strings.Trim(name, "-._")
++	if len(name) > MaxLen {
++		name = strings.TrimRight(name[:MaxLen], "-._")
++	}
++	if name == "" || IsGeneric(name) {
++		return ""
++	}
++	return name
++}
++
++// Process is the input of Derive. Paths are as seen by the process (its mount
++// namespace); ReadFile resolves them inside the process root.
++type Process struct {
++	// Exe is the basename of the executable (/proc/<pid>/exe), e.g. python3.12.
++	Exe string
++	// Argv is the full command line, Argv[0] included.
++	Argv []string
++	// Cwd is the working directory of the process.
++	Cwd string
++	// ReadFile reads an absolute path inside the process root. May be nil.
++	ReadFile func(path string) ([]byte, error)
++}
++
++var (
++	pythonExe = regexp.MustCompile(`^python(\d+(\.\d+)?)?[a-z]?$`)
++	nodeExe   = regexp.MustCompile(`^(node|nodejs)$`)
++	rubyExe   = regexp.MustCompile(`^ruby(\d+(\.\d+)*)?$`)
++	phpExe    = regexp.MustCompile(`^php(\d+(\.\d+)*)?$`)
++)
++
++// Derive returns a service name for p, or "" when the executable is not a
++// known interpreter or nothing better than the executable name was found.
++// Project metadata wins over the command line.
++func Derive(p Process) string {
++	argv := p.Argv
++	// setproctitle (gunicorn: "gunicorn: worker [server:app]") rewrites the
++	// command line as one space-separated string.
++	if len(argv) == 1 && strings.ContainsRune(argv[0], ' ') {
++		argv = strings.Fields(argv[0])
++	}
++	if len(argv) == 0 {
++		return ""
++	}
++	args := argv[1:]
++	switch {
++	case pythonExe.MatchString(p.Exe):
++		if n := pyprojectName(p); n != "" {
++			return n
++		}
++		if w := pythonWrapper(path.Base(strings.TrimSuffix(argv[0], ":"))); w != "" {
++			return fromPythonWrapper(w, args)
++		}
++		return fromPython(args)
++	case nodeExe.MatchString(p.Exe):
++		return fromNode(p, args)
++	case p.Exe == "dotnet":
++		return fromDotnet(args)
++	case rubyExe.MatchString(p.Exe):
++		return Clean(trimExt(path.Base(firstScript(args, rubyValueOpts, rubyStopOpts)), ".rb"))
++	case phpExe.MatchString(p.Exe):
++		return Clean(trimExt(path.Base(firstScript(args, phpValueOpts, phpStopOpts)), ".php"))
++	}
++	return ""
++}
++
++func trimExt(name string, exts ...string) string {
++	for _, e := range exts {
++		if strings.HasSuffix(name, e) {
++			return strings.TrimSuffix(name, e)
++		}
++	}
++	return name
++}
++
++// firstScript returns the first non-option argument, skipping the values of
++// the options in valueOpts; it returns "" at any option in stopOpts (inline
++// code, interactive mode, ...).
++func firstScript(args []string, valueOpts, stopOpts map[string]bool) string {
++	for i := 0; i < len(args); i++ {
++		a := args[i]
++		switch {
++		case stopOpts[a]:
++			return ""
++		case a == "--":
++			if i+1 < len(args) {
++				return args[i+1]
++			}
++			return ""
++		case valueOpts[a]:
++			i++
++		case a == "-":
++			return ""
++		case strings.HasPrefix(a, "-"):
++		default:
++			return a
++		}
++	}
++	return ""
++}
++
++func set(s ...string) map[string]bool {
++	m := make(map[string]bool, len(s))
++	for _, v := range s {
++		m[v] = true
++	}
++	return m
++}
++
++// ---------- Python ----------
++
++var (
++	pyValueOpts = set("-X", "-W", "--check-hash-based-pycs")
++	pyStopOpts  = set("-c", "-i")
++	// wrappers that serve a WSGI/ASGI (or Celery) application given as a target.
++	pyWrappers = set("gunicorn", "uvicorn", "hypercorn", "waitress", "waitress-serve", "celery", "daphne")
++	// module:attr, e.g. orders.main:app or app:create_app()
++	appTarget = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_.]*):[A-Za-z_][A-Za-z0-9_.]*(\(.*\))?$`)
++)
++
++func pythonWrapper(name string) string {
++	if pyWrappers[name] {
++		return name
++	}
++	return ""
++}
++
++func fromPython(args []string) string {
++	for i := 0; i < len(args); i++ {
++		a := args[i]
++		switch {
++		case pyStopOpts[a] || a == "-":
++			return ""
++		case a == "-m" || (strings.HasPrefix(a, "-m") && len(a) > 2 && !strings.HasPrefix(a, "--")):
++			mod := strings.TrimPrefix(a, "-m")
++			rest := args[i+1:]
++			if mod == "" {
++				if len(rest) == 0 {
++					return ""
++				}
++				mod, rest = rest[0], rest[1:]
++			}
++			if w := pythonWrapper(strings.SplitN(mod, ".", 2)[0]); w != "" {
++				return fromPythonWrapper(w, rest)
++			}
++			return dotted(mod)
++		case pyValueOpts[a]:
++			i++
++		case strings.HasPrefix(a, "-"):
++		default:
++			base := trimExt(path.Base(a), ".py", ".pyw", ".pyc", ".pyz")
++			if w := pythonWrapper(base); w != "" {
++				return fromPythonWrapper(w, args[i+1:])
++			}
++			return Clean(base)
++		}
++	}
++	return ""
++}
++
++// dotted returns the last non-generic component of a dotted module path:
++// orders.main -> orders, billing.worker -> worker.
++func dotted(mod string) string {
++	parts := strings.Split(mod, ".")
++	for i := len(parts) - 1; i >= 0; i-- {
++		if n := Clean(parts[i]); n != "" {
++			return n
++		}
++	}
++	return ""
++}
++
++func fromPythonWrapper(wrapper string, args []string) string {
++	if wrapper == "celery" {
++		for i := 0; i < len(args); i++ {
++			a := args[i]
++			switch {
++			case (a == "-A" || a == "--app") && i+1 < len(args):
++				return dotted(strings.SplitN(args[i+1], ":", 2)[0])
++			case strings.HasPrefix(a, "--app="):
++				return dotted(strings.SplitN(strings.TrimPrefix(a, "--app="), ":", 2)[0])
++			case strings.HasPrefix(a, "-A") && len(a) > 2:
++				return dotted(strings.SplitN(a[2:], ":", 2)[0])
++			}
++		}
++		return ""
++	}
++	// The application target is the last module:attr argument; option values
++	// such as -b :8000 or -b 0.0.0.0:8000 do not match the pattern.
++	for i := len(args) - 1; i >= 0; i-- {
++		a := strings.Trim(args[i], "[]")
++		if m := appTarget.FindStringSubmatch(a); m != nil {
++			return dotted(m[1])
++		}
++	}
++	return ""
++}
++
++// pyprojectName reads [project].name (or [tool.poetry].name) from
++// pyproject.toml in the working directory.
++func pyprojectName(p Process) string {
++	if p.ReadFile == nil || p.Cwd == "" {
++		return ""
++	}
++	data, err := p.ReadFile(path.Join(p.Cwd, "pyproject.toml"))
++	if err != nil || len(data) > maxFileBytes {
++		return ""
++	}
++	inTable := false
++	for _, line := range strings.Split(string(data), "\n") {
++		line = strings.TrimSpace(line)
++		if strings.HasPrefix(line, "[") {
++			t := strings.TrimSpace(strings.Trim(line, "[]"))
++			inTable = t == "project" || t == "tool.poetry"
++			continue
++		}
++		if !inTable {
++			continue
++		}
++		k, v, ok := strings.Cut(line, "=")
++		if !ok || strings.TrimSpace(k) != "name" {
++			continue
++		}
++		v = strings.TrimSpace(v)
++		if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') {
++			if end := strings.IndexByte(v[1:], v[0]); end >= 0 {
++				return Clean(v[1 : end+1])
++			}
++		}
++		return ""
++	}
++	return ""
++}
++
++// ---------- Node.js ----------
++
++var (
++	nodeValueOpts = set("-r", "--require", "--import", "--loader", "--experimental-loader",
++		"--env-file", "--title", "--input-type", "--conditions", "-C", "--watch-path",
++		"--inspect-port", "--debug-port", "--max-http-header-size", "--stack-size",
++		"--max-old-space-size", "--openssl-config", "--icu-data-dir", "--disable-warning")
++	nodeStopOpts = set("-e", "--eval", "-p", "--print", "-i", "--interactive", "-c", "--check",
++		"--test", "-v", "--version", "-h", "--help")
++)
++
++func fromNode(p Process, args []string) string {
++	script := firstScript(args, nodeValueOpts, nodeStopOpts)
++	if script == "" {
++		return ""
++	}
++	if n := packageJSONName(p, script); n != "" {
++		return n
++	}
++	if strings.Contains(script, "node_modules/") {
++		// a tool started from node_modules (npm, next, ts-node, ...): its file
++		// name is not the service; only the project's package.json is.
++		return ""
++	}
++	return Clean(trimExt(path.Base(script), ".js", ".mjs", ".cjs", ".ts"))
++}
++
++// packageJSONName returns the npm package name (scope removed) of the nearest
++// package.json, searched from the script's directory up to the working
++// directory. For a script under node_modules only the working directory is
++// searched, so npm's own package.json is never used.
++func packageJSONName(p Process, script string) string {
++	if p.ReadFile == nil {
++		return ""
++	}
++	abs := script
++	if !path.IsAbs(abs) {
++		if p.Cwd == "" {
++			return ""
++		}
++		abs = path.Join(p.Cwd, abs)
++	}
++	var dirs []string
++	if strings.Contains(abs, "/node_modules/") {
++		if p.Cwd != "" {
++			dirs = []string{p.Cwd}
++		}
++	} else {
++		dir := path.Dir(abs)
++		if script == "." || strings.HasSuffix(script, "/") {
++			dir = abs // node <dir>: the directory itself is the package
++		}
++		for i := 0; i < 6 && dir != "/" && dir != "."; i++ {
++			dirs = append(dirs, dir)
++			if dir == p.Cwd {
++				break
++			}
++			dir = path.Dir(dir)
++		}
++	}
++	for _, d := range dirs {
++		data, err := p.ReadFile(path.Join(d, "package.json"))
++		if err != nil || len(data) > maxFileBytes {
++			continue
++		}
++		var pkg struct {
++			Name string `json:"name"`
++		}
++		if json.Unmarshal(data, &pkg) != nil || pkg.Name == "" {
++			continue
++		}
++		name := pkg.Name
++		if strings.HasPrefix(name, "@") {
++			if _, after, ok := strings.Cut(name, "/"); ok {
++				name = after
++			}
++		}
++		return Clean(name)
++	}
++	return ""
++}
++
++// ---------- .NET, Ruby, PHP ----------
++
++var (
++	dotnetValueOpts = set("--runtimeconfig", "--depsfile", "--additionalprobingpath",
++		"--additional-deps", "--fx-version", "--roll-forward")
++	rubyValueOpts = set("-I", "-r", "-C", "-E", "--encoding", "-x")
++	rubyStopOpts  = set("-e", "-v", "--version", "-h", "--help")
++	phpValueOpts  = set("-c", "-d", "-t", "-z")
++	phpStopOpts   = set("-r", "-S", "-a", "-i", "-v", "-h", "-m")
++)
++
++// fromDotnet handles "dotnet [exec] [host options] X.dll": the assembly name.
++func fromDotnet(args []string) string {
++	for i := 0; i < len(args); i++ {
++		a := args[i]
++		switch {
++		case dotnetValueOpts[a]:
++			i++
++		case strings.HasSuffix(strings.ToLower(a), ".dll"):
++			return Clean(a[strings.LastIndexByte(a, '/')+1 : len(a)-len(".dll")])
++		}
++	}
++	return ""
++}
+diff --git a/pkg/internal/procname/procname_test.go b/pkg/internal/procname/procname_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..d484afe9b6391ff32a2c74aba6c4a3ab445ee430
+--- /dev/null
++++ b/pkg/internal/procname/procname_test.go
+@@ -0,0 +1,161 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package procname
++
++import (
++	"errors"
++	"os"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++
++	"go.opentelemetry.io/obi/pkg/appolly/app"
++	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
++	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
++)
++
++// fakeFS maps absolute in-process paths to file contents.
++type fakeFS map[string]string
++
++func (f fakeFS) read(p string) ([]byte, error) {
++	if s, ok := f[p]; ok {
++		return []byte(s), nil
++	}
++	return nil, os.ErrNotExist
++}
++
++// effectiveName is what OBI ends up with: the derived name, else the
++// executable-name fallback of exec.FileInfo.ApplyServiceDefaults.
++func effectiveName(p Process) string {
++	if n := Derive(p); n != "" {
++		return n
++	}
++	return p.Exe
++}
++
++func TestDerive(t *testing.T) {
++	tests := []struct {
++		name string
++		exe  string
++		cmd  string // space-separated argv
++		cwd  string
++		fs   fakeFS
++		want string
++	}{
++		// Python
++		{"gunicorn server:app is generic", "python3.12", "python3.12 /usr/local/bin/gunicorn -w 2 -b :8000 server:app", "/srv", nil, "python3.12"},
++		{"uvicorn orders.main:app -> first non-generic module component", "python3", "python -m uvicorn orders.main:app", "/srv", nil, "orders"},
++		{"manage.py runserver is generic", "python3", "python manage.py runserver", "/srv", nil, "python3"},
++		{"plain script", "python3", "python /srv/billing_worker.py", "/", nil, "billing_worker"},
++		{"-m module", "python3", "python3 -u -m billing.worker", "/", nil, "worker"},
++		{"-m module with generic last component", "python3", "python3 -m billing.__main__", "/", nil, "billing"},
++		{"gunicorn bind with host:port is not the target", "python3", "python3 /usr/local/bin/gunicorn -b 0.0.0.0:8000 payments.wsgi:application", "/", nil, "payments"},
++		{"gunicorn setproctitle", "python3.12", "gunicorn: worker [inventory:app]", "/", nil, "inventory"},
++		{"celery -A", "python3", "python3 /usr/local/bin/celery -A tasks.celery_app worker", "/", nil, "celery_app"},
++		{"daphne asgi", "python3", "python3 /usr/local/bin/daphne -b 0.0.0.0 shop.asgi:application", "/", nil, "shop"},
++		{"python -c stays fallback", "python3", "python3 -c print(1)", "/", nil, "python3"},
++		{"pyproject wins over script", "python3", "python3 main.py", "/srv/app", fakeFS{"/srv/app/pyproject.toml": "[build-system]\nname = \"x\"\n[project]\nname = \"ledger-api\"\nversion = \"1.0\"\n"}, "ledger-api"},
++		{"script version stripped", "python3", "python3 /srv/report-gen-2.1.py", "/", nil, "report-gen"},
++
++		// Node.js
++		{"node server.js is generic", "node", "node server.js", "/srv", nil, "node"},
++		{"package.json name with npm scope", "node", "node dist/index.js", "/srv/orders", fakeFS{"/srv/orders/package.json": `{"name":"@acme/orders-api","version":"1.0.0"}`}, "orders-api"},
++		{"package.json next to the script", "node", "node /opt/svc/lib/main.js", "/", fakeFS{"/opt/svc/lib/package.json": `{"name":"svc-worker"}`}, "svc-worker"},
++		{"node options skipped", "node", "node --require ./otel.js -r dotenv/config --inspect=0.0.0.0:9229 checkout.mjs", "/srv", nil, "checkout"},
++		{"npm start uses cwd package.json", "node", "node /usr/local/lib/node_modules/npm/bin/npm-cli.js start", "/srv/cart", fakeFS{"/srv/cart/package.json": `{"name":"cart"}`, "/usr/local/lib/node_modules/npm/package.json": `{"name":"npm"}`}, "cart"},
++		{"tool under node_modules without package.json", "node", "node node_modules/.bin/next start", "/srv", nil, "node"},
++		{"node -e stays fallback", "node", "node -e 1", "/", nil, "node"},
++
++		// .NET, Ruby, PHP
++		{"dotnet assembly", "dotnet", "dotnet Orders.Api.dll", "/app", nil, "Orders.Api"},
++		{"dotnet exec with host option", "dotnet", "dotnet exec --runtimeconfig x.json /app/Billing.dll", "/app", nil, "Billing"},
++		{"ruby script", "ruby", "ruby -I lib /srv/notifier.rb", "/", nil, "notifier"},
++		{"php script", "php8.2", "php -d memory_limit=1G worker.php", "/", nil, "worker"},
++
++		// Native and unknown executables keep the executable name.
++		{"native binary", "ping-app", "/ping-app", "/", nil, "ping-app"},
++		{"native binary with args", "envoy", "envoy -c /etc/envoy.yaml", "/", nil, "envoy"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			p := Process{Exe: tt.exe, Argv: strings.Fields(tt.cmd), Cwd: tt.cwd}
++			if strings.HasPrefix(tt.cmd, "gunicorn: ") {
++				p.Argv = []string{tt.cmd} // setproctitle: one NUL-free string
++			}
++			if tt.fs != nil {
++				p.ReadFile = tt.fs.read
++			}
++			assert.Equal(t, tt.want, effectiveName(p), "cmdline %q", tt.cmd)
++		})
++	}
++}
++
++func TestClean(t *testing.T) {
++	for in, want := range map[string]string{
++		"order-service-1.4.2":          "order-service",
++		"order-service-1.4.2-SNAPSHOT": "order-service",
++		"orders api":                   "orders-api",
++		"Main":                         "",
++		"APPLICATION":                  "",
++		"__main__":                     "",
++		"":                             "",
++		"1.2.3":                        "1.2.3",
++		strings.Repeat("a", 70):        strings.Repeat("a", MaxLen),
++	} {
++		assert.Equal(t, want, Clean(in), "Clean(%q)", in)
++	}
++}
++
++func mockProc(t *testing.T, argv []string, cwd string, fs fakeFS) {
++	t.Helper()
++	oldCmd, oldCwd, oldRoot, oldRead := cmdlineForPID, cwdForPID, rootDirForPID, readFileInRoot
++	cmdlineForPID = func(app.PID) (string, []string, error) {
++		if len(argv) == 0 {
++			return "", nil, errors.New("gone")
++		}
++		return argv[0], argv[1:], nil
++	}
++	cwdForPID = func(app.PID) (string, error) { return cwd, nil }
++	rootDirForPID = func(app.PID) string { return "/proc/1/root" }
++	readFileInRoot = func(_, p string) ([]byte, error) { return fs.read(p) }
++	t.Cleanup(func() { cmdlineForPID, cwdForPID, rootDirForPID, readFileInRoot = oldCmd, oldCwd, oldRoot, oldRead })
++}
++
++func TestResolve(t *testing.T) {
++	mockProc(t, []string{"node", "index.js"}, "/srv/backend", fakeFS{"/srv/backend/package.json": `{"name":"orders-backend"}`})
++
++	fi := exec.New(exec.Init{Pid: 42, CmdExePath: "/usr/bin/node"})
++	assert.Equal(t, "orders-backend", Resolve(fi))
++	attrs := fi.ServiceAttrs()
++	assert.Equal(t, "orders-backend", attrs.UID.Name)
++	assert.True(t, attrs.AutoName(), "derived name must stay overridable by Kubernetes metadata")
++}
++
++func TestResolveKeepsEnvName(t *testing.T) {
++	mockProc(t, []string{"node", "index.js"}, "/srv/backend", fakeFS{"/srv/backend/package.json": `{"name":"orders-backend"}`})
++
++	fi := exec.New(exec.Init{Pid: 42, CmdExePath: "/usr/bin/node"})
++	fi.ApplyEnvVariables(map[string]string{"OTEL_SERVICE_NAME": "checkout"})
++	assert.Empty(t, Resolve(fi))
++	assert.Equal(t, "checkout", fi.ServiceAttrs().UID.Name)
++
++	fi = exec.New(exec.Init{Pid: 43, CmdExePath: "/usr/bin/node"})
++	fi.ApplyEnvVariables(map[string]string{"OTEL_RESOURCE_ATTRIBUTES": "service.name=cart,deployment.environment=prod"})
++	assert.Empty(t, Resolve(fi))
++	assert.Equal(t, "cart", fi.ServiceAttrs().UID.Name)
++
++	// a name from the discovery criteria is kept too
++	fi = exec.New(exec.Init{Pid: 44, CmdExePath: "/usr/bin/node", Service: svc.Attrs{UID: svc.UID{Name: "from-criteria"}}})
++	assert.Empty(t, Resolve(fi))
++	assert.Equal(t, "from-criteria", fi.ServiceAttrs().UID.Name)
++}
++
++func TestResolveNativeKeepsFallback(t *testing.T) {
++	mockProc(t, []string{"/ping-app"}, "/", nil)
++	fi := exec.New(exec.Init{Pid: 42, CmdExePath: "/ping-app"})
++	assert.Empty(t, Resolve(fi))
++	fi.ApplyServiceDefaults(svc.InstrumentableGolang)
++	assert.Equal(t, "ping-app", fi.ServiceAttrs().UID.Name)
++}
+diff --git a/pkg/internal/procname/read_linux.go b/pkg/internal/procname/read_linux.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..9de3a2c4e9b93c84b39d49eee132b45f9891de7e
+--- /dev/null
++++ b/pkg/internal/procname/read_linux.go
+@@ -0,0 +1,82 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++//go:build linux
++
++package procname // import "go.opentelemetry.io/obi/pkg/internal/procname"
++
++import (
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"strings"
++
++	"golang.org/x/sys/unix"
++)
++
++// readInRoot reads the absolute path p inside root (/proc/<pid>/root). openat2
++// with RESOLVE_IN_ROOT resolves every symlink relative to root, so a file in a
++// container can never point OBI at a host file. Kernels without openat2 (<5.6)
++// fall back to rejecting any symlink on the path.
++func readInRoot(root, p string) ([]byte, error) {
++	if !strings.HasPrefix(p, "/") {
++		return nil, fmt.Errorf("not an absolute path: %q", p)
++	}
++	dirfd, err := unix.Open(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
++	if err != nil {
++		return nil, err
++	}
++	defer unix.Close(dirfd)
++
++	fd, err := unix.Openat2(dirfd, strings.TrimPrefix(p, "/"), &unix.OpenHow{
++		Flags:   unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW,
++		Resolve: unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_MAGICLINKS,
++	})
++	if errors.Is(err, unix.ENOSYS) {
++		fd, err = openNoSymlinks(dirfd, p)
++	}
++	if err != nil {
++		return nil, err
++	}
++	f := os.NewFile(uintptr(fd), p)
++	defer f.Close()
++	st, err := f.Stat()
++	if err != nil {
++		return nil, err
++	}
++	if !st.Mode().IsRegular() || st.Size() > maxFileBytes {
++		return nil, fmt.Errorf("not a regular file or too large: %q", p)
++	}
++	return io.ReadAll(io.LimitReader(f, maxFileBytes+1))
++}
++
++// openNoSymlinks opens p below dirfd one component at a time with O_NOFOLLOW,
++// so any symlink (or "..") on the path makes it fail.
++func openNoSymlinks(dirfd int, p string) (int, error) {
++	parts := strings.Split(strings.Trim(p, "/"), "/")
++	cur := dirfd
++	for i, part := range parts {
++		if part == "" || part == "." || part == ".." {
++			if cur != dirfd {
++				unix.Close(cur)
++			}
++			return -1, fmt.Errorf("invalid path %q", p)
++		}
++		flags := unix.O_NOFOLLOW | unix.O_CLOEXEC
++		if i < len(parts)-1 {
++			flags |= unix.O_PATH | unix.O_DIRECTORY
++		} else {
++			flags |= unix.O_RDONLY
++		}
++		next, err := unix.Openat(cur, part, flags, 0)
++		if cur != dirfd {
++			unix.Close(cur)
++		}
++		if err != nil {
++			return -1, err
++		}
++		cur = next
++	}
++	return cur, nil
++}
+diff --git a/pkg/internal/procname/read_linux_test.go b/pkg/internal/procname/read_linux_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..8fddc447058cc7ad2f6425b7103c6ae7640db98b
+--- /dev/null
++++ b/pkg/internal/procname/read_linux_test.go
+@@ -0,0 +1,36 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++//go:build linux
++
++package procname
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestReadInRootStaysInRoot(t *testing.T) {
++	root := t.TempDir()
++	outside := filepath.Join(t.TempDir(), "package.json")
++	require.NoError(t, os.WriteFile(outside, []byte(`{"name":"host-file"}`), 0o644))
++	require.NoError(t, os.MkdirAll(filepath.Join(root, "srv"), 0o755))
++	require.NoError(t, os.WriteFile(filepath.Join(root, "srv", "package.json"), []byte(`{"name":"in-root"}`), 0o644))
++	// an absolute symlink inside the root must not reach the host file
++	require.NoError(t, os.Symlink(outside, filepath.Join(root, "escape.json")))
++
++	data, err := readInRoot(root, "/srv/package.json")
++	require.NoError(t, err)
++	assert.JSONEq(t, `{"name":"in-root"}`, string(data))
++
++	data, err = readInRoot(root, "/escape.json")
++	if err == nil {
++		assert.NotContains(t, string(data), "host-file")
++	}
++	_, err = readInRoot(root, "/srv/../../"+filepath.Base(filepath.Dir(outside))+"/package.json")
++	assert.Error(t, err)
++}
+diff --git a/pkg/internal/procname/read_other.go b/pkg/internal/procname/read_other.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..45477e9703aceb184d6621cbd2268c066963c66a
+--- /dev/null
++++ b/pkg/internal/procname/read_other.go
+@@ -0,0 +1,12 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++//go:build !linux
++
++package procname // import "go.opentelemetry.io/obi/pkg/internal/procname"
++
++import "errors"
++
++func readInRoot(_, _ string) ([]byte, error) {
++	return nil, errors.New("not supported on this platform")
++}
+diff --git a/pkg/internal/procname/resolve.go b/pkg/internal/procname/resolve.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..27c9979cf707929d3f8959a9e239502bd08a79e1
+--- /dev/null
++++ b/pkg/internal/procname/resolve.go
+@@ -0,0 +1,45 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package procname // import "go.opentelemetry.io/obi/pkg/internal/procname"
++
++import (
++	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
++	ebpfcommon "go.opentelemetry.io/obi/pkg/ebpf/common"
++)
++
++// replaceable in tests
++var (
++	cmdlineForPID  = ebpfcommon.CMDLineForPID
++	cwdForPID      = ebpfcommon.CWDForPID
++	rootDirForPID  = ebpfcommon.RootDirectoryForPID
++	readFileInRoot = readInRoot
++)
++
++// Resolve sets a derived automatic service name on fi when it has no name yet
++// (no OTEL_SERVICE_NAME / service.name resource attribute, no discovery
++// criteria name, no Java resolver result). It returns the name it set, or "".
++// It must run before the process is instrumented (traceAttacher), so the name
++// is the one the tpinjector propagates in the TCP option.
++func Resolve(fi *exec.FileInfo) string {
++	if fi == nil || fi.ServiceAttrs().UID.Name != "" {
++		return ""
++	}
++	pid := fi.Pid()
++	argv0, args, err := cmdlineForPID(pid)
++	if err != nil {
++		return ""
++	}
++	cwd, _ := cwdForPID(pid)
++	root := rootDirForPID(pid)
++	name := Derive(Process{
++		Exe:      fi.ExecutableName(),
++		Argv:     append([]string{argv0}, args...),
++		Cwd:      cwd,
++		ReadFile: func(p string) ([]byte, error) { return readFileInRoot(root, p) },
++	})
++	if name != "" {
++		fi.SetAutoServiceName(name)
++	}
++	return name
++}

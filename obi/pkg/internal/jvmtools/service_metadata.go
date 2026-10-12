@@ -53,9 +53,23 @@ var springResourceNames = []string{
 	"bootstrap.yaml",
 }
 
+// Options tune ResolveServiceMetadataWithOptions.
+type Options struct {
+	// NameFromCmdline (discovery.service_name_from_cmdline) adds, after the
+	// Spring and manifest names: the launch JAR name without its version, the
+	// Spring Boot Start-Class behind a Boot launcher, and the main class's
+	// simple name. Generic results (Main, Application, app, ...) are dropped.
+	NameFromCmdline bool
+}
+
 // ResolveServiceMetadata derives missing Java service metadata from Spring configuration,
 // the application manifest, and the launch JAR name.
 func ResolveServiceMetadata(fileInfo *exec.FileInfo) error {
+	return ResolveServiceMetadataWithOptions(fileInfo, Options{})
+}
+
+// ResolveServiceMetadataWithOptions is ResolveServiceMetadata with options.
+func ResolveServiceMetadataWithOptions(fileInfo *exec.FileInfo, opts Options) error {
 	if fileInfo == nil {
 		return errors.New("java service metadata requires process file info")
 	}
@@ -113,6 +127,9 @@ func ResolveServiceMetadata(fileInfo *exec.FileInfo) error {
 	}
 	if resolveName && name == "" {
 		name = manifest.Name
+	}
+	if resolveName && name == "" && opts.NameFromCmdline {
+		name = cmdlineServiceName(args, launch, mainJarPath, roots)
 	}
 	if resolveName && name == "" {
 		name = serviceNameFromJar(launch.Jar)
@@ -297,6 +314,15 @@ func readZipEntry(file *zip.File) ([]byte, bool) {
 }
 
 func parseManifest(data []byte) ServiceMetadata {
+	values := parseManifestAttributes(data)
+	return ServiceMetadata{
+		Name:    values["Implementation-Title"],
+		Version: values["Implementation-Version"],
+	}
+}
+
+// parseManifestAttributes returns the main-section attributes of a MANIFEST.MF.
+func parseManifestAttributes(data []byte) map[string]string {
 	values := map[string]string{}
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	scanner.Buffer(make([]byte, 1024), int(maxServiceResourceBytes))
@@ -318,10 +344,7 @@ func parseManifest(data []byte) ServiceMetadata {
 		key = line[:separator]
 		values[key] = strings.TrimPrefix(line[separator+1:], " ")
 	}
-	return ServiceMetadata{
-		Name:    values["Implementation-Title"],
-		Version: values["Implementation-Version"],
-	}
+	return values
 }
 
 func propertyValue(data []byte, wanted string) string {

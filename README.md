@@ -19,6 +19,8 @@ patches/                  git format-patch stack applied in order on top of upst
   03-peer-service-name-red-attrs.patch peer.service.name on client spans and on http.client.request.duration
   04-forwarded-host.patch              server spans: X-Forwarded-Host (else Host) as x-forwarded-host, and without
                                        the port as peer.service.name on HTTP server RED (topology through L7 LBs)
+  05-autoname.patch                    discovery.service_name_from_cmdline: service name from package.json / pyproject /
+                                       JAR / main class / script instead of python3, node, java (opt-in; on in config/)
   99-pin-to-cwagent.patch              go.mod pinned to cwagent's dependency versions + forced code adaptations (ALWAYS LAST)
 obi/                      GENERATED, committed: upstream/ + patches/ as plain code (minus .github/ and
                           internal/test/integration/). Committed together with patches/ so every commit shows

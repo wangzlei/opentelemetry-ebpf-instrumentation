@@ -24,6 +24,7 @@ import (
 	javaagent "go.opentelemetry.io/obi/pkg/internal/java"
 	"go.opentelemetry.io/obi/pkg/internal/jvmtools"
 	"go.opentelemetry.io/obi/pkg/internal/nodejs"
+	"go.opentelemetry.io/obi/pkg/internal/procname"
 	"go.opentelemetry.io/obi/pkg/internal/transform/route/harvest"
 	"go.opentelemetry.io/obi/pkg/obi"
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
@@ -155,11 +156,20 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 	}, nil
 }
 
+// resolveServiceMetadata runs before getTracer -> monitorPIDs -> AllowPID, so a
+// name derived here is the one the tpinjector writes into svc_name_by_pid and
+// propagates in the TCP option.
 func (ta *traceAttacher) resolveServiceMetadata(ie *ebpf.Instrumentable) {
+	fromCmdline := ta.Cfg.Discovery.ServiceNameFromCmdline
 	if ie.Type == svc.InstrumentableJava {
-		err := jvmtools.ResolveServiceMetadata(ie.FileInfo)
+		err := jvmtools.ResolveServiceMetadataWithOptions(ie.FileInfo, jvmtools.Options{NameFromCmdline: fromCmdline})
 		if err != nil {
 			ta.log.Debug("unable to resolve Java service metadata", "pid", ie.FileInfo.Pid(), "error", err)
+		}
+	}
+	if fromCmdline {
+		if name := procname.Resolve(ie.FileInfo); name != "" {
+			ta.log.Debug("service name from command line", "pid", ie.FileInfo.Pid(), "name", name)
 		}
 	}
 }

@@ -53,6 +53,9 @@ type Tracer struct {
 	seenNetns               *expirable.LRU[uint64, struct{}]
 	netnsAttempts           *expirable.LRU[uint64, int]
 	backfillDisabled        bool
+	// svcNamePIDs maps each allowed PID to its *exec.FileInfo, so a rename
+	// after AllowPID (Kubernetes / Docker decoration) refreshes svc_name_by_pid.
+	svcNamePIDs sync.Map
 }
 
 const (
@@ -85,19 +88,21 @@ const svcNameMaxLen = 25
 // recordServiceName records this process's service.name into svc_name_by_pid,
 // keyed by host PID (matching pid_from_pid_tgid on the BPF side). The sk_msg send
 // path looks it up to stamp the real service name into a TCP option on responses
-// (EXPERIMENTAL — TCP service-name propagation).
+// (EXPERIMENTAL — TCP service-name propagation). A name that cannot be propagated
+// (empty or too long) removes the entry, so a stale earlier name is never sent.
 func (p *Tracer) recordServiceName(pid app.PID, fi *exec.FileInfo) {
 	if fi == nil || p.bpfObjects.SvcNameByPid == nil {
 		return
 	}
+	key := uint32(pid)
 	name := fi.ServiceAttrs().UID.Name
-	if name == "" {
-		return
-	}
-	if len(name) > svcNameMaxLen {
-		// Never truncate: a truncated name could merge unrelated services.
-		p.log.Debug("service name exceeds TCP-option limit, not propagating",
-			"name", name, "len", len(name), "limit", svcNameMaxLen)
+	if name == "" || len(name) > svcNameMaxLen {
+		if name != "" {
+			// Never truncate: a truncated name could merge unrelated services.
+			p.log.Debug("service name exceeds TCP-option limit, not propagating",
+				"name", name, "len", len(name), "limit", svcNameMaxLen)
+		}
+		_ = p.bpfObjects.SvcNameByPid.Delete(&key)
 		return
 	}
 
@@ -105,14 +110,31 @@ func (p *Tracer) recordServiceName(pid app.PID, fi *exec.FileInfo) {
 	copy(val[:svcNameMaxLen], name)
 	val[svcNameMaxLen] = byte(len(name))
 
-	key := uint32(pid)
 	if err := p.bpfObjects.SvcNameByPid.Update(&key, &val, ebpf.UpdateAny); err != nil {
 		p.log.Debug("failed to record service name for pid", "pid", pid, "error", err)
 	}
 }
 
-func (p *Tracer) AllowPID(pid app.PID, _ uint32, fi *exec.FileInfo) {
+// trackServiceName records the current name and re-records it whenever the
+// FileInfo is renamed later. AllowPID runs in the discovery pipeline BEFORE the
+// Kubernetes / Docker process-event decorators (pkg/internal/appolly), so
+// without the refresh an EKS pod would propagate its pre-Kubernetes name.
+func (p *Tracer) trackServiceName(pid app.PID, fi *exec.FileInfo) {
+	if fi == nil || p.bpfObjects.SvcNameByPid == nil {
+		return
+	}
+	if prev, loaded := p.svcNamePIDs.Swap(pid, fi); !loaded || prev != fi {
+		fi.OnServiceNameChange(func() {
+			if cur, ok := p.svcNamePIDs.Load(pid); ok && cur == fi {
+				p.recordServiceName(pid, fi)
+			}
+		})
+	}
 	p.recordServiceName(pid, fi)
+}
+
+func (p *Tracer) AllowPID(pid app.PID, _ uint32, fi *exec.FileInfo) {
+	p.trackServiceName(pid, fi)
 
 	p.iterMu.Lock()
 	defer p.iterMu.Unlock()
@@ -168,6 +190,7 @@ func (p *Tracer) AllowPID(pid app.PID, _ uint32, fi *exec.FileInfo) {
 }
 
 func (p *Tracer) BlockPID(pid app.PID, _ uint32) {
+	p.svcNamePIDs.Delete(pid)
 	if p.bpfObjects.SvcNameByPid == nil {
 		return
 	}
