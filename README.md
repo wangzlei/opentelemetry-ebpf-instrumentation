@@ -44,6 +44,11 @@ cwagent/                  the cwagent change (format-patch of branch exp/obi-rec
                           -a enable-ebpf` (or Distributor Additional Arguments {"SSM_EBPF":"true"}) creates the marker
                           etc/ebpf/enabled + installs the drop-in, `-a disable-ebpf` removes both; upgrades from the
                           always-on versions keep eBPF on. CI applies all of them
+distributor/              SSM Distributor package ADOT-CloudWatchAgent-eBPF-Beta (292779133546, us-west-2): install.sh,
+                          uninstall.sh, manifest.json, README with the publish steps. Install without arguments = the
+                          official agent's behaviour; Additional Arguments {"SSM_EBPF":"true"} = install + start with eBPF.
+                          A Distributor version change is uninstall + install, so the eBPF choice is carried across in
+                          etc/ebpf/enabled.reinstall
 scripts/
   apply-patches.sh        upstream/ + patches/ -> build/obi (git repo, one commit per patch, tag `upstream`)
   generate-bpf.sh         `make docker-generate` in build/obi, twice, sha256-compared (reproducibility)
