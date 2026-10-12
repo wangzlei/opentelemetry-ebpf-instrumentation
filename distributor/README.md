@@ -14,8 +14,13 @@ plus `install.sh` and `uninstall.sh` from this directory.
   `rpm -e`) then install, so the eBPF choice is carried across via
   `etc/ebpf/enabled.reinstall` (and `etc/restart`), like the official package.
 
-Publish: zip each arch (`zip -X <zip> amazon-cloudwatch-agent.rpm install.sh uninstall.sh`),
-update `version` and the sha256 values in manifest.json, upload the zips to
-`s3://adot-obi-distributor-292779133546-usw2/<version>/`, then
-`aws ssm update-document --name ADOT-CloudWatchAgent-eBPF-Beta --document-version '$LATEST' ...`
-and `update-document-default-version`. versionName cannot contain `+`.
+Publish: `distributor/publish.sh [--set-default] [--dry-run]` (from the Mac). It takes the
+clean cwagent worktree `../adot-obi-work/cwagent` (version `1.300074.0-obi.<cwagent sha>`, plus
+`-r<N>` if that versionName already exists), syncs the current adot-obi tree to the dev desktop
+(`ci/run-remote.sh apply` + BPF generation) and the cwagent tree (tar over ssh), runs
+`make package-rpm` there, zips each arch with this directory's install.sh/uninstall.sh, uploads
+to `s3://adot-obi-distributor-292779133546-usw2/<version>/`, adds the document version
+(`aws ssm update-document ... --document-version '$LATEST'`), optionally makes it the default,
+and writes the published manifest back to `manifest.json` (commit it). `--dry-run` only checks
+the trees, ssh and credentials and prints the plan. The share with 868155213681 is not changed.
+If ada fails with a Midway 401, run `mwinit` on the dev desktop. versionName cannot contain `+`.
