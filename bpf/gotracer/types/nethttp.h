@@ -37,9 +37,10 @@ typedef struct server_http_func_invocation {
     u8 path[k_path_max_len];
     u8 raw_query[k_query_max_len];
     u8 pattern[k_pattern_max_len];
+    u8 host[k_host_max_len]; // Request.Host (Host header / :authority), EXPERIMENTAL (adot-obi)
     u8 is_tls;
     bool is_jsonrpc;
-    u8 _pad[7];
+    u8 _pad[3];
 } server_http_func_invocation_t;
 
 typedef struct framer_func_invocation {

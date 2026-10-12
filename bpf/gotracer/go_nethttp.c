@@ -63,6 +63,20 @@ static __always_inline unsigned char *temp_header_mem() {
 SCRATCH_MEM_TYPED(serve_http_inv, server_http_func_invocation_t)
 SCRATCH_MEM_TYPED(round_trip_client_data, http_client_data_t)
 
+// EXPERIMENTAL (adot-obi): reads net/http.Request.Host into buf when the field
+// offset is known and the string is non-empty; otherwise buf is left untouched.
+// Server side: the Host header (HTTP/1) or :authority (HTTP/2) the client sent.
+// Client side: the Host Go sends instead of URL.Host when it is set.
+static __always_inline int read_req_host(void *req, off_table_t *ot, void *buf, u64 size) {
+    const u64 off = go_offset_of(ot, (go_offset){.v = _req_host_ptr_pos});
+    // ~0 = unknown offset (stripped binary, Go version not in offsets.json);
+    // read_go_str takes a u8 offset
+    if (off > 0xff || !peek_go_str_len("req_host", req, (u8)off)) {
+        return 0;
+    }
+    return read_go_str("req_host", req, (u8)off, buf, size);
+}
+
 /* HTTP Server */
 
 // This instrumentation attaches uprobe to the following function:
@@ -146,6 +160,9 @@ int GUARDED_PROG(obi_uprobe_ServeHTTP, struct pt_regs *, ctx) {
             bpf_dbg_printk("can't read http Request.ContentLength");
             goto done;
         }
+
+        // best-effort, like raw_query: no Host keeps the event
+        read_req_host(req, ot, invocation->host, sizeof(invocation->host));
     } else {
         goto done;
     }
@@ -581,7 +598,7 @@ static __always_inline int serve_http_returns(struct pt_regs *ctx) {
     trace->type = EVENT_HTTP_REQUEST;
     trace->start_monotime_ns = invocation->start_monotime_ns;
     trace->end_monotime_ns = bpf_ktime_get_ns();
-    trace->host[0] = '\0';
+    __builtin_memcpy(trace->host, invocation->host, sizeof(trace->host));
     if (invocation->is_tls) {
         bpf_memcpy(trace->scheme, "https", 6);
     } else {
@@ -700,6 +717,9 @@ static __always_inline void roundTripStartHelper(struct pt_regs *ctx) {
             bpf_dbg_printk("can't read http Request.URL.Host");
             return;
         }
+        // Go sends Request.Host instead of URL.Host when it is set (a client
+        // that dials an IP and names the virtual host), so prefer it.
+        read_req_host(req, ot, trace->host, sizeof(trace->host));
 
         if (!read_go_str("scheme",
                          url_ptr,

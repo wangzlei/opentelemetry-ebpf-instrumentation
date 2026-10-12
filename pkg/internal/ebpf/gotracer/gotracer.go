@@ -534,6 +534,9 @@ func (p *Tracer) RegisterOffsets(fileInfo *exec.FileInfo, offsets *goexec.Offset
 	offTable := BpfOffTableT{}
 	initMissingGoChannelOffsets(&offTable)
 	initMissingGoAutoSDKSpanContextOffsets(&offTable)
+	// EXPERIMENTAL (adot-obi): the BPF side skips Request.Host when its offset
+	// is unknown, keeping URL.Host (client) / no host (server) as upstream.
+	offTable.Table[goexec.ReqHostPtrPos] = missingGoOffset
 	// Set the field offsets and the logLevel for the Go BPF program in a map
 	for _, field := range []goexec.GoOffset{
 		goexec.ConnFdPos,
@@ -634,6 +637,7 @@ func (p *Tracer) RegisterOffsets(fileInfo *exec.FileInfo, offsets *goexec.Offset
 		goexec.PgxConfigHostPos,
 		goexec.MuxTemplatePos,
 		goexec.GinFullpathPos,
+		goexec.ReqHostPtrPos,
 	} {
 		if val, ok := offsets.Field[field].(uint64); ok {
 			offTable.Table[field] = val
