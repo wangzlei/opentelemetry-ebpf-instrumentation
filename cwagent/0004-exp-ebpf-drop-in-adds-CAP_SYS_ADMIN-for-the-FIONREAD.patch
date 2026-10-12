@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: wangzlei <66336933+wangzlei@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 15:01:32 -0700
-Subject: [PATCH 4/7] exp: ebpf drop-in adds CAP_SYS_ADMIN for the FIONREAD
+Subject: [PATCH 4/8] exp: ebpf drop-in adds CAP_SYS_ADMIN for the FIONREAD
  compensation
 
 On kernels with commit 929e30f93125 (6.6.128+, 6.12.75+, 6.18.14+, 6.19+)
