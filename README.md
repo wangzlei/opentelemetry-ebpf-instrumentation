@@ -39,7 +39,11 @@ cwagent/                  the cwagent change (format-patch of branch exp/obi-rec
                           etc/ebpf/obi.yaml (%config(noreplace), outside amazon-cloudwatch-agent.d so fetch-config
                           keeps it), loaded first by start-agent. Edit that file to change it (a .d YAML cannot:
                           the agent rejects duplicate receivers/processors/exporters/extensions/service::pipelines
-                          keys); etc/ebpf/disabled turns it off. CI applies all of them
+                          keys). 0007 makes eBPF opt-in: by default the RPM behaves like the official agent (drop-in
+                          shipped only as the template etc/ebpf/systemd-dropin.conf); `amazon-cloudwatch-agent-ctl
+                          -a enable-ebpf` (or Distributor Additional Arguments {"SSM_EBPF":"true"}) creates the marker
+                          etc/ebpf/enabled + installs the drop-in, `-a disable-ebpf` removes both; upgrades from the
+                          always-on versions keep eBPF on. CI applies all of them
 scripts/
   apply-patches.sh        upstream/ + patches/ -> build/obi (git repo, one commit per patch, tag `upstream`)
   generate-bpf.sh         `make docker-generate` in build/obi, twice, sha256-compared (reproducibility)

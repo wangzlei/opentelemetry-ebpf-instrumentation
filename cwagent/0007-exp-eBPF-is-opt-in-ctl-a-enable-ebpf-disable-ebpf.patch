@@ -1,0 +1,314 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wangzlei <66336933+wangzlei@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 14:45:47 -0700
+Subject: [PATCH 7/7] exp: eBPF is opt-in (ctl -a enable-ebpf / disable-ebpf)
+
+By default the RPM now behaves like the official CloudWatch Agent: no
+systemd drop-in, no extra capabilities, no eBPF config loaded.
+
+- start-amazon-cloudwatch-agent loads etc/ebpf/obi.yaml only when the
+  marker etc/ebpf/enabled exists (the old etc/ebpf/disabled is gone).
+- The drop-in ships as the template etc/ebpf/systemd-dropin.conf.
+  ctl -a enable-ebpf creates the marker, installs the drop-in as
+  service.d/ebpf.conf and restarts (or starts) the agent;
+  -a disable-ebpf removes both and restarts if running.
+  ctl -a status reports "ebpf": enabled|disabled.
+- Upgrades from the always-on versions keep eBPF on: %pre creates the
+  marker when the old service.d/ebpf.conf exists and %posttrans
+  reinstalls the drop-in before the cond-restart. A full erase removes
+  the marker and the drop-in.
+---
+ Tools/src/create_rpm.sh                       |  4 +-
+ cmd/start-amazon-cloudwatch-agent/path.go     | 33 ++++++----
+ .../dependencies/amazon-cloudwatch-agent-ctl  | 65 ++++++++++++++++++-
+ .../amazon-cloudwatch-agent-ebpf.conf         |  2 +
+ .../amazon-cloudwatch-agent-ebpf.yaml         |  8 ++-
+ packaging/linux/amazon-cloudwatch-agent.spec  | 31 ++++++++-
+ 6 files changed, 121 insertions(+), 22 deletions(-)
+
+diff --git a/Tools/src/create_rpm.sh b/Tools/src/create_rpm.sh
+index 3eb99a8a..09223eb3 100755
+--- a/Tools/src/create_rpm.sh
++++ b/Tools/src/create_rpm.sh
+@@ -32,9 +32,9 @@ cp ${PREPKGPATH}/CWAGENT_VERSION ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch
+ cp ${PREPKGPATH}/amazon-cloudwatch-agent ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/bin/
+ cp ${PREPKGPATH}/amazon-cloudwatch-agent-ctl ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/bin/
+ cp ${PREPKGPATH}/amazon-cloudwatch-agent.service ${BUILD_ROOT}/SOURCES/etc/systemd/system/
+-mkdir -p ${BUILD_ROOT}/SOURCES/etc/systemd/system/amazon-cloudwatch-agent.service.d
+-cp ${PREPKGPATH}/amazon-cloudwatch-agent-ebpf.conf ${BUILD_ROOT}/SOURCES/etc/systemd/system/amazon-cloudwatch-agent.service.d/ebpf.conf
+ mkdir -p ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/etc/ebpf
++# eBPF is opt-in: the drop-in is a template that "ctl -a enable-ebpf" installs.
++cp ${PREPKGPATH}/amazon-cloudwatch-agent-ebpf.conf ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/etc/ebpf/systemd-dropin.conf
+ cp ${PREPKGPATH}/amazon-cloudwatch-agent-ebpf.yaml ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/etc/ebpf/obi.yaml
+ cp ${PREPKGPATH}/config-translator ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/bin/
+ cp ${PREPKGPATH}/config-downloader ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/bin/
+diff --git a/cmd/start-amazon-cloudwatch-agent/path.go b/cmd/start-amazon-cloudwatch-agent/path.go
+index 658c68f1..6261f262 100644
+--- a/cmd/start-amazon-cloudwatch-agent/path.go
++++ b/cmd/start-amazon-cloudwatch-agent/path.go
+@@ -50,9 +50,10 @@ func startAgent(writer io.WriteCloser) error {
+ 	log.Printf("I! Detected runAsUser: %v", runAsUser)
+ 
+ 	if os.Geteuid() != 0 {
+-		// Started unprivileged (e.g. systemd User=cwagent with ambient capabilities
+-		// for the eBPF receiver): there is no user to switch to, and the chown and
+-		// setgroups that ChangeUser does would fail without root.
++		// Started unprivileged: only when eBPF is enabled, whose systemd drop-in
++		// runs the agent as User=cwagent with ambient capabilities for the eBPF
++		// receiver. There is no user to switch to, and the chown and setgroups
++		// that ChangeUser does would fail without root.
+ 		log.Printf("I! Running as uid %d, not root: skipping run_as_user %q", os.Geteuid(), runAsUser)
+ 	} else if _, err = user.ChangeUser(runAsUser); err != nil {
+ 		log.Printf("E! Failed to ChangeUser: %v ", err)
+@@ -92,23 +93,27 @@ func startAgent(writer io.WriteCloser) error {
+ }
+ 
+ // ebpfConfigArgs returns the -otelconfig pair for the default eBPF (ADOT OBI)
+-// config shipped by the RPM in etc/ebpf/, unless etc/ebpf/disabled exists. It
+-// is kept outside amazon-cloudwatch-agent.d so that fetch-config, which empties
+-// that directory, does not delete it. Note that a YAML in
+-// amazon-cloudwatch-agent.d cannot redefine the components it declares: the
+-// merge rejects duplicate keys in receivers, processors, exporters, extensions
+-// and service::pipelines. Edit etc/ebpf/obi.yaml (%config(noreplace)) to change
+-// it, or create etc/ebpf/disabled to turn it off.
++// config shipped by the RPM in etc/ebpf/, but only when eBPF is opted in, i.e.
++// etc/ebpf/enabled exists. The marker is created by
++// "amazon-cloudwatch-agent-ctl -a enable-ebpf" (which also installs the systemd
++// drop-in that grants the capabilities) and removed by "-a disable-ebpf". Without
++// it the agent behaves like the official one. The config is kept outside
++// amazon-cloudwatch-agent.d so that fetch-config, which empties that directory,
++// does not delete it. Note that a YAML in amazon-cloudwatch-agent.d cannot
++// redefine the components it declares: the merge rejects duplicate keys in
++// receivers, processors, exporters, extensions and service::pipelines. Edit
++// etc/ebpf/obi.yaml (%config(noreplace)) to change it.
+ func ebpfConfigArgs() []string {
+ 	cfg := filepath.Join(paths.AgentDir, "etc", "ebpf", "obi.yaml")
+-	if _, err := os.Stat(cfg); err != nil {
++	marker := filepath.Join(paths.AgentDir, "etc", "ebpf", "enabled")
++	if _, err := os.Stat(marker); err != nil {
+ 		return nil
+ 	}
+-	if _, err := os.Stat(filepath.Join(paths.AgentDir, "etc", "ebpf", "disabled")); err == nil {
+-		log.Printf("I! eBPF default config %s is disabled (etc/ebpf/disabled exists)", cfg)
++	if _, err := os.Stat(cfg); err != nil {
++		log.Printf("W! eBPF is enabled (%s exists) but %s is missing: %v", marker, cfg, err)
+ 		return nil
+ 	}
+-	log.Printf("I! Loading eBPF default config %s", cfg)
++	log.Printf("I! eBPF is enabled (%s exists): loading eBPF default config %s", marker, cfg)
+ 	return []string{"-otelconfig", cfg}
+ }
+ 
+diff --git a/packaging/dependencies/amazon-cloudwatch-agent-ctl b/packaging/dependencies/amazon-cloudwatch-agent-ctl
+index 28eab43a..3d740c92 100755
+--- a/packaging/dependencies/amazon-cloudwatch-agent-ctl
++++ b/packaging/dependencies/amazon-cloudwatch-agent-ctl
+@@ -21,6 +21,14 @@ readonly JSON_DIR="${CONFDIR}/amazon-cloudwatch-agent.d"
+ readonly CV_LOG_FILE="${AGENTDIR}/logs/configuration-validation.log"
+ readonly COMMON_CONIG="${CONFDIR}/common-config.toml"
+ readonly ENV_CONFIG="${CONFDIR}/env-config.json"
++# eBPF (ADOT OBI) is opt-in: the marker makes start-amazon-cloudwatch-agent load
++# etc/ebpf/obi.yaml, and the systemd drop-in (installed from the RPM's template)
++# runs the agent as cwagent with the capabilities the eBPF receiver needs.
++readonly EBPF_DIR="${CONFDIR}/ebpf"
++readonly EBPF_MARKER="${EBPF_DIR}/enabled"
++readonly EBPF_DROPIN_TEMPLATE="${EBPF_DIR}/systemd-dropin.conf"
++readonly EBPF_DROPIN_DIR="/etc/systemd/system/amazon-cloudwatch-agent.service.d"
++readonly EBPF_DROPIN="${EBPF_DROPIN_DIR}/ebpf.conf"
+ 
+ readonly CWA_NAME='amazon-cloudwatch-agent'
+ readonly ALL_CONFIG='all'
+@@ -31,7 +39,7 @@ UsageString="
+ 
+ 
+         usage:  amazon-cloudwatch-agent-ctl -a
+-                stop|start|status|status-with-workloads|fetch-config|append-config|remove-config|set-log-level|set-env
++                stop|start|status|status-with-workloads|fetch-config|append-config|remove-config|set-log-level|set-env|enable-ebpf|disable-ebpf
+                 [-m ec2|onPremise|onPrem|auto]
+                 [-c default|all|ssm:<parameter-store-name>|file:<file-path>]
+                 [-s]
+@@ -59,6 +67,8 @@ UsageString="
+             remove-config:                          remove config for agent, followed by -c. Target config can be based on the location (ssm parameter store name, file name), or 'all'.
+             set-log-level:                          sets the log level, followed by -l to provide the level in all caps.
+             set-env:                                sets an environment variable for the agent process, followed by -e to provide KEY=VALUE.
++            enable-ebpf:                            turn on eBPF (ADOT OBI) instrumentation: runs the agent as cwagent with the eBPF capabilities and loads etc/ebpf/obi.yaml. Restarts the agent, or starts it (with the default config if none) when it is stopped.
++            disable-ebpf:                           turn off eBPF instrumentation (the default) and restart the agent if it is running.
+ 
+         -m: mode
+             ec2:                                    indicate this is on ec2 host.
+@@ -189,6 +199,56 @@ agent_preun() {
+      fi
+ }
+ 
++ebpf_status() {
++     if [ -f "${EBPF_MARKER}" ]; then
++          echo "enabled"
++     else
++          echo "disabled"
++     fi
++}
++
++enable_ebpf() {
++     mode="${1:-}"
++
++     if [ "${SYSTEMD}" != 'true' ]; then
++          echo "enable-ebpf requires systemd" >&2
++          exit 1
++     fi
++     if [ ! -f "${EBPF_DROPIN_TEMPLATE}" ]; then
++          echo "eBPF systemd drop-in template ${EBPF_DROPIN_TEMPLATE} not found" >&2
++          exit 1
++     fi
++     mkdir -p "${EBPF_DIR}" "${EBPF_DROPIN_DIR}"
++     touch "${EBPF_MARKER}"
++     cp -f "${EBPF_DROPIN_TEMPLATE}" "${EBPF_DROPIN}"
++     systemctl daemon-reload
++     echo "eBPF enabled"
++
++     if [ "$(runstatus ${CWA_NAME})" = 'running' ]; then
++          systemctl restart "${CWA_NAME}.service"
++     else
++          start_all "${mode}"
++     fi
++}
++
++disable_ebpf() {
++     rm -f "${EBPF_MARKER}" "${EBPF_DROPIN}"
++     rmdir "${EBPF_DROPIN_DIR}" 2>/dev/null || :
++     if [ "${SYSTEMD}" = 'true' ]; then
++          systemctl daemon-reload
++     fi
++     echo "eBPF disabled"
++
++     if [ "$(runstatus ${CWA_NAME})" = 'running' ]; then
++          if [ "${SYSTEMD}" = 'true' ]; then
++               systemctl restart "${CWA_NAME}.service"
++          else
++               stop "${CWA_NAME}"
++               start "${CWA_NAME}"
++          fi
++     fi
++}
++
+ cwa_status() {
+      include_workloads="${1:-false}"
+ 
+@@ -203,6 +263,7 @@ cwa_status() {
+      echo "  \"status\": \"$(runstatus ${CWA_NAME})\","
+      echo "  \"starttime\": \"$(get_starttime_fmt ${CWA_NAME})\","
+      echo "  \"configstatus\": \"${cwa_config_status}\","
++     echo "  \"ebpf\": \"$(ebpf_status)\","
+      if [ "${include_workloads}" = "true" ]; then
+           workloads_json="[]"
+           if [ -x "${WORKLOAD_DISCOVERY}" ]; then
+@@ -478,6 +539,8 @@ main() {
+      preun) preun_all ;;
+      set-log-level) set_log_level_all "${log_level}" ;;
+      set-env) set_env "${env_kv}" ;;
++     enable-ebpf) enable_ebpf "${mode}" ;;
++     disable-ebpf) disable_ebpf ;;
+      *)
+           echo "Invalid action: ${action} ${UsageString}" >&2
+           exit 1
+diff --git a/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf b/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf
+index 39fa6f08..aa5544c3 100644
+--- a/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf
++++ b/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf
+@@ -1,5 +1,7 @@
+ # systemd drop-in installed as
+ #   /etc/systemd/system/amazon-cloudwatch-agent.service.d/ebpf.conf
++# by "amazon-cloudwatch-agent-ctl -a enable-ebpf" (eBPF is opt-in; the RPM ships
++# this file as the template etc/ebpf/systemd-dropin.conf).
+ # Runs the agent as the unprivileged cwagent user with only the capabilities the
+ # ADOT OBI eBPF receiver needs (raised as ambient, so they survive the exec of the
+ # agent binary). start-amazon-cloudwatch-agent skips its own run_as_user switch
+diff --git a/packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml b/packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml
+index d906cffa..6a66f090 100644
+--- a/packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml
++++ b/packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml
+@@ -2,7 +2,8 @@
+ #   /opt/aws/amazon-cloudwatch-agent/etc/ebpf/obi.yaml   (%config(noreplace))
+ # It lives outside etc/amazon-cloudwatch-agent.d/ so that
+ # `amazon-cloudwatch-agent-ctl -a fetch-config` (which empties that dir) keeps it.
+-# start-amazon-cloudwatch-agent passes it as the FIRST -otelconfig.
++# eBPF is opt-in: start-amazon-cloudwatch-agent passes it as the FIRST
++# -otelconfig only when etc/ebpf/enabled exists.
+ #
+ # To change it, edit this file: rpm upgrades keep your edits.
+ # A YAML in etc/amazon-cloudwatch-agent.d/ CANNOT override the components defined
+@@ -10,8 +11,9 @@
+ # exporters, extensions and service::pipelines, and fails to start with
+ #   E! Error running agent: failed to merge OTEL configs: merge conflict in receivers: [obi]
+ # Such a YAML may only add components with different names.
+-# To turn eBPF off:
+-#   touch /opt/aws/amazon-cloudwatch-agent/etc/ebpf/disabled && systemctl restart amazon-cloudwatch-agent
++# To turn eBPF on / off:
++#   amazon-cloudwatch-agent-ctl -a enable-ebpf
++#   amazon-cloudwatch-agent-ctl -a disable-ebpf
+ # Source: adot-obi config/otel.yaml.
+ #
+ #   AWS_REGION      X-Ray / CloudWatch region          (default us-west-2)
+diff --git a/packaging/linux/amazon-cloudwatch-agent.spec b/packaging/linux/amazon-cloudwatch-agent.spec
+index 41e1e13a..6f94c67d 100644
+--- a/packaging/linux/amazon-cloudwatch-agent.spec
++++ b/packaging/linux/amazon-cloudwatch-agent.spec
+@@ -61,6 +61,7 @@ ln -f -s /opt/aws/amazon-cloudwatch-agent/var ${RPM_BUILD_ROOT}/var/run/amazon/a
+ %config(noreplace) /opt/aws/amazon-cloudwatch-agent/etc/common-config.toml
+ %dir /opt/aws/amazon-cloudwatch-agent/etc/ebpf
+ %config(noreplace) /opt/aws/amazon-cloudwatch-agent/etc/ebpf/obi.yaml
++/opt/aws/amazon-cloudwatch-agent/etc/ebpf/systemd-dropin.conf
+ /opt/aws/amazon-cloudwatch-agent/LICENSE
+ /opt/aws/amazon-cloudwatch-agent/NOTICE
+ 
+@@ -68,8 +69,6 @@ ln -f -s /opt/aws/amazon-cloudwatch-agent/var ${RPM_BUILD_ROOT}/var/run/amazon/a
+ /opt/aws/amazon-cloudwatch-agent/RELEASE_NOTES
+ /etc/init/amazon-cloudwatch-agent.conf
+ /etc/systemd/system/amazon-cloudwatch-agent.service
+-%dir /etc/systemd/system/amazon-cloudwatch-agent.service.d
+-/etc/systemd/system/amazon-cloudwatch-agent.service.d/ebpf.conf
+ 
+ /usr/bin/amazon-cloudwatch-agent-ctl
+ /etc/amazon/amazon-cloudwatch-agent
+@@ -85,6 +84,14 @@ if [ $1 -ge 2 ]; then
+     fi
+ fi
+ 
++# eBPF is opt-in (marker etc/ebpf/enabled + drop-in installed by
++# "amazon-cloudwatch-agent-ctl -a enable-ebpf"). Hosts upgrading from the beta
++# versions where eBPF was always on (the RPM owned service.d/ebpf.conf) keep it on.
++if [ $1 -ge 2 ] && [ -f /etc/systemd/system/amazon-cloudwatch-agent.service.d/ebpf.conf ]; then
++    mkdir -p /opt/aws/amazon-cloudwatch-agent/etc/ebpf
++    touch /opt/aws/amazon-cloudwatch-agent/etc/ebpf/enabled
++fi
++
+ if ! grep "^cwagent:" /etc/group >/dev/null 2>&1; then
+     groupadd -r cwagent >/dev/null 2>&1
+     echo "create group cwagent, result: $?"
+@@ -103,7 +110,27 @@ if [ $1 -eq 0 ] ; then
+     fi
+ fi
+ 
++%postun
++# Full erase: remove the eBPF opt-in state, which the RPM does not own.
++if [ $1 -eq 0 ]; then
++    rm -f /opt/aws/amazon-cloudwatch-agent/etc/ebpf/enabled
++    rm -f /etc/systemd/system/amazon-cloudwatch-agent.service.d/ebpf.conf
++    rmdir /etc/systemd/system/amazon-cloudwatch-agent.service.d 2>/dev/null || :
++    if command -v systemctl >/dev/null 2>&1; then
++        systemctl daemon-reload >/dev/null 2>&1 || :
++    fi
++fi
++
+ %posttrans
++# eBPF opted in: (re)install the systemd drop-in from the template. On an upgrade
++# from an always-on version the old package's erase removed its ebpf.conf.
++if [ -f /opt/aws/amazon-cloudwatch-agent/etc/ebpf/enabled ] && [ -f /opt/aws/amazon-cloudwatch-agent/etc/ebpf/systemd-dropin.conf ]; then
++    mkdir -p /etc/systemd/system/amazon-cloudwatch-agent.service.d
++    cp -f /opt/aws/amazon-cloudwatch-agent/etc/ebpf/systemd-dropin.conf /etc/systemd/system/amazon-cloudwatch-agent.service.d/ebpf.conf
++    if command -v systemctl >/dev/null 2>&1; then
++        systemctl daemon-reload >/dev/null 2>&1 || :
++    fi
++fi
+ # restart agent after upgrade
+ if [ -x /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl ]; then
+     /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a cond-restart

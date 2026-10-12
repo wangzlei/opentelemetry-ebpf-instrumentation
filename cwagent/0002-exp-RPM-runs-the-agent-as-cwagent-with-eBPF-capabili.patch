@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: wangzlei <66336933+wangzlei@users.noreply.github.com>
 Date: Thu, 8 Oct 2026 20:48:09 -0700
-Subject: [PATCH 2/6] exp: RPM runs the agent as cwagent with eBPF capabilities
+Subject: [PATCH 2/7] exp: RPM runs the agent as cwagent with eBPF capabilities
  (systemd drop-in)
 
 Adds /etc/systemd/system/amazon-cloudwatch-agent.service.d/ebpf.conf: User=cwagent
