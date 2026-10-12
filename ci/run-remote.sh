@@ -28,7 +28,7 @@ seen=0
 while :; do
   sleep 20
   out=$("${SSH[@]}" "cd $R/adot-obi/ci/logs && tail -n +$((seen + 1)) run.out; echo; echo \"@@rc=\$(cat run.rc 2>/dev/null)\"" 2>/dev/null) || continue
-  body=${out%@@rc=*}; body=${body%$'\n'}; rcl=${out##*@@rc=}
+  body=${out%@@rc=*}; body=${body%$'\n'}; body=${body%$'\n'}; rcl=${out##*@@rc=}
   if [[ -n $body ]]; then printf '%s\n' "$body"; seen=$((seen + $(printf '%s\n' "$body" | wc -l))); fi
   [[ -n ${rcl//[[:space:]]/} ]] && { rc=${rcl//[[:space:]]/}; break; }
 done
