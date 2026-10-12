@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: wangzlei <66336933+wangzlei@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 14:11:56 -0700
-Subject: [PATCH 1/8] exp: add ADOT-OBI eBPF receiver (obi) to default OTel
+Subject: [PATCH 1/9] exp: add ADOT-OBI eBPF receiver (obi) to default OTel
  components
 
 Registers github.com/aws-observability/adot-obi/receiver/obireceiver (type

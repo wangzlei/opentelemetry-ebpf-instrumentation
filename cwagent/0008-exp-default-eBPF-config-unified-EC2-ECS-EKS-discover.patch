@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: wangzlei <66336933+wangzlei@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 15:52:13 -0700
-Subject: [PATCH 8/8] exp: default eBPF config: unified EC2/ECS/EKS discovery
+Subject: [PATCH 8/9] exp: default eBPF config: unified EC2/ECS/EKS discovery
 
 Instrument common service ports (80,443,3000,5000,8000-8099,8443,8888,9000)
 plus every Deployment/StatefulSet pod on EKS. Exclude the agent itself and
