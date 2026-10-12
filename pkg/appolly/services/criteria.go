@@ -141,6 +141,13 @@ type DiscoveryConfig struct {
 	// Executable path prefixes for which preliminary language detection is
 	// skipped. Processes can still be selected using non-language criteria.
 	ExcludedLinuxSystemPaths []string `yaml:"excluded_linux_system_paths"`
+
+	// ServiceNameFromCmdline derives the automatic service name of a process
+	// without OTEL_SERVICE_NAME / service.name from its project metadata or
+	// command line (package.json, pyproject.toml, script, WSGI/ASGI target, JAR,
+	// main class, .NET assembly) instead of the executable name (python3, node,
+	// java, ...). Kubernetes metadata still overrides it. Default false.
+	ServiceNameFromCmdline bool `yaml:"service_name_from_cmdline" env:"OTEL_EBPF_SERVICE_NAME_FROM_CMDLINE"`
 }
 
 type RouteHarvestingConfig struct {

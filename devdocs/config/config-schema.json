@@ -558,6 +558,12 @@
           ],
           "x-env-var": "OTEL_EBPF_ROUTE_HARVESTER_TIMEOUT"
         },
+        "service_name_from_cmdline": {
+          "type": "boolean",
+          "description": "Derives the automatic service name of a process without OTEL_SERVICE_NAME / service.name from its project metadata or command line (package.json, pyproject.toml, script, WSGI/ASGI target, JAR, main class, .NET assembly) instead of the executable name (python3, node, java, ...). Kubernetes metadata still overrides it. Default false.",
+          "default": false,
+          "x-env-var": "OTEL_EBPF_SERVICE_NAME_FROM_CMDLINE"
+        },
         "services": {
           "$ref": "#/$defs/RegexDefinitionCriteria",
           "description": "Selection. If the user defined the OTEL_EBPF_EXECUTABLE_PATH or OTEL_EBPF_OPEN_PORT variables, they will be automatically added to the services definition criteria, with the lowest preference.  Use Instrument instead",
