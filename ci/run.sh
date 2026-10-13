@@ -5,12 +5,14 @@
 #
 #   ci/run.sh [stage ...]     stages: apply bpf obi collector cwagent e2e   (default: all)
 #
-# Env: CWAGENT=<cwagent checkout on exp/obi-receiver> (default ../cwagent)
+# Env: CWAGENT=<cwagent checkout on exp/obi-receiver> (default ../cwagent, else ../adot-obi-work/cwagent)
 #      GOPROXY/GOSUMDB (default proxy.golang.org / sum.golang.org; override on networks that block them)
 #      SKIP_REPRO=1  skip the second BPF generation
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CW=${CWAGENT:-"$ROOT/../cwagent"}
+# the worktree publish.sh builds from; a missing ../cwagent would be created (root-owned) by docker -v
+[[ -n ${CWAGENT:-} || -f $CW/go.mod || ! -f $ROOT/../adot-obi-work/cwagent/go.mod ]] || CW=$ROOT/../adot-obi-work/cwagent
 LOGS="$ROOT/ci/logs"; mkdir -p "$LOGS"
 export GOPROXY=${GOPROXY:-https://proxy.golang.org,direct} GOSUMDB=${GOSUMDB:-sum.golang.org} GOFLAGS=-mod=readonly
 STAGES=("$@"); [[ ${#STAGES[@]} -gt 0 ]] || STAGES=(apply bpf obi collector cwagent e2e)
