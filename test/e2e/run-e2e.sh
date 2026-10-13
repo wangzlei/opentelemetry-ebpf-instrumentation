@@ -4,10 +4,13 @@
 # an explicit capability set and to mount a cgroup2 hierarchy on cgroup-v1 hosts).
 #
 # usage: run-e2e.sh <agent-binary> <scenario> <outdir>
-#   scenario tcp     : context_propagation=tcp, caps = 7 caps incl. CAP_NET_ADMIN
-#   scenario nonetadmin : context_propagation=disabled, caps = 6 caps (no CAP_NET_ADMIN)
-# The agent always runs as the invoking (non-root) user with ambient caps only;
-# CAP_SYS_ADMIN is never granted.
+#   scenario tcp     : context_propagation=tcp, caps = the shipped 8-cap set incl. CAP_NET_ADMIN
+#                      and CAP_SYS_ADMIN (SYS_ADMIN is for the FIONREAD compensation that
+#                      kernels 6.6.128+/6.12.75+/6.18.14+/6.19+ need; without it OBI disables
+#                      context propagation there and the peer.service.name check fails)
+#   scenario nonetadmin : context_propagation=disabled, caps = 6 caps (no CAP_NET_ADMIN, no
+#                      CAP_SYS_ADMIN): the minimal set when propagation is off
+# The agent always runs as the invoking (non-root) user with ambient caps only.
 # SKIP_CGROUP2_MOUNT=1 runs "tcp" without preparing cgroup2 (shows the cgroup-v1 degradation).
 set -uo pipefail
 AGENT=${1:?agent binary}; SCEN=${2:?scenario}; OUT=${3:?outdir}
@@ -16,7 +19,7 @@ FRONTEND_PORT=${FRONTEND_PORT:-18080}; BACKEND_PORT=${BACKEND_PORT:-18081}
 REQS=${REQS:-300}
 CAPS_BASE="cap_bpf,cap_perfmon,cap_sys_ptrace,cap_dac_read_search,cap_checkpoint_restore,cap_net_raw"
 case $SCEN in
-  tcp)        CP=tcp;      CAPS="$CAPS_BASE,cap_net_admin"; EXPECT_PEER="--expect-peer-service e2e-frontend=e2e-backend";;
+  tcp)        CP=tcp;      CAPS="$CAPS_BASE,cap_net_admin,cap_sys_admin"; EXPECT_PEER="--expect-peer-service e2e-frontend=e2e-backend";;
   nonetadmin) CP=disabled; CAPS="$CAPS_BASE";               EXPECT_PEER="";;
   *) echo "unknown scenario $SCEN"; exit 2;;
 esac
@@ -25,7 +28,8 @@ PIDS=()
 cleanup() {
   for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
   sudo pkill -f "$OUT/agent/otel.yaml" 2>/dev/null
-  sleep 1
+  # wait for the agent to exit: the next scenario binds the same ports (e.g. 8888)
+  for _ in $(seq 1 30); do pgrep -f "$OUT/agent/otel.yaml" >/dev/null || break; sleep 1; done
 }
 trap cleanup EXIT
 
@@ -66,7 +70,7 @@ if [[ -z $APID ]]; then echo "FAIL: agent did not start"; tail -50 "$OUT/agent/a
 grep -E '^(Uid|Cap(Inh|Prm|Eff|Bnd|Amb))' /proc/$APID/status | tee "$OUT/agent/proc-status.txt"
 EFF=$(awk '/^CapEff/{print $2}' /proc/$APID/status)
 /usr/sbin/capsh --decode=$EFF | tee "$OUT/agent/capeff-decoded.txt"
-if /usr/sbin/capsh --decode=$EFF | grep -q cap_sys_admin; then echo "FAIL: agent has CAP_SYS_ADMIN"; exit 1; fi
+if [[ $SCEN == nonetadmin ]] && /usr/sbin/capsh --decode=$EFF | grep -q cap_sys_admin; then echo "FAIL: agent has CAP_SYS_ADMIN"; exit 1; fi
 if [[ $(awk '/^Uid/{print $2}' /proc/$APID/status) == 0 ]]; then echo "FAIL: agent runs as uid 0"; exit 1; fi
 
 # Wait for OBI to attach its probes before generating traffic.
