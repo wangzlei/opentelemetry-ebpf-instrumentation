@@ -71,7 +71,8 @@ export COPYFILE_DISABLE=1 # no macOS ._* / xattr entries in the archives
 
 step() { echo; echo "=== [$(date +%H:%M:%S) +$((SECONDS-T0))s] $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
-if [[ $LOCAL == 1 ]]; then rsh() { (cd ~ && bash -c "$*"); }; else rsh() { "${SSH[@]}" "$@"; }; fi
+# local: a single arg is a shell command line (like ssh); several args run as argv (keeps multi-line args)
+if [[ $LOCAL == 1 ]]; then rsh() { (cd ~ && if [[ $# -gt 1 ]]; then "$@"; else bash -c "$1"; fi); }; else rsh() { "${SSH[@]}" "$@"; }; fi
 # remote aws with the ada credentials (default profile on dev-dsk)
 raws() { rsh "AWS_REGION=$REGION AWS_PAGER= aws $(printf '%q ' "$@")"; }
 
