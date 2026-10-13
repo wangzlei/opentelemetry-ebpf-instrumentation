@@ -80,6 +80,7 @@ through language-specific library instrumentation documented later in this file.
 | Opensearch | `3.0.0+` | `/_search`, `/_msearch`, `/_bulk`, `/_doc` | Yes | No | None documented |
 | AWS S3 | All | `CreateBucket`, `DeleteBucket`, `PutObject`, `DeleteObject`, `ListBuckets`, `ListObjects`, `GetObject` | Yes | No | None documented |
 | AWS SQS | All | All | Yes | No | None documented |
+| AWS Lambda | All | `Invoke` | Yes | No | Only the `Invoke` API; other Lambda APIs are plain HTTP client spans |
 | SQL++ | All | All | Yes | No | None documented |
 | GenAI | All | All | Yes | No | Supported vendors are OpenAI, Anthropic, Google AI Studio (Gemini), AWS Bedrock, Qwen (DashScope), generic embedding providers (Voyage AI, Cohere, Jina AI), Cohere (Rerank), Jina AI (Rerank), Voyage AI (Rerank), Qwen (DashScope) (Rerank), Ollama (native /api/chat and /api/generate), OpenAI-compatible gateways (LiteLLM, vLLM, LocalAI, OpenRouter, Ollama /v1/), and vector retrieval providers (Pinecone, Qdrant, Milvus, Zilliz, Chroma, Weaviate) |
 

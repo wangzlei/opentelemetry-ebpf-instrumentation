@@ -1368,3 +1368,47 @@ func TestTraceAttributesSelector_GenAITokenDetailAvailability(t *testing.T) {
 		})
 	}
 }
+
+func TestTraceAttributesSelector_AWSLambda(t *testing.T) {
+	defaultAttrs, err := UserSelectedAttributes(&attributes.SelectorConfig{})
+	require.NoError(t, err)
+
+	span := &request.Span{
+		Type:     request.EventTypeHTTPClient,
+		SubType:  request.HTTPSubtypeAWSLambda,
+		Method:   "POST",
+		Path:     "/2015-03-31/functions/fn/invocations",
+		Host:     "lambda.us-west-2.amazonaws.com",
+		HostPort: 443,
+		Status:   200,
+		AWS: &request.AWS{Lambda: request.AWSLambda{
+			Meta:           request.AWSMeta{RequestID: "req-1", Region: "us-west-2"},
+			Operation:      "Invoke",
+			FunctionName:   "fn",
+			FunctionRegion: "eu-west-1",
+		}},
+	}
+	selected := AttrsToMap(TraceAttributesSelector(span, defaultAttrs))
+	for k, want := range map[string]string{
+		"rpc.system.name":       "aws-api",
+		"rpc.method":            "Lambda/Invoke",
+		"cloud.region":          "us-west-2",
+		"aws.request_id":        "req-1",
+		"faas.invoked_name":     "fn",
+		"faas.invoked_provider": "aws",
+		"faas.invoked_region":   "eu-west-1",
+	} {
+		v, ok := selected.Get(k)
+		require.True(t, ok, k)
+		assert.Equal(t, want, v.Str(), k)
+	}
+	_, ok := selected.Get("error.type")
+	assert.False(t, ok, "error.type must be omitted on success")
+
+	span.AWS.Lambda.FunctionError = "Unhandled"
+	span.AWS.Lambda.ErrorType = "ValueError"
+	selected = AttrsToMap(TraceAttributesSelector(span, defaultAttrs))
+	v, ok := selected.Get("error.type")
+	require.True(t, ok)
+	assert.Equal(t, "ValueError", v.Str())
+}

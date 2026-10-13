@@ -237,7 +237,7 @@ Per-protocol maximum bytes to capture per request per direction, sent to userspa
 
 | YAML Path | Type | Env Var | Default | Values | Deprecated | Description |
 |---|---|---|---|---|---|---|
-| `ebpf.payload_extraction.http.aws.enabled` | `boolean` | `OTEL_EBPF_HTTP_AWS_ENABLED` | `false` |  |  | Enable AWS services (S3, SQS, etc.) payload extraction and parsing |
+| `ebpf.payload_extraction.http.aws.enabled` | `boolean` | `OTEL_EBPF_HTTP_AWS_ENABLED` | `false` |  |  | Enable AWS services (S3, SQS, Lambda Invoke, etc.) payload extraction and parsing |
 
 #### `ebpf.payload_extraction.http.elasticsearch`
 

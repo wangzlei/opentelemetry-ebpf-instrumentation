@@ -206,6 +206,10 @@ func TestTraceName(t *testing.T) {
 		{name: "JSON-RPC no method", span: &Span{Type: EventTypeHTTP, SubType: HTTPSubtypeJSONRPC, JSONRPC: &JSONRPC{Version: "2.0"}}, expected: "jsonrpc"},
 		{name: "JSON-RPC client", span: &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeJSONRPC, JSONRPC: &JSONRPC{Method: "getUser", Version: "2.0"}}, expected: "getUser"},
 
+		// AWS Lambda spans
+		{name: "AWS Lambda Invoke", span: &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSLambda, AWS: &AWS{Lambda: AWSLambda{Operation: "Invoke"}}}, expected: "lambda.Invoke"},
+		{name: "AWS Lambda no operation", span: &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSLambda, AWS: &AWS{}}, expected: "lambda.Operation"},
+
 		// Other spans
 		{name: "Mongo client", span: &Span{Type: EventTypeMongoClient, Method: "find", Path: "users"}, expected: "find users"},
 		{name: "Failed connect", span: &Span{Type: EventTypeFailedConnect}, expected: "CONNECT"},
@@ -2118,6 +2122,36 @@ func TestSpan_GenAIResponseModel_OpenAICompatible(t *testing.T) {
 				},
 			}
 			assert.Equal(t, tt.want, span.GenAIResponseModel())
+		})
+	}
+}
+
+func TestSpanStatus_AWSLambda(t *testing.T) {
+	lambdaSpan := func(status int, functionError, message string) *Span {
+		return &Span{
+			Type:    EventTypeHTTPClient,
+			Status:  status,
+			SubType: HTTPSubtypeAWSLambda,
+			AWS:     &AWS{Lambda: AWSLambda{Operation: "Invoke", FunctionName: "fn", FunctionError: functionError, ErrorMessage: message}},
+		}
+	}
+	tests := []struct {
+		name            string
+		span            *Span
+		expectedCode    string
+		expectedMessage string
+	}{
+		{name: "success", span: lambdaSpan(200, "", ""), expectedCode: StatusCodeUnset},
+		{name: "async accepted", span: lambdaSpan(202, "", ""), expectedCode: StatusCodeUnset},
+		{name: "function error on HTTP 200", span: lambdaSpan(200, "Unhandled", "boom"), expectedCode: StatusCodeError, expectedMessage: "boom"},
+		{name: "client error (not found)", span: lambdaSpan(404, "", ""), expectedCode: StatusCodeError},
+		{name: "throttled", span: lambdaSpan(429, "", ""), expectedCode: StatusCodeError},
+		{name: "service error", span: lambdaSpan(502, "", ""), expectedCode: StatusCodeError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expectedCode, SpanStatusCode(tt.span))
+			assert.Equal(t, tt.expectedMessage, SpanStatusMessage(tt.span))
 		})
 	}
 }

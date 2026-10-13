@@ -187,7 +187,14 @@ func httpRequestResponseToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo, r
 
 func postProcessHTTPSpan(parseCtx *EBPFParseContext, httpSpan *request.Span, req *http.Request, resp *http.Response) request.Span {
 	if httpSpan.IsClientSpan() && parseCtx != nil && parseCtx.payloadExtraction.HTTP.AWS.Enabled {
-		span, ok := ebpfhttp.AWSS3Span(httpSpan, req, resp)
+		// Lambda first: it is matched by its exact Invoke path, while the S3
+		// parser accepts any request with S3-style request-id headers.
+		span, ok := ebpfhttp.AWSLambdaSpan(httpSpan, req, resp)
+		if ok {
+			return span
+		}
+
+		span, ok = ebpfhttp.AWSS3Span(httpSpan, req, resp)
 		if ok {
 			return span
 		}

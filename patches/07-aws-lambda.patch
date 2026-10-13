@@ -1,0 +1,1016 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wangzlei <66336933+wangzlei@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 04:31:41 +0000
+Subject: [PATCH 7/8] aws-lambda: Lambda Invoke spans in the AWS SDK payload
+ extraction
+
+Upstream's AWS payload extraction (payload_extraction.http.aws) recognises S3
+and SQS only; a Lambda Invoke call from any AWS SDK stays a plain
+"POST /2015-03-31/functions/<fn>/invocations" HTTP client span.
+
+This patch adds a third AWS parser, AWSLambdaSpan (pkg/ebpf/common/http/
+aws_lambda.go), next to aws_s3.go / aws_sqs.go and wired the same way
+(HTTPSubtypeAWSLambda, request.AWS.Lambda, span name, span getters, tracesgen):
+- matched by POST + the exact Invoke path + an AWS request id
+  (x-amzn-RequestId) in the response; other Lambda APIs (GetFunction,
+  InvokeAsync, InvokeWithResponseStream, ...) are not matched;
+- FunctionName forms: name, name:qualifier, partial ARN
+  (<account>:function:<name>[:qualifier]) and full ARN (any partition),
+  percent-encoded or not; ?Qualifier= wins over an inline qualifier;
+- span name "lambda.Invoke" (upstream convention: s3.<Op>, sqs.<Op>);
+- attributes: rpc.system.name=aws-api, rpc.method=Lambda/Invoke (fully
+  qualified like S3's "S3/<Op>", semconv v1.41 has no rpc.service),
+  cloud.region (from the endpoint host), aws.request_id,
+  faas.invoked_name (bare function name, also for ARNs),
+  faas.invoked_provider=aws, faas.invoked_region (from a full ARN, else the
+  endpoint region), error.type on failures;
+- errors: a function error is HTTP 200 + x-amz-function-error; the span gets
+  status ERROR, the runtime's errorMessage as status message and its
+  errorType (fallback: the header value) as error.type. Service errors
+  (4xx/5xx) keep the HTTP status handling and get error.type from
+  x-amzn-ErrorType (e.g. ResourceNotFoundException).
+
+Go (aws-sdk-go-v2 talks HTTP/2 to Lambda): the request is rebuilt from HTTP/2
+frames with the peer IP as Host and the Go probe's URL.Path copy (at most
+k_path_max_len = 100 bytes). So the region falls back to the host the Go probe
+reported (Request.Host / URL.Host) when the request Host is not an AWS
+endpoint, and a path cut short inside "/invocations" (full ARN + long name) is
+still accepted once the FunctionName segment is complete and at least "/i"
+follows (no other POST /2015-03-31/functions/<name>/... API starts with it).
+Known gap: Go async invocations (InvocationType=Event, HTTP/2 202 with an
+empty body) stay plain HTTP spans, because upstream's HTTP/2 response
+extraction ignores responses without a body.
+
+Lambda is tried before S3 because the S3 parser accepts any request that
+carries S3-style request-id headers, while Lambda is matched by its exact path.
+Userspace only (the request/response are already in the large HTTP buffer):
+no BPF change. Needs the same config as S3/SQS: ebpf.buffer_sizes.http > 0 and
+ebpf.payload_extraction.http.aws.enabled: true.
+
+Why upstream does not do it: upstream only implemented S3 and SQS.
+
+Turn it off: payload_extraction.http.aws.enabled: false (disables S3/SQS too),
+or drop this patch.
+
+Adot-Obi-Patch: 07-aws-lambda
+---
+ SUPPORT_MATRIX.md                            |   1 +
+ devdocs/config/CONFIG.md                     |   2 +-
+ devdocs/config/config-schema.json            |   2 +-
+ devdocs/features.md                          |   1 +
+ pkg/appolly/app/request/metric_attributes.go |   8 +
+ pkg/appolly/app/request/span.go              |  45 +++
+ pkg/appolly/app/request/span_getters.go      |  11 +-
+ pkg/appolly/app/request/span_test.go         |  34 ++
+ pkg/config/payload_extraction.go             |   2 +-
+ pkg/ebpf/common/http/aws_lambda.go           | 182 ++++++++++
+ pkg/ebpf/common/http/aws_lambda_test.go      | 356 +++++++++++++++++++
+ pkg/ebpf/common/http_transform.go            |   9 +-
+ pkg/export/otel/tracesgen/tracesgen.go       |  15 +
+ pkg/export/otel/tracesgen/tracesgen_test.go  |  44 +++
+ schemas/obi/groups/rpc.yaml                  |   4 +-
+ 15 files changed, 709 insertions(+), 7 deletions(-)
+ create mode 100644 pkg/ebpf/common/http/aws_lambda.go
+ create mode 100644 pkg/ebpf/common/http/aws_lambda_test.go
+
+diff --git a/SUPPORT_MATRIX.md b/SUPPORT_MATRIX.md
+index 79400cd4494408dbdabbd8b26509a320bc9ff48f..7d3d1ff488c96af40917615c3746c69a34c945e2 100644
+--- a/SUPPORT_MATRIX.md
++++ b/SUPPORT_MATRIX.md
+@@ -80,6 +80,7 @@ through language-specific library instrumentation documented later in this file.
+ | Opensearch | `3.0.0+` | `/_search`, `/_msearch`, `/_bulk`, `/_doc` | Yes | No | None documented |
+ | AWS S3 | All | `CreateBucket`, `DeleteBucket`, `PutObject`, `DeleteObject`, `ListBuckets`, `ListObjects`, `GetObject` | Yes | No | None documented |
+ | AWS SQS | All | All | Yes | No | None documented |
++| AWS Lambda | All | `Invoke` | Yes | No | Only the `Invoke` API; other Lambda APIs are plain HTTP client spans |
+ | SQL++ | All | All | Yes | No | None documented |
+ | GenAI | All | All | Yes | No | Supported vendors are OpenAI, Anthropic, Google AI Studio (Gemini), AWS Bedrock, Qwen (DashScope), generic embedding providers (Voyage AI, Cohere, Jina AI), Cohere (Rerank), Jina AI (Rerank), Voyage AI (Rerank), Qwen (DashScope) (Rerank), Ollama (native /api/chat and /api/generate), OpenAI-compatible gateways (LiteLLM, vLLM, LocalAI, OpenRouter, Ollama /v1/), and vector retrieval providers (Pinecone, Qdrant, Milvus, Zilliz, Chroma, Weaviate) |
+ 
+diff --git a/devdocs/config/CONFIG.md b/devdocs/config/CONFIG.md
+index 902920513e59fa3f4081b7f3c250f21a9df82d05..60b137e3ef247cfe00e4724d9bb721b11ca236e0 100644
+--- a/devdocs/config/CONFIG.md
++++ b/devdocs/config/CONFIG.md
+@@ -237,7 +237,7 @@ Per-protocol maximum bytes to capture per request per direction, sent to userspa
+ 
+ | YAML Path | Type | Env Var | Default | Values | Deprecated | Description |
+ |---|---|---|---|---|---|---|
+-| `ebpf.payload_extraction.http.aws.enabled` | `boolean` | `OTEL_EBPF_HTTP_AWS_ENABLED` | `false` |  |  | Enable AWS services (S3, SQS, etc.) payload extraction and parsing |
++| `ebpf.payload_extraction.http.aws.enabled` | `boolean` | `OTEL_EBPF_HTTP_AWS_ENABLED` | `false` |  |  | Enable AWS services (S3, SQS, Lambda Invoke, etc.) payload extraction and parsing |
+ 
+ #### `ebpf.payload_extraction.http.elasticsearch`
+ 
+diff --git a/devdocs/config/config-schema.json b/devdocs/config/config-schema.json
+index a9dba687ee7a97f883443b2fe001a4924f6d6cec..b7909e9d4f039d5068b85ce7d854ecf675cd214e 100644
+--- a/devdocs/config/config-schema.json
++++ b/devdocs/config/config-schema.json
+@@ -6,7 +6,7 @@
+       "properties": {
+         "enabled": {
+           "type": "boolean",
+-          "description": "Enable AWS services (S3, SQS, etc.) payload extraction and parsing",
++          "description": "Enable AWS services (S3, SQS, Lambda Invoke, etc.) payload extraction and parsing",
+           "default": false,
+           "x-env-var": "OTEL_EBPF_HTTP_AWS_ENABLED"
+         }
+diff --git a/devdocs/features.md b/devdocs/features.md
+index 01b617dd9a7f398503b607c0ac3c107da8f780c3..41e31dcebac9208f11bddb69d7dd69a70de8bda1 100644
+--- a/devdocs/features.md
++++ b/devdocs/features.md
+@@ -27,6 +27,7 @@ through language-specific library instrumentation documented later in this file.
+ | Opensearch    |    All    |      3.0.0+ | /_search, /_msearch, /_bulk, /_doc                                                       |  Yes   |                 No |                                                                                                                             N/A
+ | AWS S3        |    All    |         All | CreateBucket, DeleteBucket, PutObject, DeleteObject, ListBuckets, ListObjects, GetObject |  Yes   |                 No |                                                                                                                             N/A
+ | AWS SQS       |    All    |         All | All                                                                                      |  Yes   |                 No |                                                                                                                             N/A
++| AWS Lambda    |    All    |         All | Invoke                                                                                   |  Yes   |                 No |                                                                     Only the Invoke API; other Lambda APIs are plain HTTP spans
+ | SQL++         |    All    |         All | All                                                                                      |  Yes   |                 No |                                                                                                                             N/A
+ | GenAI         |    All    |         All | All                                                                                      |  Yes   |                 No |                                                   Supported vendors: OpenAI, Anthropic, Google AI Studio (Gemini), AWS Bedrock, Qwen (DashScope), generic embedding providers (Voyage AI, Cohere, Jina AI), Cohere (Rerank), Jina AI (Rerank), Voyage AI (Rerank), Qwen (DashScope) (Rerank), Ollama (native /api/chat and /api/generate), OpenAI-compatible gateways (LiteLLM, vLLM, LocalAI, OpenRouter, Ollama /v1/), vector retrieval (Pinecone, Qdrant, Milvus, Zilliz, Chroma, Weaviate)
+ 
+diff --git a/pkg/appolly/app/request/metric_attributes.go b/pkg/appolly/app/request/metric_attributes.go
+index b19afd368e2acdd568d70906d91223ffc1dac7d7..96bf2f639eb499cd701b7e8c32d02d30b12e1e80 100644
+--- a/pkg/appolly/app/request/metric_attributes.go
++++ b/pkg/appolly/app/request/metric_attributes.go
+@@ -189,6 +189,14 @@ func S3RPCMethod(method string) string {
+ 	return "S3/" + method
+ }
+ 
++// LambdaRPCMethod returns the fully-qualified rpc.method value for AWS Lambda operations.
++func LambdaRPCMethod(operation string) string {
++	if operation == "" {
++		return ""
++	}
++	return "Lambda/" + operation
++}
++
+ func AWSRequestID(val string) attribute.KeyValue {
+ 	return attribute.Key(attr.AWSRequestID).String(val)
+ }
+diff --git a/pkg/appolly/app/request/span.go b/pkg/appolly/app/request/span.go
+index 173ef5dde0f51c2e8f8ed1043b3739ace91cb70a..943a2d9cbdd218f5cbdea14d130c0d02639bc9b3 100644
+--- a/pkg/appolly/app/request/span.go
++++ b/pkg/appolly/app/request/span.go
+@@ -114,6 +114,7 @@ const (
+ 	HTTPSubtypeRetrieval        = 15 // http + vector retrieval (Pinecone, Qdrant, Milvus, Chroma, Weaviate, etc.)
+ 	HTTPSubtypeOpenAICompatible = 16 // http + OpenAI-compatible API (custom provider)
+ 	HTTPSubtypeOllama           = 17 // http + Ollama native API
++	HTTPSubtypeAWSLambda        = 18 // http + aws lambda (Invoke)
+ )
+ 
+ func IsGenAISubtype(subtype int) bool {
+@@ -260,6 +261,8 @@ type AWS struct {
+ 	S3 AWSS3 `json:"s3"`
+ 	// https://opentelemetry.io/docs/specs/semconv/messaging/sqs/
+ 	SQS AWSSQS `json:"sqs"`
++	// https://opentelemetry.io/docs/specs/semconv/faas/faas-spans/#outgoing-invocations
++	Lambda AWSLambda `json:"lambda"`
+ }
+ 
+ type AWSMeta struct {
+@@ -284,6 +287,23 @@ type AWSSQS struct {
+ 	MessageID     string  `json:"messageId"`
+ }
+ 
++type AWSLambda struct {
++	Meta      AWSMeta `json:"meta"`
++	Operation string  `json:"operation"`
++	// FunctionName is the bare function name, also when the call used a
++	// (partial) ARN; Qualifier is the version or alias, if any.
++	FunctionName    string `json:"functionName"`
++	Qualifier       string `json:"qualifier"`
++	FunctionRegion  string `json:"functionRegion"`
++	InvocationType  string `json:"invocationType"`
++	ExecutedVersion string `json:"executedVersion"`
++	// FunctionError is the x-amz-function-error response header (the
++	// function failed although the call returned HTTP 200).
++	FunctionError string `json:"functionError"`
++	ErrorType     string `json:"errorType"`
++	ErrorMessage  string `json:"errorMessage"`
++}
++
+ type GenAI struct {
+ 	OpenAI    *VendorOpenAI
+ 	Anthropic *VendorAnthropic
+@@ -1463,6 +1483,16 @@ func spanAttributes(s *Span) SpanAttributes {
+ 			attrs["awsSQSQueueURL"] = sqs.QueueURL
+ 			attrs["awsSQSMessageID"] = sqs.MessageID
+ 		}
++		if s.SubType == HTTPSubtypeAWSLambda && s.AWS != nil {
++			lambda := s.AWS.Lambda
++			attrs["awsRequestID"] = lambda.Meta.RequestID
++			attrs["awsRegion"] = lambda.Meta.Region
++			attrs["awsLambdaOperation"] = lambda.Operation
++			attrs["awsLambdaFunctionName"] = lambda.FunctionName
++			attrs["awsLambdaQualifier"] = lambda.Qualifier
++			attrs["awsLambdaFunctionRegion"] = lambda.FunctionRegion
++			attrs["awsLambdaFunctionError"] = lambda.FunctionError
++		}
+ 		if s.SubType == HTTPSubtypeSQLPP {
+ 			attrs["dbCollectionName"] = s.Route
+ 			attrs["dbOperationName"] = s.Method
+@@ -1786,6 +1816,9 @@ func SpanStatusMessage(span *Span) string {
+ 		if span.SubType == HTTPSubtypeMCP && span.GenAI != nil && span.GenAI.MCP != nil && span.GenAI.MCP.ErrorMessage != "" {
+ 			return span.GenAI.MCP.ErrorMessage
+ 		}
++		if span.SubType == HTTPSubtypeAWSLambda && span.AWS != nil && span.AWS.Lambda.FunctionError != "" {
++			return span.AWS.Lambda.ErrorMessage
++		}
+ 	case EventTypeDNS:
+ 		if span.Status != 0 {
+ 			return dnsparser.RCode(span.Status).String()
+@@ -1811,6 +1844,10 @@ func HTTPSpanStatusCode(span *Span) string {
+ 	}
+ 
+ 	if span.Type == EventTypeHTTPClient {
++		// Lambda function errors come back as HTTP 200 + x-amz-function-error.
++		if span.SubType == HTTPSubtypeAWSLambda && span.AWS != nil && span.AWS.Lambda.FunctionError != "" {
++			return StatusCodeError
++		}
+ 		if span.Status < 400 {
+ 			// this is possibly not needed, because in my experiments they
+ 			// respond with 429, but just to be correct according to the OTel
+@@ -1986,6 +2023,14 @@ func (s *Span) TraceName() string {
+ 			}
+ 		}
+ 
++		if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSLambda && s.AWS != nil {
++			if s.AWS.Lambda.Operation != "" {
++				return "lambda." + s.AWS.Lambda.Operation
++			} else {
++				return "lambda.Operation"
++			}
++		}
++
+ 		if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeSQLPP {
+ 			dbOperationName := s.Method
+ 			if dbOperationName == "" {
+diff --git a/pkg/appolly/app/request/span_getters.go b/pkg/appolly/app/request/span_getters.go
+index b6b82f5c7337d241bcf62d46c20c19cf02c40f2c..634664b880cb3aaf9b73d379b9052b59cf524a07 100644
+--- a/pkg/appolly/app/request/span_getters.go
++++ b/pkg/appolly/app/request/span_getters.go
+@@ -103,6 +103,9 @@ func spanOTELGetters(name attr.Name) (attributes.Getter[*Span, attribute.KeyValu
+ 			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSS3 && s.AWS != nil {
+ 				return semconv.RPCMethod(S3RPCMethod(s.AWS.S3.Method))
+ 			}
++			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSLambda && s.AWS != nil {
++				return semconv.RPCMethod(LambdaRPCMethod(s.AWS.Lambda.Operation))
++			}
+ 			return semconv.RPCMethod(s.Path)
+ 		}
+ 	case attr.RPCSystem:
+@@ -113,7 +116,7 @@ func spanOTELGetters(name attr.Name) (attributes.Getter[*Span, attribute.KeyValu
+ 			if s.SubType == HTTPSubtypeJSONRPC {
+ 				return semconv.RPCSystemNameJSONRPC
+ 			}
+-			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSS3 {
++			if s.Type == EventTypeHTTPClient && (s.SubType == HTTPSubtypeAWSS3 || s.SubType == HTTPSubtypeAWSLambda) {
+ 				return RPCSystem("aws-api")
+ 			}
+ 			return semconv.RPCSystemNameGRPC
+@@ -387,6 +390,9 @@ func spanOTELGetters(name attr.Name) (attributes.Getter[*Span, attribute.KeyValu
+ 			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSSQS && s.AWS != nil {
+ 				return AWSRequestID(s.AWS.SQS.Meta.RequestID)
+ 			}
++			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSLambda && s.AWS != nil {
++				return AWSRequestID(s.AWS.Lambda.Meta.RequestID)
++			}
+ 			return AWSRequestID("")
+ 		}
+ 	case attr.AWSExtendedRequestID:
+@@ -425,6 +431,9 @@ func spanOTELGetters(name attr.Name) (attributes.Getter[*Span, attribute.KeyValu
+ 			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSSQS && s.AWS != nil {
+ 				return CloudRegion(s.AWS.SQS.Meta.Region)
+ 			}
++			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSLambda && s.AWS != nil {
++				return CloudRegion(s.AWS.Lambda.Meta.Region)
++			}
+ 			return CloudRegion("")
+ 		}
+ 	case attr.DNSQuestionName:
+diff --git a/pkg/appolly/app/request/span_test.go b/pkg/appolly/app/request/span_test.go
+index da401d394204ef94168921fb4d033040449b4059..a6d5a7ec6f1a797507864d0cbc9b26e3668e4354 100644
+--- a/pkg/appolly/app/request/span_test.go
++++ b/pkg/appolly/app/request/span_test.go
+@@ -206,6 +206,10 @@ func TestTraceName(t *testing.T) {
+ 		{name: "JSON-RPC no method", span: &Span{Type: EventTypeHTTP, SubType: HTTPSubtypeJSONRPC, JSONRPC: &JSONRPC{Version: "2.0"}}, expected: "jsonrpc"},
+ 		{name: "JSON-RPC client", span: &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeJSONRPC, JSONRPC: &JSONRPC{Method: "getUser", Version: "2.0"}}, expected: "getUser"},
+ 
++		// AWS Lambda spans
++		{name: "AWS Lambda Invoke", span: &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSLambda, AWS: &AWS{Lambda: AWSLambda{Operation: "Invoke"}}}, expected: "lambda.Invoke"},
++		{name: "AWS Lambda no operation", span: &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSLambda, AWS: &AWS{}}, expected: "lambda.Operation"},
++
+ 		// Other spans
+ 		{name: "Mongo client", span: &Span{Type: EventTypeMongoClient, Method: "find", Path: "users"}, expected: "find users"},
+ 		{name: "Failed connect", span: &Span{Type: EventTypeFailedConnect}, expected: "CONNECT"},
+@@ -2121,3 +2125,33 @@ func TestSpan_GenAIResponseModel_OpenAICompatible(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestSpanStatus_AWSLambda(t *testing.T) {
++	lambdaSpan := func(status int, functionError, message string) *Span {
++		return &Span{
++			Type:    EventTypeHTTPClient,
++			Status:  status,
++			SubType: HTTPSubtypeAWSLambda,
++			AWS:     &AWS{Lambda: AWSLambda{Operation: "Invoke", FunctionName: "fn", FunctionError: functionError, ErrorMessage: message}},
++		}
++	}
++	tests := []struct {
++		name            string
++		span            *Span
++		expectedCode    string
++		expectedMessage string
++	}{
++		{name: "success", span: lambdaSpan(200, "", ""), expectedCode: StatusCodeUnset},
++		{name: "async accepted", span: lambdaSpan(202, "", ""), expectedCode: StatusCodeUnset},
++		{name: "function error on HTTP 200", span: lambdaSpan(200, "Unhandled", "boom"), expectedCode: StatusCodeError, expectedMessage: "boom"},
++		{name: "client error (not found)", span: lambdaSpan(404, "", ""), expectedCode: StatusCodeError},
++		{name: "throttled", span: lambdaSpan(429, "", ""), expectedCode: StatusCodeError},
++		{name: "service error", span: lambdaSpan(502, "", ""), expectedCode: StatusCodeError},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			assert.Equal(t, tt.expectedCode, SpanStatusCode(tt.span))
++			assert.Equal(t, tt.expectedMessage, SpanStatusMessage(tt.span))
++		})
++	}
++}
+diff --git a/pkg/config/payload_extraction.go b/pkg/config/payload_extraction.go
+index 0125d114f4d8e413868278d5ca7b63f318fc805c..3c51602c9d73de60d36dc34ea08e2235ef3bcbf6 100644
+--- a/pkg/config/payload_extraction.go
++++ b/pkg/config/payload_extraction.go
+@@ -66,7 +66,7 @@ type GraphQLConfig struct {
+ }
+ 
+ type AWSConfig struct {
+-	// Enable AWS services (S3, SQS, etc.) payload extraction and parsing
++	// Enable AWS services (S3, SQS, Lambda Invoke, etc.) payload extraction and parsing
+ 	Enabled bool `yaml:"enabled" env:"OTEL_EBPF_HTTP_AWS_ENABLED" validate:"boolean"`
+ }
+ 
+diff --git a/pkg/ebpf/common/http/aws_lambda.go b/pkg/ebpf/common/http/aws_lambda.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..4928e0764995769de95527f93fb4b2e6cbe3ac43
+--- /dev/null
++++ b/pkg/ebpf/common/http/aws_lambda.go
+@@ -0,0 +1,182 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package ebpfcommon // import "go.opentelemetry.io/obi/pkg/ebpf/common/http"
++
++import (
++	"bytes"
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++
++	"go.opentelemetry.io/obi/pkg/appolly/app/request"
++)
++
++const (
++	// Lambda Invoke: POST /2015-03-31/functions/{FunctionName}/invocations[?Qualifier=...]
++	lambdaInvokePathPrefix = "/2015-03-31/functions/"
++	lambdaInvokePathSuffix = "/invocations"
++	// shortest accepted remainder of a truncated Invoke path: no other
++	// POST /2015-03-31/functions/<name>/... API starts with it
++	lambdaTruncatedSuffixMin = "/i"
++
++	lambdaFunctionErrorHeader = "x-amz-function-error"
++	lambdaExecutedVersion     = "x-amz-executed-version"
++	lambdaInvocationType      = "x-amz-invocation-type"
++	amznErrorTypeHeader       = "x-amzn-errortype"
++)
++
++// awsLambdaErrorPayload is the body Lambda returns for a function error
++// (x-amz-function-error: Unhandled|Handled), in every managed runtime.
++type awsLambdaErrorPayload struct {
++	ErrorMessage string `json:"errorMessage"`
++	ErrorType    string `json:"errorType"`
++}
++
++// AWSLambdaSpan recognizes an AWS Lambda Invoke call (any SDK, any language:
++// the operation is fully identified by method + path) and enriches the HTTP
++// client span with the invoked function. Other Lambda APIs are not handled.
++func AWSLambdaSpan(baseSpan *request.Span, req *http.Request, resp *http.Response) (request.Span, bool) {
++	lambda, err := parseAWSLambda(req, resp, request.HostFromSchemeHost(baseSpan))
++	if err != nil {
++		return *baseSpan, false
++	}
++
++	// https://opentelemetry.io/docs/specs/semconv/faas/faas-spans/#outgoing-invocations
++	baseSpan.SubType = request.HTTPSubtypeAWSLambda
++	baseSpan.AWS = &request.AWS{
++		Lambda: lambda,
++	}
++
++	return *baseSpan, true
++}
++
++// parseAWSLambda parses an Invoke call. spanHost is the host the client
++// instrumentation reported (Go: Request.Host / URL.Host); it stands in for the
++// Host of requests rebuilt from HTTP/2 frames, which carry the peer IP instead.
++func parseAWSLambda(req *http.Request, resp *http.Response, spanHost string) (request.AWSLambda, error) {
++	lambda := request.AWSLambda{}
++
++	if req.Method != http.MethodPost || req.URL == nil {
++		return lambda, errors.New("not a Lambda Invoke request")
++	}
++	functionID, ok := lambdaInvokeFunctionID(req.URL)
++	if !ok {
++		return lambda, errors.New("not a Lambda Invoke request")
++	}
++
++	var err error
++	lambda.Meta, err = parseAWSMeta(req, resp)
++	if err != nil {
++		return lambda, err
++	}
++	if spanHost != "" && !awsRegionURLRgx.MatchString(req.Host) {
++		lambda.Meta.Region = parseAWSRegion(&http.Request{Host: spanHost})
++	}
++
++	lambda.Operation = "Invoke"
++	lambda.FunctionName, lambda.Qualifier, lambda.FunctionRegion = parseLambdaFunctionID(functionID)
++	if lambda.FunctionName == "" {
++		return lambda, errors.New("missing Lambda function name")
++	}
++	if q := req.URL.Query().Get("Qualifier"); q != "" {
++		lambda.Qualifier = q
++	}
++	if lambda.FunctionRegion == "" {
++		lambda.FunctionRegion = lambda.Meta.Region
++	}
++	lambda.InvocationType = req.Header.Get(lambdaInvocationType)
++	lambda.ExecutedVersion = resp.Header.Get(lambdaExecutedVersion)
++
++	// Service errors (throttling, missing function, ...): HTTP 4xx/5xx and
++	// x-amzn-ErrorType: <ExceptionName>[:<namespace>].
++	if resp.StatusCode >= http.StatusBadRequest {
++		lambda.ErrorType, _, _ = strings.Cut(resp.Header.Get(amznErrorTypeHeader), ":")
++	}
++
++	// Function errors: HTTP 200 with x-amz-function-error and the runtime's
++	// error payload as the response body.
++	lambda.FunctionError = resp.Header.Get(lambdaFunctionErrorHeader)
++	if lambda.FunctionError != "" && resp.Body != nil {
++		respB, err := io.ReadAll(resp.Body)
++		if err == nil {
++			resp.Body = io.NopCloser(bytes.NewBuffer(respB))
++			var p awsLambdaErrorPayload
++			if json.Unmarshal(respB, &p) == nil {
++				lambda.ErrorType = p.ErrorType
++				lambda.ErrorMessage = p.ErrorMessage
++			}
++		}
++		if lambda.ErrorType == "" {
++			lambda.ErrorType = lambda.FunctionError
++		}
++	}
++
++	return lambda, nil
++}
++
++// lambdaInvokeFunctionID returns the (unescaped) FunctionName path segment
++// of an Invoke request: a name, a partial ARN or a full ARN, optionally
++// followed by ":<qualifier>".
++//
++// The path may be cut short: the Go probes copy at most k_path_max_len
++// (100) bytes of URL.Path, and Go requests rebuilt from HTTP/2 frames use
++// that copy, so a full ARN with a long name loses the end of "/invocations".
++// A path is still accepted when the FunctionName segment is complete and
++// what follows is a prefix of "/invocations" long enough to tell it from the
++// other /functions/<name>/... APIs.
++func lambdaInvokeFunctionID(u *url.URL) (string, bool) {
++	p, ok := strings.CutPrefix(u.EscapedPath(), lambdaInvokePathPrefix)
++	if !ok {
++		return "", false
++	}
++	seg, rest, ok := strings.Cut(p, "/")
++	rest = "/" + rest
++	if !ok || seg == "" || len(rest) < len(lambdaTruncatedSuffixMin) || !strings.HasPrefix(lambdaInvokePathSuffix, rest) {
++		return "", false
++	}
++	id, err := url.PathUnescape(seg)
++	if err != nil || id == "" {
++		return "", false
++	}
++	return id, true
++}
++
++// parseLambdaFunctionID splits the FunctionName parameter of Invoke into the
++// function name, the qualifier (version or alias) and, for a full ARN, the
++// function's region. Accepted forms (https://docs.aws.amazon.com/lambda/latest/api/API_Invoke.html):
++//
++//	my-function                                                  => my-function, "", ""
++//	my-function:prod                                             => my-function, prod, ""
++//	123456789012:function:my-function[:prod]                     => my-function, prod, ""
++//	arn:aws:lambda:us-west-2:123456789012:function:my-function   => my-function, "", us-west-2
++//	arn:aws:lambda:us-west-2:123456789012:function:my-function:7 => my-function, 7, us-west-2
++func parseLambdaFunctionID(id string) (name, qualifier, region string) {
++	parts := strings.Split(id, ":")
++	switch {
++	case len(parts) >= 7 && parts[0] == "arn" && parts[2] == "lambda" && parts[5] == "function":
++		// arn:<partition>:lambda:<region>:<account>:function:<name>[:<qualifier>]
++		name, region = parts[6], parts[3]
++		if len(parts) >= 8 {
++			qualifier = parts[7]
++		}
++	case len(parts) >= 3 && parts[1] == "function":
++		// <account>:function:<name>[:<qualifier>]
++		name = parts[2]
++		if len(parts) >= 4 {
++			qualifier = parts[3]
++		}
++	case len(parts) <= 2:
++		name = parts[0]
++		if len(parts) == 2 {
++			qualifier = parts[1]
++		}
++	}
++	if region != "" && !isAWSRegion(region) {
++		region = ""
++	}
++	return name, qualifier, region
++}
+diff --git a/pkg/ebpf/common/http/aws_lambda_test.go b/pkg/ebpf/common/http/aws_lambda_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..fa8aa021a25ae5acfa08b788b66adc0e7cfc6449
+--- /dev/null
++++ b/pkg/ebpf/common/http/aws_lambda_test.go
+@@ -0,0 +1,356 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++package ebpfcommon
++
++import (
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"go.opentelemetry.io/obi/pkg/appolly/app/request"
++)
++
++func lambdaReq(t *testing.T, method, rawURL string) *http.Request {
++	t.Helper()
++	r, err := http.NewRequest(method, rawURL, io.NopCloser(strings.NewReader(`{"k":"v"}`)))
++	require.NoError(t, err)
++	return r
++}
++
++func lambdaResp(status int, headers map[string]string, body string) *http.Response {
++	r := &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}
++	for k, v := range headers {
++		r.Header.Set(k, v)
++	}
++	return r
++}
++
++func TestParseAWSLambda(t *testing.T) {
++	okHeaders := map[string]string{"x-amzn-RequestId": "6b2f2c1a-0000-4000-8000-000000000001", "X-Amz-Executed-Version": "$LATEST"}
++
++	tests := []struct {
++		name     string
++		req      *http.Request
++		resp     *http.Response
++		spanHost string
++		want     request.AWSLambda
++		wantErr  bool
++	}{
++		{
++			name: "function name",
++			req:  lambdaReq(t, http.MethodPost, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/my-function/invocations"),
++			resp: lambdaResp(http.StatusOK, okHeaders, `{"ok":true}`),
++			want: request.AWSLambda{
++				Meta:            request.AWSMeta{RequestID: "6b2f2c1a-0000-4000-8000-000000000001", Region: "us-west-2"},
++				Operation:       "Invoke",
++				FunctionName:    "my-function",
++				FunctionRegion:  "us-west-2",
++				ExecutedVersion: "$LATEST",
++			},
++		},
++		{
++			name: "function name with qualifier query",
++			req:  lambdaReq(t, http.MethodPost, "https://lambda.eu-central-1.amazonaws.com/2015-03-31/functions/my-function/invocations?Qualifier=prod"),
++			resp: lambdaResp(http.StatusOK, okHeaders, ``),
++			want: request.AWSLambda{
++				Meta:            request.AWSMeta{RequestID: "6b2f2c1a-0000-4000-8000-000000000001", Region: "eu-central-1"},
++				Operation:       "Invoke",
++				FunctionName:    "my-function",
++				Qualifier:       "prod",
++				FunctionRegion:  "eu-central-1",
++				ExecutedVersion: "$LATEST",
++			},
++		},
++		{
++			name: "function name with inline qualifier",
++			req:  lambdaReq(t, http.MethodPost, "https://lambda.us-east-2.amazonaws.com/2015-03-31/functions/my-function%3A7/invocations"),
++			resp: lambdaResp(http.StatusOK, okHeaders, ``),
++			want: request.AWSLambda{
++				Meta:            request.AWSMeta{RequestID: "6b2f2c1a-0000-4000-8000-000000000001", Region: "us-east-2"},
++				Operation:       "Invoke",
++				FunctionName:    "my-function",
++				Qualifier:       "7",
++				FunctionRegion:  "us-east-2",
++				ExecutedVersion: "$LATEST",
++			},
++		},
++		{
++			name: "full ARN (percent-encoded) in another region",
++			req:  lambdaReq(t, http.MethodPost, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/arn%3Aaws%3Alambda%3Aap-southeast-1%3A123456789012%3Afunction%3Amy-function/invocations"),
++			resp: lambdaResp(http.StatusOK, okHeaders, ``),
++			want: request.AWSLambda{
++				Meta:            request.AWSMeta{RequestID: "6b2f2c1a-0000-4000-8000-000000000001", Region: "us-west-2"},
++				Operation:       "Invoke",
++				FunctionName:    "my-function",
++				FunctionRegion:  "ap-southeast-1",
++				ExecutedVersion: "$LATEST",
++			},
++		},
++		{
++			name: "full ARN with alias, unescaped colons",
++			req:  lambdaReq(t, http.MethodPost, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/arn:aws:lambda:us-west-2:123456789012:function:my-function:live/invocations"),
++			resp: lambdaResp(http.StatusOK, okHeaders, ``),
++			want: request.AWSLambda{
++				Meta:            request.AWSMeta{RequestID: "6b2f2c1a-0000-4000-8000-000000000001", Region: "us-west-2"},
++				Operation:       "Invoke",
++				FunctionName:    "my-function",
++				Qualifier:       "live",
++				FunctionRegion:  "us-west-2",
++				ExecutedVersion: "$LATEST",
++			},
++		},
++		{
++			name: "China partition ARN",
++			req:  lambdaReq(t, http.MethodPost, "https://lambda.cn-north-1.amazonaws.com.cn/2015-03-31/functions/arn%3Aaws-cn%3Alambda%3Acn-north-1%3A123456789012%3Afunction%3Afn/invocations"),
++			resp: lambdaResp(http.StatusOK, okHeaders, ``),
++			want: request.AWSLambda{
++				Meta:            request.AWSMeta{RequestID: "6b2f2c1a-0000-4000-8000-000000000001", Region: "cn-north-1"},
++				Operation:       "Invoke",
++				FunctionName:    "fn",
++				FunctionRegion:  "cn-north-1",
++				ExecutedVersion: "$LATEST",
++			},
++		},
++		{
++			name: "partial ARN with version",
++			req:  lambdaReq(t, http.MethodPost, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/123456789012%3Afunction%3Amy-function%3A3/invocations"),
++			resp: lambdaResp(http.StatusOK, okHeaders, ``),
++			want: request.AWSLambda{
++				Meta:            request.AWSMeta{RequestID: "6b2f2c1a-0000-4000-8000-000000000001", Region: "us-west-2"},
++				Operation:       "Invoke",
++				FunctionName:    "my-function",
++				Qualifier:       "3",
++				FunctionRegion:  "us-west-2",
++				ExecutedVersion: "$LATEST",
++			},
++		},
++		{
++			name: "asynchronous invocation",
++			req: func() *http.Request {
++				r := lambdaReq(t, http.MethodPost, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/my-function/invocations")
++				r.Header.Set("X-Amz-Invocation-Type", "Event")
++				return r
++			}(),
++			resp: lambdaResp(http.StatusAccepted, map[string]string{"X-Amzn-Requestid": "req-async"}, ``),
++			want: request.AWSLambda{
++				Meta:           request.AWSMeta{RequestID: "req-async", Region: "us-west-2"},
++				Operation:      "Invoke",
++				FunctionName:   "my-function",
++				FunctionRegion: "us-west-2",
++				InvocationType: "Event",
++			},
++		},
++		{
++			name: "unhandled function error",
++			req:  lambdaReq(t, http.MethodPost, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/my-function/invocations"),
++			resp: lambdaResp(http.StatusOK, map[string]string{"x-amzn-RequestId": "req-err", "X-Amz-Function-Error": "Unhandled"},
++				`{"errorMessage": "boom", "errorType": "ValueError", "requestId": "req-err", "stackTrace": ["  File \"/var/task/app.py\""]}`),
++			want: request.AWSLambda{
++				Meta:           request.AWSMeta{RequestID: "req-err", Region: "us-west-2"},
++				Operation:      "Invoke",
++				FunctionName:   "my-function",
++				FunctionRegion: "us-west-2",
++				FunctionError:  "Unhandled",
++				ErrorType:      "ValueError",
++				ErrorMessage:   "boom",
++			},
++		},
++		{
++			name: "function error with truncated payload",
++			req:  lambdaReq(t, http.MethodPost, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/my-function/invocations"),
++			resp: lambdaResp(http.StatusOK, map[string]string{"x-amzn-RequestId": "req-err", "X-Amz-Function-Error": "Unhandled"}, `{"errorMessage": "bo`),
++			want: request.AWSLambda{
++				Meta:           request.AWSMeta{RequestID: "req-err", Region: "us-west-2"},
++				Operation:      "Invoke",
++				FunctionName:   "my-function",
++				FunctionRegion: "us-west-2",
++				FunctionError:  "Unhandled",
++				ErrorType:      "Unhandled",
++			},
++		},
++		{
++			name: "service error: function not found",
++			req:  lambdaReq(t, http.MethodPost, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/missing/invocations"),
++			resp: lambdaResp(http.StatusNotFound, map[string]string{
++				"x-amzn-RequestId": "req-404",
++				"x-amzn-ErrorType": "ResourceNotFoundException:http://internal.amazon.com/coral/com.amazonaws.awslambda/",
++			}, `{"Type":"User","message":"Function not found"}`),
++			want: request.AWSLambda{
++				Meta:           request.AWSMeta{RequestID: "req-404", Region: "us-west-2"},
++				Operation:      "Invoke",
++				FunctionName:   "missing",
++				FunctionRegion: "us-west-2",
++				ErrorType:      "ResourceNotFoundException",
++			},
++		},
++		{
++			// Go over HTTP/2: the request is rebuilt from frames with the peer IP as
++			// Host and the probe's (truncated) URL.Path copy.
++			name: "HTTP/2 request: span host and truncated path",
++			req: func() *http.Request {
++				r := lambdaReq(t, http.MethodPost, "https://18.246.199.104/2015-03-31/functions/arn:aws:lambda:us-west-2:123456789012:function:obi-lambda-test:live/i")
++				r.Host = "18.246.199.104"
++				return r
++			}(),
++			resp:     lambdaResp(http.StatusOK, okHeaders, ``),
++			spanHost: "lambda.us-west-2.amazonaws.com",
++			want: request.AWSLambda{
++				Meta:            request.AWSMeta{RequestID: "6b2f2c1a-0000-4000-8000-000000000001", Region: "us-west-2"},
++				Operation:       "Invoke",
++				FunctionName:    "obi-lambda-test",
++				Qualifier:       "live",
++				FunctionRegion:  "us-west-2",
++				ExecutedVersion: "$LATEST",
++			},
++		},
++		{
++			name:     "span host does not override an AWS endpoint host",
++			req:      lambdaReq(t, http.MethodPost, "https://lambda.eu-west-1.amazonaws.com/2015-03-31/functions/fn/invocation"),
++			resp:     lambdaResp(http.StatusOK, okHeaders, ``),
++			spanHost: "lambda.us-west-2.amazonaws.com",
++			want: request.AWSLambda{
++				Meta:            request.AWSMeta{RequestID: "6b2f2c1a-0000-4000-8000-000000000001", Region: "eu-west-1"},
++				Operation:       "Invoke",
++				FunctionName:    "fn",
++				FunctionRegion:  "eu-west-1",
++				ExecutedVersion: "$LATEST",
++			},
++		},
++		{
++			name:    "truncated path too short to be Invoke",
++			req:     lambdaReq(t, http.MethodPost, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/my-function/"),
++			resp:    lambdaResp(http.StatusOK, okHeaders, ``),
++			wantErr: true,
++		},
++		{
++			name:    "other Lambda API: PublishVersion",
++			req:     lambdaReq(t, http.MethodPost, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/my-function/versions"),
++			resp:    lambdaResp(http.StatusCreated, okHeaders, `{}`),
++			wantErr: true,
++		},
++		{
++			name:    "invocations followed by more path",
++			req:     lambdaReq(t, http.MethodPost, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/my-function/invocations/x"),
++			resp:    lambdaResp(http.StatusOK, okHeaders, ``),
++			wantErr: true,
++		},
++		{
++			name:    "missing request id",
++			req:     lambdaReq(t, http.MethodPost, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/my-function/invocations"),
++			resp:    lambdaResp(http.StatusOK, nil, ``),
++			wantErr: true,
++		},
++		{
++			name:    "other Lambda API: GetFunction",
++			req:     lambdaReq(t, http.MethodGet, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/my-function"),
++			resp:    lambdaResp(http.StatusOK, okHeaders, `{}`),
++			wantErr: true,
++		},
++		{
++			name:    "other Lambda API: InvokeAsync",
++			req:     lambdaReq(t, http.MethodPost, "https://lambda.us-west-2.amazonaws.com/2014-11-13/functions/my-function/invoke-async/"),
++			resp:    lambdaResp(http.StatusAccepted, okHeaders, ``),
++			wantErr: true,
++		},
++		{
++			name:    "other Lambda API: InvokeWithResponseStream",
++			req:     lambdaReq(t, http.MethodPost, "https://lambda.us-west-2.amazonaws.com/2021-11-15/functions/my-function/response-streaming-invocations"),
++			resp:    lambdaResp(http.StatusOK, okHeaders, ``),
++			wantErr: true,
++		},
++		{
++			name:    "GET on the invocations path",
++			req:     lambdaReq(t, http.MethodGet, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/my-function/invocations"),
++			resp:    lambdaResp(http.StatusOK, okHeaders, ``),
++			wantErr: true,
++		},
++		{
++			name:    "empty function name",
++			req:     lambdaReq(t, http.MethodPost, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions//invocations"),
++			resp:    lambdaResp(http.StatusOK, okHeaders, ``),
++			wantErr: true,
++		},
++		{
++			name:    "nested path",
++			req:     lambdaReq(t, http.MethodPost, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/a/b/invocations"),
++			resp:    lambdaResp(http.StatusOK, okHeaders, ``),
++			wantErr: true,
++		},
++		{
++			name:    "SQS request",
++			req:     lambdaReq(t, http.MethodPost, "https://sqs.us-east-1.amazonaws.com/"),
++			resp:    lambdaResp(http.StatusOK, map[string]string{"x-amzn-RequestId": "req-sqs"}, `{}`),
++			wantErr: true,
++		},
++		{
++			name:    "S3 request",
++			req:     lambdaReq(t, http.MethodPut, "https://my-bucket.s3.us-west-2.amazonaws.com/key"),
++			resp:    lambdaResp(http.StatusOK, map[string]string{"x-amz-request-id": "r", "x-amz-id-2": "e"}, ``),
++			wantErr: true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got, err := parseAWSLambda(tt.req, tt.resp, tt.spanHost)
++			if tt.wantErr {
++				assert.Error(t, err)
++				return
++			}
++			require.NoError(t, err)
++			assert.Equal(t, tt.want, got)
++		})
++	}
++}
++
++func TestParseLambdaFunctionID(t *testing.T) {
++	tests := []struct {
++		id, name, qualifier, region string
++	}{
++		{"my-function", "my-function", "", ""},
++		{"my-function:$LATEST", "my-function", "$LATEST", ""},
++		{"123456789012:function:my-function", "my-function", "", ""},
++		{"123456789012:function:my-function:prod", "my-function", "prod", ""},
++		{"arn:aws:lambda:us-west-2:123456789012:function:my-function", "my-function", "", "us-west-2"},
++		{"arn:aws:lambda:us-west-2:123456789012:function:my-function:1", "my-function", "1", "us-west-2"},
++		{"arn:aws-us-gov:lambda:us-gov-west-1:123456789012:function:f", "f", "", "us-gov-west-1"},
++		{"a:b:c", "", "", ""},
++	}
++	for _, tt := range tests {
++		t.Run(tt.id, func(t *testing.T) {
++			name, qualifier, region := parseLambdaFunctionID(tt.id)
++			assert.Equal(t, tt.name, name)
++			assert.Equal(t, tt.qualifier, qualifier)
++			assert.Equal(t, tt.region, region)
++		})
++	}
++}
++
++func TestAWSLambdaSpan(t *testing.T) {
++	base := request.Span{Type: request.EventTypeHTTPClient, Method: http.MethodPost, Status: http.StatusOK}
++
++	req := lambdaReq(t, http.MethodPost, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/my-function/invocations")
++	resp := lambdaResp(http.StatusOK, map[string]string{"x-amzn-RequestId": "req-1"}, `{"ok":true}`)
++	span, ok := AWSLambdaSpan(&base, req, resp)
++	require.True(t, ok)
++	assert.Equal(t, request.HTTPSubtypeAWSLambda, span.SubType)
++	require.NotNil(t, span.AWS)
++	assert.Equal(t, "my-function", span.AWS.Lambda.FunctionName)
++	assert.Equal(t, "lambda.Invoke", span.TraceName())
++
++	// the response body stays readable for later parsers
++	b, err := io.ReadAll(resp.Body)
++	require.NoError(t, err)
++	assert.JSONEq(t, `{"ok":true}`, string(b))
++
++	other := request.Span{Type: request.EventTypeHTTPClient}
++	span, ok = AWSLambdaSpan(&other, lambdaReq(t, http.MethodGet, "https://example.com/"), lambdaResp(http.StatusOK, nil, ``))
++	assert.False(t, ok)
++	assert.Equal(t, request.HTTPSubtypeNone, span.SubType)
++	assert.Nil(t, span.AWS)
++}
+diff --git a/pkg/ebpf/common/http_transform.go b/pkg/ebpf/common/http_transform.go
+index aba484983f80b10894549c6c11c0da71a0c844b9..f5e4829e0ac9390a3930dc4d7f84a92c7cf35c94 100644
+--- a/pkg/ebpf/common/http_transform.go
++++ b/pkg/ebpf/common/http_transform.go
+@@ -187,7 +187,14 @@ func httpRequestResponseToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo, r
+ 
+ func postProcessHTTPSpan(parseCtx *EBPFParseContext, httpSpan *request.Span, req *http.Request, resp *http.Response) request.Span {
+ 	if httpSpan.IsClientSpan() && parseCtx != nil && parseCtx.payloadExtraction.HTTP.AWS.Enabled {
+-		span, ok := ebpfhttp.AWSS3Span(httpSpan, req, resp)
++		// Lambda first: it is matched by its exact Invoke path, while the S3
++		// parser accepts any request with S3-style request-id headers.
++		span, ok := ebpfhttp.AWSLambdaSpan(httpSpan, req, resp)
++		if ok {
++			return span
++		}
++
++		span, ok = ebpfhttp.AWSS3Span(httpSpan, req, resp)
+ 		if ok {
+ 			return span
+ 		}
+diff --git a/pkg/export/otel/tracesgen/tracesgen.go b/pkg/export/otel/tracesgen/tracesgen.go
+index 10e2814d409629f2b3a14ed73e358c7bc81b28f2..79d341835d1ef1cb5fdc0acbd6ddd4beb46801c1 100644
+--- a/pkg/export/otel/tracesgen/tracesgen.go
++++ b/pkg/export/otel/tracesgen/tracesgen.go
+@@ -718,6 +718,21 @@ func traceAttributesSelectorInternal(span *request.Span, optionalAttrs map[attr.
+ 			attrs = append(attrs, request.AWSSQSQueueURL(sqs.QueueURL))
+ 		}
+ 
++		if span.SubType == request.HTTPSubtypeAWSLambda && span.AWS != nil {
++			lambda := span.AWS.Lambda
++			attrs = append(attrs, request.RPCSystem("aws-api"))
++			attrs = append(attrs, semconv.RPCMethod(request.LambdaRPCMethod(lambda.Operation)))
++			attrs = append(attrs, semconv.CloudRegion(lambda.Meta.Region))
++			attrs = append(attrs, semconv.AWSRequestID(lambda.Meta.RequestID))
++			attrs = append(attrs, semconv.FaaSInvokedName(lambda.FunctionName))
++			attrs = append(attrs, semconv.FaaSInvokedProviderAWS)
++			attrs = append(attrs, semconv.FaaSInvokedRegion(lambda.FunctionRegion))
++			// error.type only applies to failed invocations: omit it otherwise.
++			if lambda.ErrorType != "" {
++				attrs = append(attrs, request.ErrorType(lambda.ErrorType))
++			}
++		}
++
+ 		if span.SubType == request.HTTPSubtypeOpenAI && span.GenAI != nil && span.GenAI.OpenAI != nil {
+ 			ai := span.GenAI.OpenAI
+ 			attrs = append(attrs, semconv.GenAIProviderNameOpenAI)
+diff --git a/pkg/export/otel/tracesgen/tracesgen_test.go b/pkg/export/otel/tracesgen/tracesgen_test.go
+index ad928cd542c9f8414051ef9345ec1a62ef6b24f8..08321d13009ccb196bd2e6fd245a6d5ce565ede3 100644
+--- a/pkg/export/otel/tracesgen/tracesgen_test.go
++++ b/pkg/export/otel/tracesgen/tracesgen_test.go
+@@ -1368,3 +1368,47 @@ func TestTraceAttributesSelector_GenAITokenDetailAvailability(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestTraceAttributesSelector_AWSLambda(t *testing.T) {
++	defaultAttrs, err := UserSelectedAttributes(&attributes.SelectorConfig{})
++	require.NoError(t, err)
++
++	span := &request.Span{
++		Type:     request.EventTypeHTTPClient,
++		SubType:  request.HTTPSubtypeAWSLambda,
++		Method:   "POST",
++		Path:     "/2015-03-31/functions/fn/invocations",
++		Host:     "lambda.us-west-2.amazonaws.com",
++		HostPort: 443,
++		Status:   200,
++		AWS: &request.AWS{Lambda: request.AWSLambda{
++			Meta:           request.AWSMeta{RequestID: "req-1", Region: "us-west-2"},
++			Operation:      "Invoke",
++			FunctionName:   "fn",
++			FunctionRegion: "eu-west-1",
++		}},
++	}
++	selected := AttrsToMap(TraceAttributesSelector(span, defaultAttrs))
++	for k, want := range map[string]string{
++		"rpc.system.name":       "aws-api",
++		"rpc.method":            "Lambda/Invoke",
++		"cloud.region":          "us-west-2",
++		"aws.request_id":        "req-1",
++		"faas.invoked_name":     "fn",
++		"faas.invoked_provider": "aws",
++		"faas.invoked_region":   "eu-west-1",
++	} {
++		v, ok := selected.Get(k)
++		require.True(t, ok, k)
++		assert.Equal(t, want, v.Str(), k)
++	}
++	_, ok := selected.Get("error.type")
++	assert.False(t, ok, "error.type must be omitted on success")
++
++	span.AWS.Lambda.FunctionError = "Unhandled"
++	span.AWS.Lambda.ErrorType = "ValueError"
++	selected = AttrsToMap(TraceAttributesSelector(span, defaultAttrs))
++	v, ok := selected.Get("error.type")
++	require.True(t, ok)
++	assert.Equal(t, "ValueError", v.Str())
++}
+diff --git a/schemas/obi/groups/rpc.yaml b/schemas/obi/groups/rpc.yaml
+index 40c746a071e8eb22d33ff51b1dad12e3504a234a..2bf73a3b05a0984172cf9d4daeee9895aa8cd18d 100644
+--- a/schemas/obi/groups/rpc.yaml
++++ b/schemas/obi/groups/rpc.yaml
+@@ -1,6 +1,6 @@
+ groups:
+   # Overrides `rpc.system.name`: extends the upstream enum with `aws-api`,
+-  # which OBI reports for AWS SDK calls (S3, SQS, ...) detected on the wire —
++  # which OBI reports for AWS SDK calls (S3, SQS, Lambda, ...) detected on the wire —
+   # the value the AWS SDK instrumentation conventions historically used for
+   # `rpc.system`, which upstream v1.41 has no `rpc.system.name` member for.
+   # Emitters: pkg/appolly/app/request/span_getters.go (attr.RPCSystem) and
+@@ -44,7 +44,7 @@ groups:
+             - id: aws-api
+               value: 'aws-api'
+               brief: >
+-                An AWS service API call detected on the wire (S3, SQS, ...).
++                An AWS service API call detected on the wire (S3, SQS, Lambda, ...).
+                 Mirrors the `aws-api` value the AWS SDK instrumentation
+                 conventions used for the former `rpc.system` attribute.
+               stability: development

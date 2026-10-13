@@ -189,6 +189,14 @@ func S3RPCMethod(method string) string {
 	return "S3/" + method
 }
 
+// LambdaRPCMethod returns the fully-qualified rpc.method value for AWS Lambda operations.
+func LambdaRPCMethod(operation string) string {
+	if operation == "" {
+		return ""
+	}
+	return "Lambda/" + operation
+}
+
 func AWSRequestID(val string) attribute.KeyValue {
 	return attribute.Key(attr.AWSRequestID).String(val)
 }

@@ -718,6 +718,21 @@ func traceAttributesSelectorInternal(span *request.Span, optionalAttrs map[attr.
 			attrs = append(attrs, request.AWSSQSQueueURL(sqs.QueueURL))
 		}
 
+		if span.SubType == request.HTTPSubtypeAWSLambda && span.AWS != nil {
+			lambda := span.AWS.Lambda
+			attrs = append(attrs, request.RPCSystem("aws-api"))
+			attrs = append(attrs, semconv.RPCMethod(request.LambdaRPCMethod(lambda.Operation)))
+			attrs = append(attrs, semconv.CloudRegion(lambda.Meta.Region))
+			attrs = append(attrs, semconv.AWSRequestID(lambda.Meta.RequestID))
+			attrs = append(attrs, semconv.FaaSInvokedName(lambda.FunctionName))
+			attrs = append(attrs, semconv.FaaSInvokedProviderAWS)
+			attrs = append(attrs, semconv.FaaSInvokedRegion(lambda.FunctionRegion))
+			// error.type only applies to failed invocations: omit it otherwise.
+			if lambda.ErrorType != "" {
+				attrs = append(attrs, request.ErrorType(lambda.ErrorType))
+			}
+		}
+
 		if span.SubType == request.HTTPSubtypeOpenAI && span.GenAI != nil && span.GenAI.OpenAI != nil {
 			ai := span.GenAI.OpenAI
 			attrs = append(attrs, semconv.GenAIProviderNameOpenAI)

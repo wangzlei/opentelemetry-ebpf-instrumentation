@@ -103,6 +103,9 @@ func spanOTELGetters(name attr.Name) (attributes.Getter[*Span, attribute.KeyValu
 			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSS3 && s.AWS != nil {
 				return semconv.RPCMethod(S3RPCMethod(s.AWS.S3.Method))
 			}
+			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSLambda && s.AWS != nil {
+				return semconv.RPCMethod(LambdaRPCMethod(s.AWS.Lambda.Operation))
+			}
 			return semconv.RPCMethod(s.Path)
 		}
 	case attr.RPCSystem:
@@ -113,7 +116,7 @@ func spanOTELGetters(name attr.Name) (attributes.Getter[*Span, attribute.KeyValu
 			if s.SubType == HTTPSubtypeJSONRPC {
 				return semconv.RPCSystemNameJSONRPC
 			}
-			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSS3 {
+			if s.Type == EventTypeHTTPClient && (s.SubType == HTTPSubtypeAWSS3 || s.SubType == HTTPSubtypeAWSLambda) {
 				return RPCSystem("aws-api")
 			}
 			return semconv.RPCSystemNameGRPC
@@ -387,6 +390,9 @@ func spanOTELGetters(name attr.Name) (attributes.Getter[*Span, attribute.KeyValu
 			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSSQS && s.AWS != nil {
 				return AWSRequestID(s.AWS.SQS.Meta.RequestID)
 			}
+			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSLambda && s.AWS != nil {
+				return AWSRequestID(s.AWS.Lambda.Meta.RequestID)
+			}
 			return AWSRequestID("")
 		}
 	case attr.AWSExtendedRequestID:
@@ -424,6 +430,9 @@ func spanOTELGetters(name attr.Name) (attributes.Getter[*Span, attribute.KeyValu
 			}
 			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSSQS && s.AWS != nil {
 				return CloudRegion(s.AWS.SQS.Meta.Region)
+			}
+			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSLambda && s.AWS != nil {
+				return CloudRegion(s.AWS.Lambda.Meta.Region)
 			}
 			return CloudRegion("")
 		}

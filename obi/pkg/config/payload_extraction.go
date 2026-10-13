@@ -66,7 +66,7 @@ type GraphQLConfig struct {
 }
 
 type AWSConfig struct {
-	// Enable AWS services (S3, SQS, etc.) payload extraction and parsing
+	// Enable AWS services (S3, SQS, Lambda Invoke, etc.) payload extraction and parsing
 	Enabled bool `yaml:"enabled" env:"OTEL_EBPF_HTTP_AWS_ENABLED" validate:"boolean"`
 }
 

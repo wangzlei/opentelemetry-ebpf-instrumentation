@@ -23,6 +23,8 @@ patches/                  git format-patch stack applied in order on top of upst
                                        JAR / main class / script instead of python3, node, java (opt-in; on in config/)
   06-go-request-host.patch             Go uprobes read net/http.Request.Host: client server.address = the Host Go sends,
                                        server spans get the Host (so 04's x-forwarded-host / RED peer.service.name work for Go)
+  07-aws-lambda.patch                  AWS SDK payload extraction for Lambda Invoke (next to upstream's S3/SQS): span
+                                       lambda.Invoke, rpc.method=Lambda/Invoke, faas.invoked_name/provider/region, function errors
   99-pin-to-cwagent.patch              go.mod pinned to cwagent's dependency versions + forced code adaptations (ALWAYS LAST)
 obi/                      GENERATED, committed: upstream/ + patches/ as plain code (minus .github/ and
                           internal/test/integration/). Committed together with patches/ so every commit shows

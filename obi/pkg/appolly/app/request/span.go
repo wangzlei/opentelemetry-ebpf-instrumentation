@@ -114,6 +114,7 @@ const (
 	HTTPSubtypeRetrieval        = 15 // http + vector retrieval (Pinecone, Qdrant, Milvus, Chroma, Weaviate, etc.)
 	HTTPSubtypeOpenAICompatible = 16 // http + OpenAI-compatible API (custom provider)
 	HTTPSubtypeOllama           = 17 // http + Ollama native API
+	HTTPSubtypeAWSLambda        = 18 // http + aws lambda (Invoke)
 )
 
 func IsGenAISubtype(subtype int) bool {
@@ -260,6 +261,8 @@ type AWS struct {
 	S3 AWSS3 `json:"s3"`
 	// https://opentelemetry.io/docs/specs/semconv/messaging/sqs/
 	SQS AWSSQS `json:"sqs"`
+	// https://opentelemetry.io/docs/specs/semconv/faas/faas-spans/#outgoing-invocations
+	Lambda AWSLambda `json:"lambda"`
 }
 
 type AWSMeta struct {
@@ -282,6 +285,23 @@ type AWSSQS struct {
 	Destination   string  `json:"destination"`
 	QueueURL      string  `json:"queueUrl"`
 	MessageID     string  `json:"messageId"`
+}
+
+type AWSLambda struct {
+	Meta      AWSMeta `json:"meta"`
+	Operation string  `json:"operation"`
+	// FunctionName is the bare function name, also when the call used a
+	// (partial) ARN; Qualifier is the version or alias, if any.
+	FunctionName    string `json:"functionName"`
+	Qualifier       string `json:"qualifier"`
+	FunctionRegion  string `json:"functionRegion"`
+	InvocationType  string `json:"invocationType"`
+	ExecutedVersion string `json:"executedVersion"`
+	// FunctionError is the x-amz-function-error response header (the
+	// function failed although the call returned HTTP 200).
+	FunctionError string `json:"functionError"`
+	ErrorType     string `json:"errorType"`
+	ErrorMessage  string `json:"errorMessage"`
 }
 
 type GenAI struct {
@@ -1463,6 +1483,16 @@ func spanAttributes(s *Span) SpanAttributes {
 			attrs["awsSQSQueueURL"] = sqs.QueueURL
 			attrs["awsSQSMessageID"] = sqs.MessageID
 		}
+		if s.SubType == HTTPSubtypeAWSLambda && s.AWS != nil {
+			lambda := s.AWS.Lambda
+			attrs["awsRequestID"] = lambda.Meta.RequestID
+			attrs["awsRegion"] = lambda.Meta.Region
+			attrs["awsLambdaOperation"] = lambda.Operation
+			attrs["awsLambdaFunctionName"] = lambda.FunctionName
+			attrs["awsLambdaQualifier"] = lambda.Qualifier
+			attrs["awsLambdaFunctionRegion"] = lambda.FunctionRegion
+			attrs["awsLambdaFunctionError"] = lambda.FunctionError
+		}
 		if s.SubType == HTTPSubtypeSQLPP {
 			attrs["dbCollectionName"] = s.Route
 			attrs["dbOperationName"] = s.Method
@@ -1786,6 +1816,9 @@ func SpanStatusMessage(span *Span) string {
 		if span.SubType == HTTPSubtypeMCP && span.GenAI != nil && span.GenAI.MCP != nil && span.GenAI.MCP.ErrorMessage != "" {
 			return span.GenAI.MCP.ErrorMessage
 		}
+		if span.SubType == HTTPSubtypeAWSLambda && span.AWS != nil && span.AWS.Lambda.FunctionError != "" {
+			return span.AWS.Lambda.ErrorMessage
+		}
 	case EventTypeDNS:
 		if span.Status != 0 {
 			return dnsparser.RCode(span.Status).String()
@@ -1811,6 +1844,10 @@ func HTTPSpanStatusCode(span *Span) string {
 	}
 
 	if span.Type == EventTypeHTTPClient {
+		// Lambda function errors come back as HTTP 200 + x-amz-function-error.
+		if span.SubType == HTTPSubtypeAWSLambda && span.AWS != nil && span.AWS.Lambda.FunctionError != "" {
+			return StatusCodeError
+		}
 		if span.Status < 400 {
 			// this is possibly not needed, because in my experiments they
 			// respond with 429, but just to be correct according to the OTel
@@ -1983,6 +2020,14 @@ func (s *Span) TraceName() string {
 				return "sqs." + s.AWS.SQS.OperationName
 			} else {
 				return "sqs.Operation"
+			}
+		}
+
+		if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSLambda && s.AWS != nil {
+			if s.AWS.Lambda.Operation != "" {
+				return "lambda." + s.AWS.Lambda.Operation
+			} else {
+				return "lambda.Operation"
 			}
 		}
 

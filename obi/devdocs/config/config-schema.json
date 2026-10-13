@@ -6,7 +6,7 @@
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Enable AWS services (S3, SQS, etc.) payload extraction and parsing",
+          "description": "Enable AWS services (S3, SQS, Lambda Invoke, etc.) payload extraction and parsing",
           "default": false,
           "x-env-var": "OTEL_EBPF_HTTP_AWS_ENABLED"
         }
