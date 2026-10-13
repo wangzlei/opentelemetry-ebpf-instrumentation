@@ -1365,7 +1365,7 @@ type Span struct {
 	// ForwardedHost is the raw X-Forwarded-Host request header of a server span,
 	// or its Host header when X-Forwarded-Host is absent (EXPERIMENTAL — front-door
 	// name of a request that may have come through a load balancer). Server spans
-	// only. Exported as the x-forwarded-host span attribute and, without the port,
+	// only. Exported as the x-forwarded-host span attribute and, as sent (port kept),
 	// as peer.service.name on HTTP server RED metrics.
 	ForwardedHost     string         `json:"forwardedHost,omitempty"`
 	OtherNamespace    string         `json:"-"`

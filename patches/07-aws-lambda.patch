@@ -143,7 +143,7 @@ index b19afd368e2acdd568d70906d91223ffc1dac7d7..96bf2f639eb499cd701b7e8c32d02d30
  	return attribute.Key(attr.AWSRequestID).String(val)
  }
 diff --git a/pkg/appolly/app/request/span.go b/pkg/appolly/app/request/span.go
-index 173ef5dde0f51c2e8f8ed1043b3739ace91cb70a..943a2d9cbdd218f5cbdea14d130c0d02639bc9b3 100644
+index 1c6366e9c95a832ceba6a0f168021bf38162cd8a..6ce64cacc5349692ceeaf1a3ba0b86189890a300 100644
 --- a/pkg/appolly/app/request/span.go
 +++ b/pkg/appolly/app/request/span.go
 @@ -114,6 +114,7 @@ const (

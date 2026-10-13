@@ -7,7 +7,7 @@ Subject: [PATCH 04/10] forwarded-host: X-Forwarded-Host / Host on server spans
 Record the front-door name an incoming HTTP request was addressed to: the
 X-Forwarded-Host request header, or the Host header when X-Forwarded-Host is
 absent. It is exported as the x-forwarded-host attribute on server spans, and
-(first entry, without the port) as peer.service.name on the HTTP server RED
+(first entry, as sent with its port, i.e. equal to the client's server.address) as peer.service.name on the HTTP server RED
 metrics (http.server.request.duration / request.body.size / response.body.size).
 
 Why: behind an L7 load balancer (e.g. ALB) the TCP-option service name
@@ -22,7 +22,7 @@ metrics keep the shared serverInfo group unchanged.
 
 Adot-Obi-Patch: 04-forwarded-host
 ---
- pkg/appolly/app/request/forwarded_host.go     | 26 +++++++++
+ pkg/appolly/app/request/forwarded_host.go     | 17 ++++++
  .../app/request/forwarded_host_test.go        | 25 +++++++++
  pkg/appolly/app/request/span.go               |  8 ++-
  pkg/appolly/app/request/span_getters.go       |  9 +++-
@@ -34,46 +34,37 @@ Adot-Obi-Patch: 04-forwarded-host
  pkg/export/attributes/attr_selector_test.go   |  1 +
  pkg/export/attributes/names/attrs.go          |  4 ++
  pkg/export/otel/tracesgen/tracesgen.go        |  4 ++
- 12 files changed, 205 insertions(+), 33 deletions(-)
+ 12 files changed, 196 insertions(+), 33 deletions(-)
  create mode 100644 pkg/appolly/app/request/forwarded_host.go
  create mode 100644 pkg/appolly/app/request/forwarded_host_test.go
  create mode 100644 pkg/ebpf/common/forwarded_host_test.go
 
 diff --git a/pkg/appolly/app/request/forwarded_host.go b/pkg/appolly/app/request/forwarded_host.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..1cfe1f840ec33b92862747f8dd101ca0c758506a
+index 0000000000000000000000000000000000000000..ff5cb03772822c2ec9cdcf2ae3b2a4a26380c58c
 --- /dev/null
 +++ b/pkg/appolly/app/request/forwarded_host.go
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,17 @@
 +// Copyright The OpenTelemetry Authors
 +// SPDX-License-Identifier: Apache-2.0
 +
 +package request // import "go.opentelemetry.io/obi/pkg/appolly/app/request"
 +
-+import (
-+	"net"
-+	"strings"
-+)
++import "strings"
 +
-+// ForwardedHostName turns a raw X-Forwarded-Host / Host header value into a bare
-+// host name: the first entry of a comma-separated proxy chain, without the port
-+// or IPv6 brackets. Returns "" for an empty value.
++// ForwardedHostName turns a raw X-Forwarded-Host / Host header value into the
++// name the client used for this server: the first entry of a comma-separated proxy
++// chain, kept as sent (port included), so it equals the client's server.address.
++// Returns "" for an empty value.
 +func ForwardedHostName(v string) string {
 +	if i := strings.IndexByte(v, ','); i >= 0 {
 +		v = v[:i]
 +	}
-+	v = strings.TrimSpace(v)
-+	if v == "" {
-+		return ""
-+	}
-+	if host, _, err := net.SplitHostPort(v); err == nil {
-+		return host
-+	}
-+	return strings.Trim(v, "[]")
++	return strings.TrimSpace(v)
 +}
 diff --git a/pkg/appolly/app/request/forwarded_host_test.go b/pkg/appolly/app/request/forwarded_host_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..b9041e92c3886fdfc93a9e221f42c20de3533819
+index 0000000000000000000000000000000000000000..c48122ae7f355a7b719e6cd6b2485413c35c5b2b
 --- /dev/null
 +++ b/pkg/appolly/app/request/forwarded_host_test.go
 @@ -0,0 +1,25 @@
@@ -92,18 +83,18 @@ index 0000000000000000000000000000000000000000..b9041e92c3886fdfc93a9e221f42c20d
 +	for in, want := range map[string]string{
 +		"":                           "",
 +		"payment.ping.internal":      "payment.ping.internal",
-+		"payment.ping.internal:8000": "payment.ping.internal",
++		"payment.ping.internal:8000": "payment.ping.internal:8000",
 +		"a.example.com, proxy.local": "a.example.com",
 +		" spaced.example.com ":       "spaced.example.com",
-+		"[2001:db8::1]:443":          "2001:db8::1",
-+		"[2001:db8::1]":              "2001:db8::1",
-+		"10.0.10.246:8000":           "10.0.10.246",
++		"[2001:db8::1]:443":          "[2001:db8::1]:443",
++		"[2001:db8::1]":              "[2001:db8::1]",
++		"10.0.10.246:8000":           "10.0.10.246:8000",
 +	} {
 +		assert.Equal(t, want, ForwardedHostName(in), in)
 +	}
 +}
 diff --git a/pkg/appolly/app/request/span.go b/pkg/appolly/app/request/span.go
-index beb746815ed2b5dfc88ded1573eb62919fe46f24..173ef5dde0f51c2e8f8ed1043b3739ace91cb70a 100644
+index beb746815ed2b5dfc88ded1573eb62919fe46f24..1c6366e9c95a832ceba6a0f168021bf38162cd8a 100644
 --- a/pkg/appolly/app/request/span.go
 +++ b/pkg/appolly/app/request/span.go
 @@ -1338,7 +1338,13 @@ type Span struct {
@@ -115,7 +106,7 @@ index beb746815ed2b5dfc88ded1573eb62919fe46f24..173ef5dde0f51c2e8f8ed1043b3739ac
 +	// ForwardedHost is the raw X-Forwarded-Host request header of a server span,
 +	// or its Host header when X-Forwarded-Host is absent (EXPERIMENTAL — front-door
 +	// name of a request that may have come through a load balancer). Server spans
-+	// only. Exported as the x-forwarded-host span attribute and, without the port,
++	// only. Exported as the x-forwarded-host span attribute and, as sent (port kept),
 +	// as peer.service.name on HTTP server RED metrics.
 +	ForwardedHost     string         `json:"forwardedHost,omitempty"`
  	OtherNamespace    string         `json:"-"`

@@ -17,8 +17,8 @@ patches/                  git format-patch stack applied in order on top of upst
                                        (tpinjector), incl. the server-response capture fix for kprobe-traced servers
   02-http2-multiplex.patch             capture every HTTP/2 stream on a multiplexed connection (+ unit/integration test)
   03-peer-service-name-red-attrs.patch peer.service.name on client spans and on http.client.request.duration
-  04-forwarded-host.patch              server spans: X-Forwarded-Host (else Host) as x-forwarded-host, and without
-                                       the port as peer.service.name on HTTP server RED (topology through L7 LBs)
+  04-forwarded-host.patch              server spans: X-Forwarded-Host (else Host) as x-forwarded-host, and as sent
+                                       (port kept, = client server.address) as peer.service.name on HTTP server RED (topology through L7 LBs)
   05-autoname.patch                    discovery.service_name_from_cmdline: service name from package.json / pyproject /
                                        JAR / main class / script instead of python3, node, java (opt-in; on in config/)
   06-go-request-host.patch             Go uprobes read net/http.Request.Host: client server.address = the Host Go sends,

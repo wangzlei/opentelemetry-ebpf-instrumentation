@@ -118,7 +118,7 @@ index 96bf2f639eb499cd701b7e8c32d02d30b12e1e80..1bca153f5ada85b3406f9b889a17f567
  	return attribute.Key(attr.CloudRegion).String(val)
  }
 diff --git a/pkg/appolly/app/request/span.go b/pkg/appolly/app/request/span.go
-index 943a2d9cbdd218f5cbdea14d130c0d02639bc9b3..7f29b74372302b8aa7c3f676b6cb2808640eb859 100644
+index 6ce64cacc5349692ceeaf1a3ba0b86189890a300..610d5d23b5e9ace9fe84eef943fab663e3a5d79d 100644
 --- a/pkg/appolly/app/request/span.go
 +++ b/pkg/appolly/app/request/span.go
 @@ -292,9 +292,12 @@ type AWSLambda struct {
