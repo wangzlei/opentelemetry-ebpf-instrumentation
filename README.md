@@ -28,6 +28,8 @@ patches/                  git format-patch stack applied in order on top of upst
   08-aws-red-attrs.patch               HTTP client RED metrics carry the AWS resource of parsed SDK calls: aws.s3.bucket,
                                        aws.sqs.queue.url, aws.lambda.function.arn (+ faas.invoked_name/region); absent on plain
                                        HTTP; Lambda calls by name get the ARN completed from cloud.account.id in config/otel.yaml
+  09-aws-metadata-ips.patch            AWS metadata endpoints (IMDS 169.254.169.254 / fd00:ec2::254, ECS 169.254.170.2, EKS Pod
+                                       Identity 169.254.170.23 / fd00:ec2::23) keep their IP instead of server.address="outgoing"
   99-pin-to-cwagent.patch              go.mod pinned to cwagent's dependency versions + forced code adaptations (ALWAYS LAST)
 obi/                      GENERATED, committed: upstream/ + patches/ as plain code (minus .github/ and
                           internal/test/integration/). Committed together with patches/ so every commit shows

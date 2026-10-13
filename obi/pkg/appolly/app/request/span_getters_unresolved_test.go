@@ -641,3 +641,31 @@ func getVal[O any](t *testing.T, getters attributes.NamedGetters[*Span, O], span
 	require.Truef(t, ok, "getter %s should be found", name)
 	return getter(span)
 }
+
+func TestRenameUnresolved_AWSMetadataIPsKept(t *testing.T) {
+	for _, ip := range []string{"169.254.169.254", "fd00:ec2::254", "169.254.170.2", "169.254.170.23", "fd00:ec2::23"} {
+		assert.Equal(t, ip, unresolvedValue(ip, "outgoing"), ip)
+		assert.False(t, willReplaceIP(ip, "outgoing"), ip)
+	}
+	for _, ip := range []string{"169.254.169.253", "10.0.0.1", "2001:db8::1"} {
+		assert.Equal(t, "outgoing", unresolvedValue(ip, "outgoing"), ip)
+		assert.True(t, willReplaceIP(ip, "outgoing"), ip)
+	}
+	assert.Equal(t, "169.254.169.254", unresolvedValue("169.254.169.254", ""))
+
+	// an AWS SDK fetching credentials from IMDS: client span, Host header = the IP
+	s := Span{
+		Service:   svc.Attrs{UID: svc.UID{Name: "service", Namespace: "ns"}},
+		Type:      EventTypeHTTPClient,
+		HostName:  "169.254.169.254",
+		Host:      "169.254.169.254",
+		Statement: "http;169.254.169.254",
+	}
+	cfg := UnresolvedNames{Generic: "unresolved", Outgoing: "outgoing", Incoming: "incoming"}
+	assert.Equal(t, "169.254.169.254", getVal(t, SpanOTELGetters(cfg), &s, attr.Server).Value.AsString())
+	assert.Empty(t, getVal(t, SpanOTELGetters(cfg), &s, attr.ServerNamespace).Value.AsString())
+	pg := SpanPromGetters(cfg)
+	g, ok := pg(attr.Server)
+	require.True(t, ok)
+	assert.Equal(t, "169.254.169.254", g(&s))
+}

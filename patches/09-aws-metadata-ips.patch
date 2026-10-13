@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wangzlei <66336933+wangzlei@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 06:13:37 +0000
+Subject: [PATCH 09/10] aws-metadata-ips: keep AWS metadata endpoint IPs
+ instead of "outgoing"
+
+AWS SDKs fetch credentials from EC2 IMDS (169.254.169.254 / fd00:ec2::254), the
+ECS task metadata endpoint (169.254.170.2) or the EKS Pod Identity agent
+(169.254.170.23 / fd00:ec2::23). These IPs never resolve to a name, so the
+rename_unresolved_hosts* options turned every such call into
+server.address="outgoing" on client RED and spans (seen on the lei demo as an
+unexplained "outgoing" peer of every Node/Python service using the SDK). They are
+a handful of fixed constants, so keeping the IP adds no cardinality.
+
+Adot-Obi-Patch: 09-aws-metadata-ips
+---
+ .../app/request/span_getters_unresolved.go    | 30 +++++++++++++++----
+ .../request/span_getters_unresolved_test.go   | 28 +++++++++++++++++
+ 2 files changed, 53 insertions(+), 5 deletions(-)
+
+diff --git a/pkg/appolly/app/request/span_getters_unresolved.go b/pkg/appolly/app/request/span_getters_unresolved.go
+index a0928faa708da3266d8cba1c455d8d0d55bde549..31795f789842ed2b2b853fba7b4e278c58281535 100644
+--- a/pkg/appolly/app/request/span_getters_unresolved.go
++++ b/pkg/appolly/app/request/span_getters_unresolved.go
+@@ -12,15 +12,35 @@ import (
+ 	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
+ )
+ 
++// awsMetadataIPs are the fixed link-local endpoints AWS SDKs and agents call for
++// instance metadata and credentials: EC2 IMDS (IPv4/IPv6), the ECS task metadata and
++// credentials endpoint, and the EKS Pod Identity agent (IPv4/IPv6). They never
++// resolve to a name, but they are a handful of well-known constants, so keeping the
++// IP costs no cardinality and is far more useful than "outgoing"/"unresolved".
++var awsMetadataIPs = map[string]struct{}{
++	"169.254.169.254": {},
++	"fd00:ec2::254":   {},
++	"169.254.170.2":   {},
++	"169.254.170.23":  {},
++	"fd00:ec2::23":    {},
++}
++
++func isAWSMetadataIP(ip net.IP) bool {
++	_, ok := awsMetadataIPs[ip.String()]
++	return ok
++}
++
+ func willReplaceIP(value, replacement string) bool {
+-	return replacement != "" && net.ParseIP(value) != nil
++	if replacement == "" {
++		return false
++	}
++	ip := net.ParseIP(value)
++	return ip != nil && !isAWSMetadataIP(ip)
+ }
+ 
+ func unresolvedValue(value, replacement string) string {
+-	if replacement != "" {
+-		if net.ParseIP(value) != nil {
+-			return replacement
+-		}
++	if willReplaceIP(value, replacement) {
++		return replacement
+ 	}
+ 
+ 	return value
+diff --git a/pkg/appolly/app/request/span_getters_unresolved_test.go b/pkg/appolly/app/request/span_getters_unresolved_test.go
+index b24ca50c5a3756c2bc23ca83aa066b7fd4347d25..1a9e05cdb368c471590898203127d2065cd9a42e 100644
+--- a/pkg/appolly/app/request/span_getters_unresolved_test.go
++++ b/pkg/appolly/app/request/span_getters_unresolved_test.go
+@@ -641,3 +641,31 @@ func getVal[O any](t *testing.T, getters attributes.NamedGetters[*Span, O], span
+ 	require.Truef(t, ok, "getter %s should be found", name)
+ 	return getter(span)
+ }
++
++func TestRenameUnresolved_AWSMetadataIPsKept(t *testing.T) {
++	for _, ip := range []string{"169.254.169.254", "fd00:ec2::254", "169.254.170.2", "169.254.170.23", "fd00:ec2::23"} {
++		assert.Equal(t, ip, unresolvedValue(ip, "outgoing"), ip)
++		assert.False(t, willReplaceIP(ip, "outgoing"), ip)
++	}
++	for _, ip := range []string{"169.254.169.253", "10.0.0.1", "2001:db8::1"} {
++		assert.Equal(t, "outgoing", unresolvedValue(ip, "outgoing"), ip)
++		assert.True(t, willReplaceIP(ip, "outgoing"), ip)
++	}
++	assert.Equal(t, "169.254.169.254", unresolvedValue("169.254.169.254", ""))
++
++	// an AWS SDK fetching credentials from IMDS: client span, Host header = the IP
++	s := Span{
++		Service:   svc.Attrs{UID: svc.UID{Name: "service", Namespace: "ns"}},
++		Type:      EventTypeHTTPClient,
++		HostName:  "169.254.169.254",
++		Host:      "169.254.169.254",
++		Statement: "http;169.254.169.254",
++	}
++	cfg := UnresolvedNames{Generic: "unresolved", Outgoing: "outgoing", Incoming: "incoming"}
++	assert.Equal(t, "169.254.169.254", getVal(t, SpanOTELGetters(cfg), &s, attr.Server).Value.AsString())
++	assert.Empty(t, getVal(t, SpanOTELGetters(cfg), &s, attr.ServerNamespace).Value.AsString())
++	pg := SpanPromGetters(cfg)
++	g, ok := pg(attr.Server)
++	require.True(t, ok)
++	assert.Equal(t, "169.254.169.254", g(&s))
++}

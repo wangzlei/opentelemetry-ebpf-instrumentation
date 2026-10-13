@@ -12,15 +12,35 @@ import (
 	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
 )
 
+// awsMetadataIPs are the fixed link-local endpoints AWS SDKs and agents call for
+// instance metadata and credentials: EC2 IMDS (IPv4/IPv6), the ECS task metadata and
+// credentials endpoint, and the EKS Pod Identity agent (IPv4/IPv6). They never
+// resolve to a name, but they are a handful of well-known constants, so keeping the
+// IP costs no cardinality and is far more useful than "outgoing"/"unresolved".
+var awsMetadataIPs = map[string]struct{}{
+	"169.254.169.254": {},
+	"fd00:ec2::254":   {},
+	"169.254.170.2":   {},
+	"169.254.170.23":  {},
+	"fd00:ec2::23":    {},
+}
+
+func isAWSMetadataIP(ip net.IP) bool {
+	_, ok := awsMetadataIPs[ip.String()]
+	return ok
+}
+
 func willReplaceIP(value, replacement string) bool {
-	return replacement != "" && net.ParseIP(value) != nil
+	if replacement == "" {
+		return false
+	}
+	ip := net.ParseIP(value)
+	return ip != nil && !isAWSMetadataIP(ip)
 }
 
 func unresolvedValue(value, replacement string) string {
-	if replacement != "" {
-		if net.ParseIP(value) != nil {
-			return replacement
-		}
+	if willReplaceIP(value, replacement) {
+		return replacement
 	}
 
 	return value
