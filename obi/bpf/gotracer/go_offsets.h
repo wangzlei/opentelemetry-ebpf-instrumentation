@@ -157,6 +157,8 @@ typedef enum {
     _runtime_sched_stw_total_time_gc_pos,
     _runtime_time_histogram_underflow_pos,
     _runtime_time_histogram_overflow_pos,
+    // EXPERIMENTAL (adot-obi): net/http.Request.Host; ~0 (missing) when unknown
+    _req_host_ptr_pos,
     _last_go_offset,
 } go_offset_const;
 

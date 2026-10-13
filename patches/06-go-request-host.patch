@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wangzlei <66336933+wangzlei@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 16:32:49 -0700
+Subject: [PATCH 6/7] go-request-host: read net/http.Request.Host in the Go
+ HTTP probes
+
+Upstream's Go uprobes read only Request.URL.Host. Two consequences:
+- client: a Go client that dials an IP and sets req.Host = "audit.internal:8000"
+  (Go then sends req.Host as the Host header) gets server.address = the IP;
+- server: a server-side Request.URL comes from the request-target and has no
+  host, so Go server spans have no host and patch 04's Go ForwardedHost (and
+  with it peer.service.name on HTTP server RED behind an ALB) is always empty.
+
+This patch adds the net/http.Request.Host offset (DWARF, and the prefetched
+offsets.json / tracker input for stripped binaries: 128 since Go 1.17) and
+reads it in the BPF probes:
+- roundTrip: after URL.Host, Request.Host overrides it when non-empty, which is
+  exactly what Go's transport puts on the wire;
+- ServeHTTP: Request.Host (Host header for HTTP/1, :authority for HTTP/2) is
+  stored in server_http_func_invocation_t.host (+100 B per map entry) and copied
+  into the server trace's host, which used to be forced empty. The Go server
+  span then carries the Host like the kprobe path already does.
+
+Degrades to upstream behaviour: the new offset table slot is initialised to the
+missing sentinel (~0) and the BPF helper skips the read when the offset is
+unknown or the string is empty. No new map, no stack growth (the server copy
+lives in the existing per-CPU scratch / LRU map value; the client reuses its
+host buffer).
+
+Why upstream does not do it: OBI took the host from URL.Host only, which is
+correct for most clients and was never wired for servers.
+
+Turn it off: not configurable (it only fills a host that was empty or replaces
+it by the value Go sends on the wire); drop this patch to get upstream back.
+
+Adot-Obi-Patch: 06-go-request-host
+---
+ bpf/gotracer/go_nethttp.c                 | 22 +++++++++++++++++++++-
+ bpf/gotracer/go_offsets.h                 |  2 ++
+ bpf/gotracer/types/nethttp.h              |  3 ++-
+ configs/offsets/tracker_input.json        |  3 ++-
+ pkg/internal/ebpf/gotracer/gotracer.go    |  4 ++++
+ pkg/internal/goexec/offsets.json          | 12 ++++++++++++
+ pkg/internal/goexec/structmembers.go      |  3 +++
+ pkg/internal/goexec/structmembers_test.go |  2 ++
+ 8 files changed, 48 insertions(+), 3 deletions(-)
+
+diff --git a/bpf/gotracer/go_nethttp.c b/bpf/gotracer/go_nethttp.c
+index 186884aa9dba3fb72128e53278bcafdfe112e875..4f6a248c6726c244fd85e1e72049ac8596ada3e3 100644
+--- a/bpf/gotracer/go_nethttp.c
++++ b/bpf/gotracer/go_nethttp.c
+@@ -63,6 +63,20 @@ static __always_inline unsigned char *temp_header_mem() {
+ SCRATCH_MEM_TYPED(serve_http_inv, server_http_func_invocation_t)
+ SCRATCH_MEM_TYPED(round_trip_client_data, http_client_data_t)
+ 
++// EXPERIMENTAL (adot-obi): reads net/http.Request.Host into buf when the field
++// offset is known and the string is non-empty; otherwise buf is left untouched.
++// Server side: the Host header (HTTP/1) or :authority (HTTP/2) the client sent.
++// Client side: the Host Go sends instead of URL.Host when it is set.
++static __always_inline int read_req_host(void *req, off_table_t *ot, void *buf, u64 size) {
++    const u64 off = go_offset_of(ot, (go_offset){.v = _req_host_ptr_pos});
++    // ~0 = unknown offset (stripped binary, Go version not in offsets.json);
++    // read_go_str takes a u8 offset
++    if (off > 0xff || !peek_go_str_len("req_host", req, (u8)off)) {
++        return 0;
++    }
++    return read_go_str("req_host", req, (u8)off, buf, size);
++}
++
+ /* HTTP Server */
+ 
+ // This instrumentation attaches uprobe to the following function:
+@@ -146,6 +160,9 @@ int GUARDED_PROG(obi_uprobe_ServeHTTP, struct pt_regs *, ctx) {
+             bpf_dbg_printk("can't read http Request.ContentLength");
+             goto done;
+         }
++
++        // best-effort, like raw_query: no Host keeps the event
++        read_req_host(req, ot, invocation->host, sizeof(invocation->host));
+     } else {
+         goto done;
+     }
+@@ -581,7 +598,7 @@ static __always_inline int serve_http_returns(struct pt_regs *ctx) {
+     trace->type = EVENT_HTTP_REQUEST;
+     trace->start_monotime_ns = invocation->start_monotime_ns;
+     trace->end_monotime_ns = bpf_ktime_get_ns();
+-    trace->host[0] = '\0';
++    __builtin_memcpy(trace->host, invocation->host, sizeof(trace->host));
+     if (invocation->is_tls) {
+         bpf_memcpy(trace->scheme, "https", 6);
+     } else {
+@@ -700,6 +717,9 @@ static __always_inline void roundTripStartHelper(struct pt_regs *ctx) {
+             bpf_dbg_printk("can't read http Request.URL.Host");
+             return;
+         }
++        // Go sends Request.Host instead of URL.Host when it is set (a client
++        // that dials an IP and names the virtual host), so prefer it.
++        read_req_host(req, ot, trace->host, sizeof(trace->host));
+ 
+         if (!read_go_str("scheme",
+                          url_ptr,
+diff --git a/bpf/gotracer/go_offsets.h b/bpf/gotracer/go_offsets.h
+index dc4c7997e79426713e392cb38f1a9904303becfa..c3a2cfb33a0551be94524f1a1667b34be47f6f83 100644
+--- a/bpf/gotracer/go_offsets.h
++++ b/bpf/gotracer/go_offsets.h
+@@ -157,6 +157,8 @@ typedef enum {
+     _runtime_sched_stw_total_time_gc_pos,
+     _runtime_time_histogram_underflow_pos,
+     _runtime_time_histogram_overflow_pos,
++    // EXPERIMENTAL (adot-obi): net/http.Request.Host; ~0 (missing) when unknown
++    _req_host_ptr_pos,
+     _last_go_offset,
+ } go_offset_const;
+ 
+diff --git a/bpf/gotracer/types/nethttp.h b/bpf/gotracer/types/nethttp.h
+index 670b026990781f52c288b10536ab7198e17e44dc..0245b4716dba44b65a7c5e1fb29ea145ae5060f0 100644
+--- a/bpf/gotracer/types/nethttp.h
++++ b/bpf/gotracer/types/nethttp.h
+@@ -37,9 +37,10 @@ typedef struct server_http_func_invocation {
+     u8 path[k_path_max_len];
+     u8 raw_query[k_query_max_len];
+     u8 pattern[k_pattern_max_len];
++    u8 host[k_host_max_len]; // Request.Host (Host header / :authority), EXPERIMENTAL (adot-obi)
+     u8 is_tls;
+     bool is_jsonrpc;
+-    u8 _pad[7];
++    u8 _pad[3];
+ } server_http_func_invocation_t;
+ 
+ typedef struct framer_func_invocation {
+diff --git a/configs/offsets/tracker_input.json b/configs/offsets/tracker_input.json
+index 3d38f602d762344d5d5848b3bed91ffbcd0eb713..7f53bf9e2f8cd68c3c47807d6c79c7288f151cc6 100644
+--- a/configs/offsets/tracker_input.json
++++ b/configs/offsets/tracker_input.json
+@@ -7,7 +7,8 @@
+         "Method",
+         "URL",
+         "ContentLength",
+-        "Header"
++        "Header",
++        "Host"
+       ],
+       "net/url.URL": ["Path", "RawQuery", "Host", "Scheme"],
+       "net/http.Response": ["StatusCode", "ContentLength"],
+diff --git a/pkg/internal/ebpf/gotracer/gotracer.go b/pkg/internal/ebpf/gotracer/gotracer.go
+index aea20d06783607d0693a7868c33de56d18a5b04d..5c96c6eff941a77e10b698090234824eb9730a6c 100644
+--- a/pkg/internal/ebpf/gotracer/gotracer.go
++++ b/pkg/internal/ebpf/gotracer/gotracer.go
+@@ -534,6 +534,9 @@ func (p *Tracer) RegisterOffsets(fileInfo *exec.FileInfo, offsets *goexec.Offset
+ 	offTable := BpfOffTableT{}
+ 	initMissingGoChannelOffsets(&offTable)
+ 	initMissingGoAutoSDKSpanContextOffsets(&offTable)
++	// EXPERIMENTAL (adot-obi): the BPF side skips Request.Host when its offset
++	// is unknown, keeping URL.Host (client) / no host (server) as upstream.
++	offTable.Table[goexec.ReqHostPtrPos] = missingGoOffset
+ 	// Set the field offsets and the logLevel for the Go BPF program in a map
+ 	for _, field := range []goexec.GoOffset{
+ 		goexec.ConnFdPos,
+@@ -634,6 +637,7 @@ func (p *Tracer) RegisterOffsets(fileInfo *exec.FileInfo, offsets *goexec.Offset
+ 		goexec.PgxConfigHostPos,
+ 		goexec.MuxTemplatePos,
+ 		goexec.GinFullpathPos,
++		goexec.ReqHostPtrPos,
+ 	} {
+ 		if val, ok := offsets.Field[field].(uint64); ok {
+ 			offTable.Table[field] = val
+diff --git a/pkg/internal/goexec/offsets.json b/pkg/internal/goexec/offsets.json
+index 782ba6cf6393e5ac428bfc0fd461eff3284e3f59..a2f8320076e5371414fc5291697de57e835cc18a 100755
+--- a/pkg/internal/goexec/offsets.json
++++ b/pkg/internal/goexec/offsets.json
+@@ -1049,6 +1049,18 @@
+           }
+         ]
+       },
++      "Host": {
++        "versions": {
++          "oldest": "1.17.0",
++          "newest": "1.26.4"
++        },
++        "offsets": [
++          {
++            "offset": 128,
++            "since": "1.17.0"
++          }
++        ]
++      },
+       "Method": {
+         "versions": {
+           "oldest": "1.17.0",
+diff --git a/pkg/internal/goexec/structmembers.go b/pkg/internal/goexec/structmembers.go
+index 6a7340cd66422dc568e72d08092201398a211c59..b006911a9bfe0f224b5faa880e994dbc977192e0 100644
+--- a/pkg/internal/goexec/structmembers.go
++++ b/pkg/internal/goexec/structmembers.go
+@@ -232,6 +232,8 @@ const (
+ 	RuntimeSchedSTWTotalTimeGCPos
+ 	RuntimeTimeHistogramUnderflowPos
+ 	RuntimeTimeHistogramOverflowPos
++	// EXPERIMENTAL (adot-obi): net/http.Request.Host
++	ReqHostPtrPos
+ )
+ 
+ //go:embed offsets.json
+@@ -280,6 +282,7 @@ var structMembers = map[string]structInfo{
+ 		lib: "go",
+ 		fields: map[string]GoOffset{
+ 			"URL":           URLPtrPos,
++			"Host":          ReqHostPtrPos,
+ 			"Method":        MethodPtrPos,
+ 			"ContentLength": ContentLengthPtrPos,
+ 			"Header":        ReqHeaderPtrPos,
+diff --git a/pkg/internal/goexec/structmembers_test.go b/pkg/internal/goexec/structmembers_test.go
+index 7a1c0bbf432c6ea84922d6767fb09d28cfd5d6ab..7f26328584366d085b24e24c8bafa9f952b7f46f 100644
+--- a/pkg/internal/goexec/structmembers_test.go
++++ b/pkg/internal/goexec/structmembers_test.go
+@@ -125,6 +125,7 @@ func TestGoOffsetsFromDwarf(t *testing.T) {
+ 	// this test might fail if a future Go version updates the internal structure of the used structs.
+ 	mustMatch(t, FieldOffsets{
+ 		URLPtrPos:         uint64(16),
++		ReqHostPtrPos:     uint64(128),
+ 		PathPtrPos:        uint64(56),
+ 		ConnFdPos:         uint64(0),
+ 		FdLaddrPos:        uint64(96),
+@@ -172,6 +173,7 @@ func TestGoOffsetsWithoutDwarf(t *testing.T) {
+ 	// this test might fail if a future Go version updates the internal structure of the used structs.
+ 	mustMatch(t, FieldOffsets{
+ 		URLPtrPos:                         uint64(16),
++		ReqHostPtrPos:                     uint64(128),
+ 		PathPtrPos:                        uint64(56),
+ 		ConnFdPos:                         uint64(0),
+ 		FdLaddrPos:                        uint64(96),

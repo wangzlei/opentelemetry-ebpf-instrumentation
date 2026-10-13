@@ -1049,6 +1049,18 @@
           }
         ]
       },
+      "Host": {
+        "versions": {
+          "oldest": "1.17.0",
+          "newest": "1.26.4"
+        },
+        "offsets": [
+          {
+            "offset": 128,
+            "since": "1.17.0"
+          }
+        ]
+      },
       "Method": {
         "versions": {
           "oldest": "1.17.0",

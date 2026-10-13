@@ -232,6 +232,8 @@ const (
 	RuntimeSchedSTWTotalTimeGCPos
 	RuntimeTimeHistogramUnderflowPos
 	RuntimeTimeHistogramOverflowPos
+	// EXPERIMENTAL (adot-obi): net/http.Request.Host
+	ReqHostPtrPos
 )
 
 //go:embed offsets.json
@@ -280,6 +282,7 @@ var structMembers = map[string]structInfo{
 		lib: "go",
 		fields: map[string]GoOffset{
 			"URL":           URLPtrPos,
+			"Host":          ReqHostPtrPos,
 			"Method":        MethodPtrPos,
 			"ContentLength": ContentLengthPtrPos,
 			"Header":        ReqHeaderPtrPos,

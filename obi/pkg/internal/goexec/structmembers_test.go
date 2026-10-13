@@ -125,6 +125,7 @@ func TestGoOffsetsFromDwarf(t *testing.T) {
 	// this test might fail if a future Go version updates the internal structure of the used structs.
 	mustMatch(t, FieldOffsets{
 		URLPtrPos:         uint64(16),
+		ReqHostPtrPos:     uint64(128),
 		PathPtrPos:        uint64(56),
 		ConnFdPos:         uint64(0),
 		FdLaddrPos:        uint64(96),
@@ -172,6 +173,7 @@ func TestGoOffsetsWithoutDwarf(t *testing.T) {
 	// this test might fail if a future Go version updates the internal structure of the used structs.
 	mustMatch(t, FieldOffsets{
 		URLPtrPos:                         uint64(16),
+		ReqHostPtrPos:                     uint64(128),
 		PathPtrPos:                        uint64(56),
 		ConnFdPos:                         uint64(0),
 		FdLaddrPos:                        uint64(96),
