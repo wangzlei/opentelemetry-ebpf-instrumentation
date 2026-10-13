@@ -1907,3 +1907,85 @@ func resourcesMatch(t *testing.T, one *TargetMetrics, two *TargetMetrics) {
 		assert.Equal(t, a.Value.AsString(), other.AsString())
 	}
 }
+
+// TestAppMetrics_HTTPClientAWSResourceAttributes: http.client.request.duration
+// carries the AWS resource attributes for spans the AWS parsers recognized, and
+// a plain HTTP client datapoint carries none of them (not even empty).
+func TestAppMetrics_HTTPClientAWSResourceAttributes(t *testing.T) {
+	ctx := t.Context()
+	metricRecords := make(chan collector.MetricRecord, 100)
+	metrics := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(10))
+	processEvents := msg.NewQueue[exec.ProcessEvent](msg.ChannelBufferLen(10))
+	mcfg := &otelcfg.MetricsConfig{
+		Interval:          50 * time.Millisecond,
+		TTL:               30 * time.Minute,
+		ReportersCacheLen: 10,
+		Instrumentations:  []instrumentations.Instrumentation{instrumentations.InstrumentationHTTP},
+		MetricsConsumer:   testMetricsConsumer(metricRecords),
+	}
+	reporter, err := newMetricsReporter(
+		ctx,
+		&global.ContextInfo{OTELMetricsExporter: &otelcfg.MetricsExporterInstancer{Cfg: mcfg}},
+		mcfg,
+		&perapp.GlobalMetricsConfig{Features: export.FeatureApplicationRED},
+		&attributes.SelectorConfig{},
+		request.UnresolvedNames{},
+		metrics,
+		processEvents,
+	)
+	require.NoError(t, err)
+	go reporter.reportMetrics(ctx)
+
+	svcAttrs := svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}
+	span := func(host string, subType int, aws *request.AWS) request.Span {
+		return request.Span{
+			Service: svcAttrs, Type: request.EventTypeHTTPClient, SubType: subType, AWS: aws,
+			Method: "POST", Path: "/", Host: host, HostPort: 443, Status: 200, RequestStart: 100, End: 200,
+		}
+	}
+	metrics.Send([]request.Span{
+		span("example.com", request.HTTPSubtypeNone, nil),
+		span("my-bucket.s3.us-west-2.amazonaws.com", request.HTTPSubtypeAWSS3, &request.AWS{S3: request.AWSS3{Bucket: "my-bucket", Method: "PutObject"}}),
+		span("sqs.us-west-2.amazonaws.com", request.HTTPSubtypeAWSSQS, &request.AWS{SQS: request.AWSSQS{QueueURL: "https://sqs.us-west-2.amazonaws.com/123456789012/q"}}),
+		span("lambda.us-west-2.amazonaws.com", request.HTTPSubtypeAWSLambda, &request.AWS{Lambda: request.AWSLambda{
+			Operation: "Invoke", FunctionName: "fn", FunctionRegion: "us-west-2", FunctionARN: "arn:aws:lambda:us-west-2:123456789012:function:fn",
+		}}),
+	})
+
+	awsKeys := []string{"aws.s3.bucket", "aws.sqs.queue.url", "aws.lambda.function.arn", "faas.invoked_name", "faas.invoked_region"}
+	want := map[string]map[string]string{
+		"example.com":                          {},
+		"my-bucket.s3.us-west-2.amazonaws.com": {"aws.s3.bucket": "my-bucket"},
+		"sqs.us-west-2.amazonaws.com":          {"aws.sqs.queue.url": "https://sqs.us-west-2.amazonaws.com/123456789012/q"},
+		"lambda.us-west-2.amazonaws.com": {
+			"aws.lambda.function.arn": "arn:aws:lambda:us-west-2:123456789012:function:fn",
+			"faas.invoked_name":       "fn",
+			"faas.invoked_region":     "us-west-2",
+		},
+	}
+	got := map[string]map[string]string{}
+	deadline := time.After(timeout)
+	for len(got) < len(want) {
+		select {
+		case r := <-metricRecords:
+			if r.Name != attributes.HTTPClientDuration.OTEL {
+				continue
+			}
+			got[r.Attributes["server.address"]] = r.Attributes
+		case <-deadline:
+			require.Failf(t, "timeout", "got datapoints for %v", got)
+		}
+	}
+	for host, wantAttrs := range want {
+		attrs, ok := got[host]
+		require.True(t, ok, host)
+		for _, k := range awsKeys {
+			v, present := attrs[k]
+			if wv, expected := wantAttrs[k]; expected {
+				assert.Equal(t, wv, v, "%s %s", host, k)
+			} else {
+				assert.False(t, present, "%s must not carry %s (got %q)", host, k, v)
+			}
+		}
+	}
+}

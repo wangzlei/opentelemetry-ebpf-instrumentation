@@ -1,0 +1,676 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wangzlei <66336933+wangzlei@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 05:43:52 +0000
+Subject: [PATCH 8/9] aws-red-attrs: AWS resource attributes on HTTP client RED
+ metrics
+
+Upstream's S3/SQS parsers (and patch 07's Lambda parser) enrich spans only; the
+HTTP client RED metrics of an AWS SDK call carry just server.address, so a
+dashboard cannot tell which bucket, queue or function a service talks to.
+
+This patch adds them as default attributes of the HTTP client metric group
+(http.client.request.duration, http.client.request.body.size,
+http.client.response.body.size), the same mechanism patch 03 uses for
+peer.service.name:
+- aws.s3.bucket (semconv)         S3 calls with a bucket
+- aws.sqs.queue.url (semconv)     SQS calls whose payload names the queue
+- aws.lambda.function.arn         Lambda Invoke, unqualified ARN
+- faas.invoked_name / faas.invoked_region (semconv)  Lambda Invoke
+
+aws.lambda.function.arn: no semconv attribute covers the client side
+(aws.lambda.invoked_arn is the server-side ARN as given to the function,
+qualifier included), so the name follows the AWS SDK instrumentation used by
+ADOT / Application Signals. It is the unqualified ARN, so calls to the same
+function by name, ARN or ARN:alias share one series. The Lambda parser sets it
+when the call names the account: a full ARN is kept up to the function name;
+a partial ARN (<account>:function:<name>) is completed with the endpoint region
+and its partition (aws / aws-cn / aws-us-gov). A call by bare name targets the
+caller's account, which OBI does not know: the ARN is left out and the
+collector completes it from cloud.account.id (adot-obi config/otel.yaml,
+transform/aws). The ARN is also added to the Lambda span.
+
+The getters return an invalid KeyValue for every span the AWS parsers did not
+recognize (and for S3 / SQS calls without bucket / queue), so the OTEL
+exporter's Expirer drops them: plain HTTP client datapoints keep exactly their
+upstream attribute set. aws.s3.bucket / aws.sqs.queue.url getters used to emit
+an empty string for such spans (they were not default metric attributes).
+Prometheus label sets are fixed, so there the omitted value is "".
+
+SQS parser: a body rebuilt from the captured buffer that ends before its
+Content-Length (seen for Go clients, whose SQS response body is often not in the
+capture) no longer fails the whole parse; the captured part is used. Before,
+Go aws-sdk-go-v2 SQS calls were never parsed; now ReceiveMessage is (SendMessage
+mostly still lacks a captured response, an upstream Go large-buffer limit).
+
+Cardinality: one series per bucket / queue / function an application calls;
+no request data (object key, message id, qualifier) is used. Documented in
+devdocs/metrics.md.
+
+Why upstream does not do it: upstream only enriches the spans.
+
+Turn it off: attributes.select exclude per metric, or drop this patch.
+
+Adot-Obi-Patch: 08-aws-red-attrs
+---
+ devdocs/metrics.md                           | 22 ++++++
+ pkg/appolly/app/request/metric_attributes.go |  4 +
+ pkg/appolly/app/request/span.go              | 10 ++-
+ pkg/appolly/app/request/span_getters.go      | 31 +++++++-
+ pkg/appolly/app/request/span_getters_test.go | 44 +++++++++++
+ pkg/ebpf/common/http/aws_lambda.go           | 36 +++++++++
+ pkg/ebpf/common/http/aws_lambda_test.go      | 29 +++++++
+ pkg/ebpf/common/http/aws_sqs.go              | 17 +++-
+ pkg/ebpf/common/http/aws_sqs_test.go         | 30 +++++++
+ pkg/export/attributes/attr_defs.go           | 13 +++-
+ pkg/export/attributes/attr_selector_test.go  | 17 ++++
+ pkg/export/attributes/names/attrs.go         | 12 +++
+ pkg/export/otel/metrics_test.go              | 82 ++++++++++++++++++++
+ pkg/export/otel/tracesgen/tracesgen.go       |  3 +
+ pkg/export/otel/tracesgen/tracesgen_test.go  | 10 ++-
+ 15 files changed, 347 insertions(+), 13 deletions(-)
+
+diff --git a/devdocs/metrics.md b/devdocs/metrics.md
+index 7cf3b8866a7b41b69f09b4974ef24bcd0a747548..ffe36729ef7726b71a12fb4355af9885a4919346 100644
+--- a/devdocs/metrics.md
++++ b/devdocs/metrics.md
+@@ -82,6 +82,28 @@ In the following methods:
+ 
+ the actual metrics are created using the names defined in [pkg/export/attributes/metric.go](../pkg/export/attributes/metric.go) with the attributes defined and added in [pkg/export/attributes/attr_defs.go](../pkg/export/attributes/attr_defs.go).
+ 
++### AWS resource attributes on HTTP client metrics (ADOT, experimental)
++
++With `payload_extraction.http.aws.enabled` (and `buffer_sizes.http`), the HTTP
++client RED metrics (`http.client.request.duration`, `http.client.request.body.size`,
++`http.client.response.body.size`) carry the AWS resource of calls the AWS SDK
++parsers recognized, as default attributes of `httpClientInfo`:
++
++| Service | Attribute | Notes |
++|---|---|---|
++| S3 | `aws.s3.bucket` | omitted for bucket-less calls (`ListBuckets`) |
++| SQS | `aws.sqs.queue.url` | omitted when the queue URL is not in the payload (`ListQueues`) |
++| Lambda `Invoke` | `aws.lambda.function.arn` | unqualified ARN; only when the call names the account (full or partial ARN). Calls by bare name leave it out: the collector can complete it from `cloud.account.id` |
++| Lambda `Invoke` | `faas.invoked_name`, `faas.invoked_region` | function name (no qualifier) and region |
++
++The getters return an invalid `KeyValue` for every other span, so the OTEL
++exporter omits the attributes on plain HTTP client datapoints (Prometheus, which
++needs fixed label sets, gets an empty label). Cardinality: one series per
++bucket / queue / function an application calls - bounded by the application's
++own resources, not by request data (object keys, message ids and qualifiers are
++never used). Exclude them with `attributes.select` if an application talks to
++an unbounded set of buckets or queues.
++
+ ### Add a new application metric
+ 
+ To add a new application metric, follow these guidelines:
+diff --git a/pkg/appolly/app/request/metric_attributes.go b/pkg/appolly/app/request/metric_attributes.go
+index 96bf2f639eb499cd701b7e8c32d02d30b12e1e80..1bca153f5ada85b3406f9b889a17f567e3fccd04 100644
+--- a/pkg/appolly/app/request/metric_attributes.go
++++ b/pkg/appolly/app/request/metric_attributes.go
+@@ -217,6 +217,10 @@ func AWSSQSQueueURL(val string) attribute.KeyValue {
+ 	return attribute.Key(attr.AWSSQSQueueURL).String(val)
+ }
+ 
++func AWSLambdaFunctionARN(val string) attribute.KeyValue {
++	return attribute.Key(attr.AWSLambdaFunctionARN).String(val)
++}
++
+ func CloudRegion(val string) attribute.KeyValue {
+ 	return attribute.Key(attr.CloudRegion).String(val)
+ }
+diff --git a/pkg/appolly/app/request/span.go b/pkg/appolly/app/request/span.go
+index 943a2d9cbdd218f5cbdea14d130c0d02639bc9b3..7f29b74372302b8aa7c3f676b6cb2808640eb859 100644
+--- a/pkg/appolly/app/request/span.go
++++ b/pkg/appolly/app/request/span.go
+@@ -292,9 +292,12 @@ type AWSLambda struct {
+ 	Operation string  `json:"operation"`
+ 	// FunctionName is the bare function name, also when the call used a
+ 	// (partial) ARN; Qualifier is the version or alias, if any.
+-	FunctionName    string `json:"functionName"`
+-	Qualifier       string `json:"qualifier"`
+-	FunctionRegion  string `json:"functionRegion"`
++	FunctionName   string `json:"functionName"`
++	Qualifier      string `json:"qualifier"`
++	FunctionRegion string `json:"functionRegion"`
++	// FunctionARN is the unqualified function ARN, set when the call named the
++	// account (full or partial ARN); empty for calls by bare name.
++	FunctionARN     string `json:"functionArn"`
+ 	InvocationType  string `json:"invocationType"`
+ 	ExecutedVersion string `json:"executedVersion"`
+ 	// FunctionError is the x-amz-function-error response header (the
+@@ -1491,6 +1494,7 @@ func spanAttributes(s *Span) SpanAttributes {
+ 			attrs["awsLambdaFunctionName"] = lambda.FunctionName
+ 			attrs["awsLambdaQualifier"] = lambda.Qualifier
+ 			attrs["awsLambdaFunctionRegion"] = lambda.FunctionRegion
++			attrs["awsLambdaFunctionARN"] = lambda.FunctionARN
+ 			attrs["awsLambdaFunctionError"] = lambda.FunctionError
+ 		}
+ 		if s.SubType == HTTPSubtypeSQLPP {
+diff --git a/pkg/appolly/app/request/span_getters.go b/pkg/appolly/app/request/span_getters.go
+index 634664b880cb3aaf9b73d379b9052b59cf524a07..d8b75c65ba2e6fb77e326c11efd76ed4682320c8 100644
+--- a/pkg/appolly/app/request/span_getters.go
++++ b/pkg/appolly/app/request/span_getters.go
+@@ -403,11 +403,13 @@ func spanOTELGetters(name attr.Name) (attributes.Getter[*Span, attribute.KeyValu
+ 			return AWSExtendedRequestID("")
+ 		}
+ 	case attr.AWSS3Bucket:
++		// Omitted (invalid KeyValue) unless the S3 parser found a bucket, so that
++		// plain HTTP client metrics get no empty label.
+ 		getter = func(s *Span) attribute.KeyValue {
+-			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSS3 && s.AWS != nil {
++			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSS3 && s.AWS != nil && s.AWS.S3.Bucket != "" {
+ 				return AWSS3Bucket(s.AWS.S3.Bucket)
+ 			}
+-			return AWSS3Bucket("")
++			return attribute.KeyValue{}
+ 		}
+ 	case attr.AWSS3Key:
+ 		getter = func(s *Span) attribute.KeyValue {
+@@ -418,10 +420,31 @@ func spanOTELGetters(name attr.Name) (attributes.Getter[*Span, attribute.KeyValu
+ 		}
+ 	case attr.AWSSQSQueueURL:
+ 		getter = func(s *Span) attribute.KeyValue {
+-			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSSQS && s.AWS != nil {
++			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSSQS && s.AWS != nil && s.AWS.SQS.QueueURL != "" {
+ 				return AWSSQSQueueURL(s.AWS.SQS.QueueURL)
+ 			}
+-			return AWSSQSQueueURL("")
++			return attribute.KeyValue{}
++		}
++	case attr.AWSLambdaFunctionARN:
++		getter = func(s *Span) attribute.KeyValue {
++			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSLambda && s.AWS != nil && s.AWS.Lambda.FunctionARN != "" {
++				return AWSLambdaFunctionARN(s.AWS.Lambda.FunctionARN)
++			}
++			return attribute.KeyValue{}
++		}
++	case attr.FaaSInvokedName:
++		getter = func(s *Span) attribute.KeyValue {
++			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSLambda && s.AWS != nil && s.AWS.Lambda.FunctionName != "" {
++				return semconv.FaaSInvokedName(s.AWS.Lambda.FunctionName)
++			}
++			return attribute.KeyValue{}
++		}
++	case attr.FaaSInvokedRegion:
++		getter = func(s *Span) attribute.KeyValue {
++			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSLambda && s.AWS != nil && s.AWS.Lambda.FunctionRegion != "" {
++				return semconv.FaaSInvokedRegion(s.AWS.Lambda.FunctionRegion)
++			}
++			return attribute.KeyValue{}
+ 		}
+ 	case attr.CloudRegion:
+ 		getter = func(s *Span) attribute.KeyValue {
+diff --git a/pkg/appolly/app/request/span_getters_test.go b/pkg/appolly/app/request/span_getters_test.go
+index 7a5dd90cd9d32f2e128917dcb85a3d720d3ad65c..4971b03a0849ab5b8f2c51f74dbb2bbc90fef822 100644
+--- a/pkg/appolly/app/request/span_getters_test.go
++++ b/pkg/appolly/app/request/span_getters_test.go
+@@ -1239,3 +1239,47 @@ func TestSpanOTELGetters_Instance(t *testing.T) {
+ 	assert.Equal(t, string(attr.Instance), string(kv.Key))
+ 	assert.Equal(t, "instance-42", kv.Value.AsString())
+ }
++
++// TestSpanOTELGetters_AWSResourceAttrs: the AWS resource attributes of the HTTP
++// client RED metrics are set only on spans the AWS parsers recognized and are
++// omitted (not emitted empty) everywhere else.
++func TestSpanOTELGetters_AWSResourceAttrs(t *testing.T) {
++	s3 := &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSS3, AWS: &AWS{S3: AWSS3{Bucket: "my-bucket", Method: "GetObject"}}}
++	s3NoBucket := &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSS3, AWS: &AWS{S3: AWSS3{Method: "ListBuckets"}}}
++	sqs := &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSSQS, AWS: &AWS{SQS: AWSSQS{QueueURL: "https://sqs.us-west-2.amazonaws.com/123456789012/q"}}}
++	sqsNoQueue := &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSSQS, AWS: &AWS{SQS: AWSSQS{OperationName: "ListQueues"}}}
++	lambdaARN := &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSLambda, AWS: &AWS{Lambda: AWSLambda{
++		FunctionName: "fn", FunctionRegion: "us-west-2", FunctionARN: "arn:aws:lambda:us-west-2:123456789012:function:fn",
++	}}}
++	lambdaName := &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSLambda, AWS: &AWS{Lambda: AWSLambda{FunctionName: "fn", FunctionRegion: "us-west-2"}}}
++	plain := &Span{Type: EventTypeHTTPClient, Method: "GET", Host: "example.com", Status: 200}
++	server := &Span{Type: EventTypeHTTP, SubType: HTTPSubtypeAWSS3, AWS: &AWS{S3: AWSS3{Bucket: "b"}}}
++
++	tests := []struct {
++		name  attr.Name
++		set   map[*Span]string
++		unset []*Span
++	}{
++		{attr.AWSS3Bucket, map[*Span]string{s3: "my-bucket"}, []*Span{s3NoBucket, sqs, lambdaARN, plain, server}},
++		{attr.AWSSQSQueueURL, map[*Span]string{sqs: "https://sqs.us-west-2.amazonaws.com/123456789012/q"}, []*Span{sqsNoQueue, s3, lambdaARN, plain}},
++		{attr.AWSLambdaFunctionARN, map[*Span]string{lambdaARN: "arn:aws:lambda:us-west-2:123456789012:function:fn"}, []*Span{lambdaName, s3, sqs, plain}},
++		{attr.FaaSInvokedName, map[*Span]string{lambdaARN: "fn", lambdaName: "fn"}, []*Span{s3, sqs, plain}},
++		{attr.FaaSInvokedRegion, map[*Span]string{lambdaARN: "us-west-2", lambdaName: "us-west-2"}, []*Span{s3, sqs, plain}},
++	}
++	for _, tt := range tests {
++		t.Run(string(tt.name), func(t *testing.T) {
++			getter, ok := spanOTELGetters(tt.name)
++			require.True(t, ok)
++			for span, want := range tt.set {
++				kv := getter(span)
++				require.True(t, kv.Valid())
++				assert.Equal(t, string(tt.name), string(kv.Key))
++				assert.Equal(t, want, kv.Value.AsString())
++			}
++			for _, span := range tt.unset {
++				kv := getter(span)
++				assert.False(t, kv.Valid(), "attribute should be omitted, got %v", kv)
++			}
++		})
++	}
++}
+diff --git a/pkg/ebpf/common/http/aws_lambda.go b/pkg/ebpf/common/http/aws_lambda.go
+index 4928e0764995769de95527f93fb4b2e6cbe3ac43..b419c1a0d3dc07175ae21c5362ec9c18a350ab97 100644
+--- a/pkg/ebpf/common/http/aws_lambda.go
++++ b/pkg/ebpf/common/http/aws_lambda.go
+@@ -10,6 +10,7 @@ import (
+ 	"io"
+ 	"net/http"
+ 	"net/url"
++	"regexp"
+ 	"strings"
+ 
+ 	"go.opentelemetry.io/obi/pkg/appolly/app/request"
+@@ -88,6 +89,7 @@ func parseAWSLambda(req *http.Request, resp *http.Response, spanHost string) (re
+ 	if lambda.FunctionRegion == "" {
+ 		lambda.FunctionRegion = lambda.Meta.Region
+ 	}
++	lambda.FunctionARN = lambdaFunctionARN(functionID, lambda.FunctionName, lambda.FunctionRegion)
+ 	lambda.InvocationType = req.Header.Get(lambdaInvocationType)
+ 	lambda.ExecutedVersion = resp.Header.Get(lambdaExecutedVersion)
+ 
+@@ -180,3 +182,37 @@ func parseLambdaFunctionID(id string) (name, qualifier, region string) {
+ 	}
+ 	return name, qualifier, region
+ }
++
++var awsAccountIDRgx = regexp.MustCompile(`^\d{12}$`)
++
++// lambdaFunctionARN returns the unqualified ARN of the invoked function when
++// the FunctionName parameter names the account (full or partial ARN), else "".
++// A call by bare name targets the caller's account, which OBI does not know;
++// the collector can complete it from the cloud.account.id resource attribute.
++//
++//	arn:aws:lambda:us-west-2:123456789012:function:my-function:7 => arn:aws:lambda:us-west-2:123456789012:function:my-function
++//	123456789012:function:my-function:prod (region us-west-2)    => arn:aws:lambda:us-west-2:123456789012:function:my-function
++//	my-function                                                  => ""
++func lambdaFunctionARN(id, name, region string) string {
++	parts := strings.Split(id, ":")
++	switch {
++	case len(parts) >= 7 && parts[0] == "arn" && parts[2] == "lambda" && parts[5] == "function":
++		return strings.Join(parts[:7], ":")
++	case len(parts) >= 3 && parts[1] == "function" && awsAccountIDRgx.MatchString(parts[0]) && region != "":
++		return "arn:" + awsPartition(region) + ":lambda:" + region + ":" + parts[0] + ":function:" + name
++	}
++	return ""
++}
++
++// awsPartition returns the ARN partition of a region (see isAWSRegion for the
++// regions OBI recognizes).
++func awsPartition(region string) string {
++	switch {
++	case strings.HasPrefix(region, "cn-"):
++		return "aws-cn"
++	case strings.HasPrefix(region, "us-gov-"):
++		return "aws-us-gov"
++	default:
++		return "aws"
++	}
++}
+diff --git a/pkg/ebpf/common/http/aws_lambda_test.go b/pkg/ebpf/common/http/aws_lambda_test.go
+index fa8aa021a25ae5acfa08b788b66adc0e7cfc6449..c3888b34c077355e340e9ee3db3dcef58faa9c7a 100644
+--- a/pkg/ebpf/common/http/aws_lambda_test.go
++++ b/pkg/ebpf/common/http/aws_lambda_test.go
+@@ -88,6 +88,7 @@ func TestParseAWSLambda(t *testing.T) {
+ 				Operation:       "Invoke",
+ 				FunctionName:    "my-function",
+ 				FunctionRegion:  "ap-southeast-1",
++				FunctionARN:     "arn:aws:lambda:ap-southeast-1:123456789012:function:my-function",
+ 				ExecutedVersion: "$LATEST",
+ 			},
+ 		},
+@@ -101,6 +102,7 @@ func TestParseAWSLambda(t *testing.T) {
+ 				FunctionName:    "my-function",
+ 				Qualifier:       "live",
+ 				FunctionRegion:  "us-west-2",
++				FunctionARN:     "arn:aws:lambda:us-west-2:123456789012:function:my-function",
+ 				ExecutedVersion: "$LATEST",
+ 			},
+ 		},
+@@ -113,6 +115,7 @@ func TestParseAWSLambda(t *testing.T) {
+ 				Operation:       "Invoke",
+ 				FunctionName:    "fn",
+ 				FunctionRegion:  "cn-north-1",
++				FunctionARN:     "arn:aws-cn:lambda:cn-north-1:123456789012:function:fn",
+ 				ExecutedVersion: "$LATEST",
+ 			},
+ 		},
+@@ -126,6 +129,7 @@ func TestParseAWSLambda(t *testing.T) {
+ 				FunctionName:    "my-function",
+ 				Qualifier:       "3",
+ 				FunctionRegion:  "us-west-2",
++				FunctionARN:     "arn:aws:lambda:us-west-2:123456789012:function:my-function",
+ 				ExecutedVersion: "$LATEST",
+ 			},
+ 		},
+@@ -205,6 +209,7 @@ func TestParseAWSLambda(t *testing.T) {
+ 				FunctionName:    "obi-lambda-test",
+ 				Qualifier:       "live",
+ 				FunctionRegion:  "us-west-2",
++				FunctionARN:     "arn:aws:lambda:us-west-2:123456789012:function:obi-lambda-test",
+ 				ExecutedVersion: "$LATEST",
+ 			},
+ 		},
+@@ -331,6 +336,30 @@ func TestParseLambdaFunctionID(t *testing.T) {
+ 	}
+ }
+ 
++func TestLambdaFunctionARN(t *testing.T) {
++	tests := []struct {
++		id, region, want string
++	}{
++		{"my-function", "us-west-2", ""},
++		{"my-function:prod", "us-west-2", ""},
++		{"123456789012:function:my-function", "us-west-2", "arn:aws:lambda:us-west-2:123456789012:function:my-function"},
++		{"123456789012:function:my-function:prod", "eu-west-1", "arn:aws:lambda:eu-west-1:123456789012:function:my-function"},
++		{"123456789012:function:my-function", "cn-northwest-1", "arn:aws-cn:lambda:cn-northwest-1:123456789012:function:my-function"},
++		{"123456789012:function:my-function", "us-gov-west-1", "arn:aws-us-gov:lambda:us-gov-west-1:123456789012:function:my-function"},
++		{"12345:function:my-function", "us-west-2", ""},
++		{"123456789012:function:my-function", "", ""},
++		{"arn:aws:lambda:us-west-2:123456789012:function:my-function", "eu-west-1", "arn:aws:lambda:us-west-2:123456789012:function:my-function"},
++		{"arn:aws:lambda:us-west-2:123456789012:function:my-function:$LATEST", "us-west-2", "arn:aws:lambda:us-west-2:123456789012:function:my-function"},
++		{"arn:aws-us-gov:lambda:us-gov-west-1:123456789012:function:f:live", "us-gov-west-1", "arn:aws-us-gov:lambda:us-gov-west-1:123456789012:function:f"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.id, func(t *testing.T) {
++			name, _, _ := parseLambdaFunctionID(tt.id)
++			assert.Equal(t, tt.want, lambdaFunctionARN(tt.id, name, tt.region))
++		})
++	}
++}
++
+ func TestAWSLambdaSpan(t *testing.T) {
+ 	base := request.Span{Type: request.EventTypeHTTPClient, Method: http.MethodPost, Status: http.StatusOK}
+ 
+diff --git a/pkg/ebpf/common/http/aws_sqs.go b/pkg/ebpf/common/http/aws_sqs.go
+index 78288cb9eba8d2e574f0061056c03e1883498cd7..2e196c5a4d4bc2fae1fab85696900a2260786876 100644
+--- a/pkg/ebpf/common/http/aws_sqs.go
++++ b/pkg/ebpf/common/http/aws_sqs.go
+@@ -42,13 +42,13 @@ func AWSSQSSpan(baseSpan *request.Span, req *http.Request, resp *http.Response)
+ func parseAWSSQS(req *http.Request, resp *http.Response) (request.AWSSQS, error) {
+ 	sqs := request.AWSSQS{}
+ 
+-	reqB, err := io.ReadAll(req.Body)
++	reqB, err := readCapturedBody(req.Body)
+ 	if err != nil {
+ 		return sqs, fmt.Errorf("read SQS request body: %w", err)
+ 	}
+ 	req.Body = io.NopCloser(bytes.NewBuffer(reqB))
+ 
+-	respB, err := io.ReadAll(resp.Body)
++	respB, err := readCapturedBody(resp.Body)
+ 	if err != nil {
+ 		return sqs, fmt.Errorf("read SQS response body: %w", err)
+ 	}
+@@ -125,3 +125,16 @@ func inferSQSOperationType(opName string) string {
+ 		return ""
+ 	}
+ }
++
++// readCapturedBody reads a body rebuilt from the captured HTTP buffer. The
++// capture may end before Content-Length (large buffer size, or the body was
++// written after the span ended), which surfaces as io.ErrUnexpectedEOF: keep
++// what was captured instead of failing, the request headers and queue URL do
++// not depend on the rest.
++func readCapturedBody(body io.Reader) ([]byte, error) {
++	b, err := io.ReadAll(body)
++	if errors.Is(err, io.ErrUnexpectedEOF) {
++		return b, nil
++	}
++	return b, err
++}
+diff --git a/pkg/ebpf/common/http/aws_sqs_test.go b/pkg/ebpf/common/http/aws_sqs_test.go
+index 89296184e56d8642a56d2bbe507db8a5ebbeabbf..2cedb86ffad4a77e96d89b9c5776059de912c2d8 100644
+--- a/pkg/ebpf/common/http/aws_sqs_test.go
++++ b/pkg/ebpf/common/http/aws_sqs_test.go
+@@ -4,6 +4,7 @@
+ package ebpfcommon
+ 
+ import (
++	"bufio"
+ 	"io"
+ 	"net/http"
+ 	"strings"
+@@ -191,6 +192,35 @@ func TestParseAWSSQS(t *testing.T) {
+ 			},
+ 			wantErr: false,
+ 		},
++		{
++			// Go clients: the captured response may end before Content-Length.
++			name: "response body truncated by the capture",
++			req: func() *http.Request {
++				body := `{"QueueUrl":"https://sqs.us-west-2.amazonaws.com/123456789012/q","MaxNumberOfMessages":1}`
++				r, _ := http.NewRequest(http.MethodPost, "https://sqs.us-west-2.amazonaws.com/", io.NopCloser(strings.NewReader(body)))
++				r.Header.Set("x-amz-target", "AmazonSQS.ReceiveMessage")
++				return r
++			}(),
++			resp: func() *http.Response {
++				raw := "HTTP/1.1 200 OK\r\nX-Amzn-RequestId: reqid-trunc\r\nContent-Length: 400\r\n\r\n{\"Messa"
++				r, err := http.ReadResponse(bufio.NewReader(strings.NewReader(raw)), nil)
++				if err != nil {
++					panic(err)
++				}
++				return r
++			}(),
++			want: request.AWSSQS{
++				Meta: request.AWSMeta{
++					Region:    "us-west-2",
++					RequestID: "reqid-trunc",
++				},
++				OperationName: "ReceiveMessage",
++				OperationType: "receive",
++				QueueURL:      "https://sqs.us-west-2.amazonaws.com/123456789012/q",
++				Destination:   "q",
++			},
++			wantErr: false,
++		},
+ 	}
+ 
+ 	for _, tt := range tests {
+diff --git a/pkg/export/attributes/attr_defs.go b/pkg/export/attributes/attr_defs.go
+index 12e8507575b70d0492b3f984169d5daf3f20643a..65afc9295ec2840ef2cf0eb99dd82707c1688934 100644
+--- a/pkg/export/attributes/attr_defs.go
++++ b/pkg/export/attributes/attr_defs.go
+@@ -313,13 +313,20 @@ func getDefinitions(
+ 		extraGroupAttributes[GroupServerInfo],
+ 	)
+ 
++	// AWS resource attributes (EXPERIMENTAL) are only set on client spans the
++	// AWS SDK parsers recognized; plain HTTP client metrics never carry them.
+ 	httpClientInfo := NewAttrReportGroup(
+ 		false,
+ 		nil,
+ 		map[attr.Name]Default{
+-			attr.ServerAddr:      true,
+-			attr.ServerPort:      true,
+-			attr.PeerServiceName: true,
++			attr.ServerAddr:           true,
++			attr.ServerPort:           true,
++			attr.PeerServiceName:      true,
++			attr.AWSS3Bucket:          true,
++			attr.AWSSQSQueueURL:       true,
++			attr.AWSLambdaFunctionARN: true,
++			attr.FaaSInvokedName:      true,
++			attr.FaaSInvokedRegion:    true,
+ 		},
+ 		extraGroupAttributes[GroupHTTPClientInfo],
+ 	)
+diff --git a/pkg/export/attributes/attr_selector_test.go b/pkg/export/attributes/attr_selector_test.go
+index 347660329366bdd0eb2a1e32113b1b798e52971a..236c7a0e44f80bbde436d8c33fe9b9e64a4c82ce 100644
+--- a/pkg/export/attributes/attr_selector_test.go
++++ b/pkg/export/attributes/attr_selector_test.go
+@@ -295,3 +295,20 @@ func TestTracesGenAIToolCallAttributes(t *testing.T) {
+ 	assert.NotContains(t, p.For(Traces), attr.GenAIToolCallArguments)
+ 	assert.NotContains(t, p.For(Traces), attr.GenAIToolCallResult)
+ }
++
++func TestHTTPClientAWSResourceAttributes(t *testing.T) {
++	p, err := NewAttrSelector(AttrGroups(0), &SelectorConfig{})
++	require.NoError(t, err)
++
++	awsAttrs := []attr.Name{
++		attr.AWSS3Bucket, attr.AWSSQSQueueURL, attr.AWSLambdaFunctionARN,
++		attr.FaaSInvokedName, attr.FaaSInvokedRegion,
++	}
++	for _, section := range []Section{HTTPClientDuration.Section, HTTPClientRequestSize.Section, HTTPClientResponseSize.Section} {
++		assert.Subset(t, p.For(Name{Section: section}), awsAttrs, "client RED metric %s", section)
++	}
++	for _, section := range []Section{HTTPServerDuration.Section, RPCClientDuration.Section} {
++		assert.NotContains(t, p.For(Name{Section: section}), attr.AWSLambdaFunctionARN, section)
++		assert.NotContains(t, p.For(Name{Section: section}), attr.AWSS3Bucket, section)
++	}
++}
+diff --git a/pkg/export/attributes/names/attrs.go b/pkg/export/attributes/names/attrs.go
+index a767923e50ef451799f5bc844a58ac31a27e43a1..65ca3425b91f946cf917f7aca92d246d75bea6d2 100644
+--- a/pkg/export/attributes/names/attrs.go
++++ b/pkg/export/attributes/names/attrs.go
+@@ -105,6 +105,18 @@ const PeerServiceName = Name("peer.service.name")
+ // Host header when X-Forwarded-Host is absent (EXPERIMENTAL). Server spans only.
+ const XForwardedHost = Name("x-forwarded-host")
+ 
++// AWSLambdaFunctionARN is the unqualified ARN of the Lambda function an Invoke
++// call targets. No semconv attribute covers the client side (aws.lambda.invoked_arn
++// is the server-side, possibly qualified, ARN), so the name follows the AWS SDK
++// instrumentation used by ADOT / Application Signals.
++const AWSLambdaFunctionARN = Name("aws.lambda.function.arn")
++
++// FaaS client attributes (outgoing invocations).
++var (
++	FaaSInvokedName   = Name(semconv.FaaSInvokedNameKey)
++	FaaSInvokedRegion = Name(semconv.FaaSInvokedRegionKey)
++)
++
+ // HTTPRequestHeaderKey returns the attribute key for a request header (lowercased).
+ func HTTPRequestHeaderKey(name string) string {
+ 	return HTTPRequestHeaderPrefix + strings.ToLower(name)
+diff --git a/pkg/export/otel/metrics_test.go b/pkg/export/otel/metrics_test.go
+index eec30aa53e76328d9d729ac518ebf51a51a91115..c845b046f14ed43c955e4bf22ed0625bf8c2a72c 100644
+--- a/pkg/export/otel/metrics_test.go
++++ b/pkg/export/otel/metrics_test.go
+@@ -1907,3 +1907,85 @@ func resourcesMatch(t *testing.T, one *TargetMetrics, two *TargetMetrics) {
+ 		assert.Equal(t, a.Value.AsString(), other.AsString())
+ 	}
+ }
++
++// TestAppMetrics_HTTPClientAWSResourceAttributes: http.client.request.duration
++// carries the AWS resource attributes for spans the AWS parsers recognized, and
++// a plain HTTP client datapoint carries none of them (not even empty).
++func TestAppMetrics_HTTPClientAWSResourceAttributes(t *testing.T) {
++	ctx := t.Context()
++	metricRecords := make(chan collector.MetricRecord, 100)
++	metrics := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(10))
++	processEvents := msg.NewQueue[exec.ProcessEvent](msg.ChannelBufferLen(10))
++	mcfg := &otelcfg.MetricsConfig{
++		Interval:          50 * time.Millisecond,
++		TTL:               30 * time.Minute,
++		ReportersCacheLen: 10,
++		Instrumentations:  []instrumentations.Instrumentation{instrumentations.InstrumentationHTTP},
++		MetricsConsumer:   testMetricsConsumer(metricRecords),
++	}
++	reporter, err := newMetricsReporter(
++		ctx,
++		&global.ContextInfo{OTELMetricsExporter: &otelcfg.MetricsExporterInstancer{Cfg: mcfg}},
++		mcfg,
++		&perapp.GlobalMetricsConfig{Features: export.FeatureApplicationRED},
++		&attributes.SelectorConfig{},
++		request.UnresolvedNames{},
++		metrics,
++		processEvents,
++	)
++	require.NoError(t, err)
++	go reporter.reportMetrics(ctx)
++
++	svcAttrs := svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}
++	span := func(host string, subType int, aws *request.AWS) request.Span {
++		return request.Span{
++			Service: svcAttrs, Type: request.EventTypeHTTPClient, SubType: subType, AWS: aws,
++			Method: "POST", Path: "/", Host: host, HostPort: 443, Status: 200, RequestStart: 100, End: 200,
++		}
++	}
++	metrics.Send([]request.Span{
++		span("example.com", request.HTTPSubtypeNone, nil),
++		span("my-bucket.s3.us-west-2.amazonaws.com", request.HTTPSubtypeAWSS3, &request.AWS{S3: request.AWSS3{Bucket: "my-bucket", Method: "PutObject"}}),
++		span("sqs.us-west-2.amazonaws.com", request.HTTPSubtypeAWSSQS, &request.AWS{SQS: request.AWSSQS{QueueURL: "https://sqs.us-west-2.amazonaws.com/123456789012/q"}}),
++		span("lambda.us-west-2.amazonaws.com", request.HTTPSubtypeAWSLambda, &request.AWS{Lambda: request.AWSLambda{
++			Operation: "Invoke", FunctionName: "fn", FunctionRegion: "us-west-2", FunctionARN: "arn:aws:lambda:us-west-2:123456789012:function:fn",
++		}}),
++	})
++
++	awsKeys := []string{"aws.s3.bucket", "aws.sqs.queue.url", "aws.lambda.function.arn", "faas.invoked_name", "faas.invoked_region"}
++	want := map[string]map[string]string{
++		"example.com":                          {},
++		"my-bucket.s3.us-west-2.amazonaws.com": {"aws.s3.bucket": "my-bucket"},
++		"sqs.us-west-2.amazonaws.com":          {"aws.sqs.queue.url": "https://sqs.us-west-2.amazonaws.com/123456789012/q"},
++		"lambda.us-west-2.amazonaws.com": {
++			"aws.lambda.function.arn": "arn:aws:lambda:us-west-2:123456789012:function:fn",
++			"faas.invoked_name":       "fn",
++			"faas.invoked_region":     "us-west-2",
++		},
++	}
++	got := map[string]map[string]string{}
++	deadline := time.After(timeout)
++	for len(got) < len(want) {
++		select {
++		case r := <-metricRecords:
++			if r.Name != attributes.HTTPClientDuration.OTEL {
++				continue
++			}
++			got[r.Attributes["server.address"]] = r.Attributes
++		case <-deadline:
++			require.Failf(t, "timeout", "got datapoints for %v", got)
++		}
++	}
++	for host, wantAttrs := range want {
++		attrs, ok := got[host]
++		require.True(t, ok, host)
++		for _, k := range awsKeys {
++			v, present := attrs[k]
++			if wv, expected := wantAttrs[k]; expected {
++				assert.Equal(t, wv, v, "%s %s", host, k)
++			} else {
++				assert.False(t, present, "%s must not carry %s (got %q)", host, k, v)
++			}
++		}
++	}
++}
+diff --git a/pkg/export/otel/tracesgen/tracesgen.go b/pkg/export/otel/tracesgen/tracesgen.go
+index 79d341835d1ef1cb5fdc0acbd6ddd4beb46801c1..0e042c01f718583c95c660efff110f6e074672b5 100644
+--- a/pkg/export/otel/tracesgen/tracesgen.go
++++ b/pkg/export/otel/tracesgen/tracesgen.go
+@@ -727,6 +727,9 @@ func traceAttributesSelectorInternal(span *request.Span, optionalAttrs map[attr.
+ 			attrs = append(attrs, semconv.FaaSInvokedName(lambda.FunctionName))
+ 			attrs = append(attrs, semconv.FaaSInvokedProviderAWS)
+ 			attrs = append(attrs, semconv.FaaSInvokedRegion(lambda.FunctionRegion))
++			if lambda.FunctionARN != "" {
++				attrs = append(attrs, request.AWSLambdaFunctionARN(lambda.FunctionARN))
++			}
+ 			// error.type only applies to failed invocations: omit it otherwise.
+ 			if lambda.ErrorType != "" {
+ 				attrs = append(attrs, request.ErrorType(lambda.ErrorType))
+diff --git a/pkg/export/otel/tracesgen/tracesgen_test.go b/pkg/export/otel/tracesgen/tracesgen_test.go
+index 08321d13009ccb196bd2e6fd245a6d5ce565ede3..7bcdef9d9f49a7fc260f85f494afba89f067ab4e 100644
+--- a/pkg/export/otel/tracesgen/tracesgen_test.go
++++ b/pkg/export/otel/tracesgen/tracesgen_test.go
+@@ -1404,11 +1404,19 @@ func TestTraceAttributesSelector_AWSLambda(t *testing.T) {
+ 	}
+ 	_, ok := selected.Get("error.type")
+ 	assert.False(t, ok, "error.type must be omitted on success")
++	_, ok = selected.Get("aws.lambda.function.arn")
++	assert.False(t, ok, "aws.lambda.function.arn must be omitted when unknown")
++
++	span.AWS.Lambda.FunctionARN = "arn:aws:lambda:eu-west-1:123456789012:function:fn"
++	selected = AttrsToMap(TraceAttributesSelector(span, defaultAttrs))
++	v, ok := selected.Get("aws.lambda.function.arn")
++	require.True(t, ok)
++	assert.Equal(t, "arn:aws:lambda:eu-west-1:123456789012:function:fn", v.Str())
+ 
+ 	span.AWS.Lambda.FunctionError = "Unhandled"
+ 	span.AWS.Lambda.ErrorType = "ValueError"
+ 	selected = AttrsToMap(TraceAttributesSelector(span, defaultAttrs))
+-	v, ok := selected.Get("error.type")
++	v, ok = selected.Get("error.type")
+ 	require.True(t, ok)
+ 	assert.Equal(t, "ValueError", v.Str())
+ }

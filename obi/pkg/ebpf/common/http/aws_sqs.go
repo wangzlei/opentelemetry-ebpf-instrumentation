@@ -42,13 +42,13 @@ func AWSSQSSpan(baseSpan *request.Span, req *http.Request, resp *http.Response) 
 func parseAWSSQS(req *http.Request, resp *http.Response) (request.AWSSQS, error) {
 	sqs := request.AWSSQS{}
 
-	reqB, err := io.ReadAll(req.Body)
+	reqB, err := readCapturedBody(req.Body)
 	if err != nil {
 		return sqs, fmt.Errorf("read SQS request body: %w", err)
 	}
 	req.Body = io.NopCloser(bytes.NewBuffer(reqB))
 
-	respB, err := io.ReadAll(resp.Body)
+	respB, err := readCapturedBody(resp.Body)
 	if err != nil {
 		return sqs, fmt.Errorf("read SQS response body: %w", err)
 	}
@@ -124,4 +124,17 @@ func inferSQSOperationType(opName string) string {
 	default:
 		return ""
 	}
+}
+
+// readCapturedBody reads a body rebuilt from the captured HTTP buffer. The
+// capture may end before Content-Length (large buffer size, or the body was
+// written after the span ended), which surfaces as io.ErrUnexpectedEOF: keep
+// what was captured instead of failing, the request headers and queue URL do
+// not depend on the rest.
+func readCapturedBody(body io.Reader) ([]byte, error) {
+	b, err := io.ReadAll(body)
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return b, nil
+	}
+	return b, err
 }

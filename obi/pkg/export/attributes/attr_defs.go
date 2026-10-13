@@ -313,13 +313,20 @@ func getDefinitions(
 		extraGroupAttributes[GroupServerInfo],
 	)
 
+	// AWS resource attributes (EXPERIMENTAL) are only set on client spans the
+	// AWS SDK parsers recognized; plain HTTP client metrics never carry them.
 	httpClientInfo := NewAttrReportGroup(
 		false,
 		nil,
 		map[attr.Name]Default{
-			attr.ServerAddr:      true,
-			attr.ServerPort:      true,
-			attr.PeerServiceName: true,
+			attr.ServerAddr:           true,
+			attr.ServerPort:           true,
+			attr.PeerServiceName:      true,
+			attr.AWSS3Bucket:          true,
+			attr.AWSSQSQueueURL:       true,
+			attr.AWSLambdaFunctionARN: true,
+			attr.FaaSInvokedName:      true,
+			attr.FaaSInvokedRegion:    true,
 		},
 		extraGroupAttributes[GroupHTTPClientInfo],
 	)

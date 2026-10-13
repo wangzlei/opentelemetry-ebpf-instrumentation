@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wangzlei <66336933+wangzlei@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 05:44:59 +0000
+Subject: [PATCH] exp: default eBPF config: complete aws.lambda.function.arn
+ for Lambda calls by name
+
+adot-obi patch 08-aws-red-attrs puts aws.lambda.function.arn on Lambda Invoke
+spans and HTTP client RED metrics when the call names the account (full or
+partial ARN). For calls by bare function name transform/aws now builds
+arn:<partition>:lambda:<faas.invoked_region>:<cloud.account.id>:function:<faas.invoked_name>
+from the host's cloud.account.id (span and datapoint context), so calls by name
+and by ARN land in the same series. Same change as adot-obi config/otel.yaml.
+---
+ .../amazon-cloudwatch-agent-ebpf.yaml            | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml b/packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml
+index a29c801f..51206830 100644
+--- a/packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml
++++ b/packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml
+@@ -105,6 +105,14 @@ processors:
+           - replace_pattern(attributes["host.ip"], "-", ".") where attributes["host.ip"] != nil
+           - set(attributes["aws.vpc.id"], "${env:AWS_VPC_ID}") where "${env:AWS_VPC_ID}" != ""
+           - set(attributes["aws.subnet.id"], "${env:AWS_SUBNET_ID}") where "${env:AWS_SUBNET_ID}" != ""
++      # Lambda Invoke by bare function name: OBI cannot know the account, so complete
++      # aws.lambda.function.arn from the host's cloud.account.id (the caller's account
++      # unless it uses cross-account credentials) + faas.invoked_region / _name.
++      - context: span
++        statements:
++          - set(attributes["aws.lambda.function.arn"], Concat(["arn:aws:lambda:", attributes["faas.invoked_region"], ":", resource.attributes["cloud.account.id"], ":function:", attributes["faas.invoked_name"]], "")) where attributes["aws.lambda.function.arn"] == nil and attributes["faas.invoked_name"] != nil and attributes["faas.invoked_region"] != nil and resource.attributes["cloud.account.id"] != nil
++          - replace_pattern(attributes["aws.lambda.function.arn"], "^arn:aws:lambda:cn-", "arn:aws-cn:lambda:cn-") where attributes["aws.lambda.function.arn"] != nil
++          - replace_pattern(attributes["aws.lambda.function.arn"], "^arn:aws:lambda:us-gov-", "arn:aws-us-gov:lambda:us-gov-") where attributes["aws.lambda.function.arn"] != nil
+     metric_statements:
+       - context: resource
+         statements:
+@@ -117,6 +125,14 @@ processors:
+           - replace_pattern(attributes["host.ip"], "-", ".") where attributes["host.ip"] != nil
+           - set(attributes["aws.vpc.id"], "${env:AWS_VPC_ID}") where "${env:AWS_VPC_ID}" != ""
+           - set(attributes["aws.subnet.id"], "${env:AWS_SUBNET_ID}") where "${env:AWS_SUBNET_ID}" != ""
++      # Lambda Invoke by bare function name: OBI cannot know the account, so complete
++      # aws.lambda.function.arn from the host's cloud.account.id (the caller's account
++      # unless it uses cross-account credentials) + faas.invoked_region / _name.
++      - context: datapoint
++        statements:
++          - set(attributes["aws.lambda.function.arn"], Concat(["arn:aws:lambda:", attributes["faas.invoked_region"], ":", resource.attributes["cloud.account.id"], ":function:", attributes["faas.invoked_name"]], "")) where attributes["aws.lambda.function.arn"] == nil and attributes["faas.invoked_name"] != nil and attributes["faas.invoked_region"] != nil and resource.attributes["cloud.account.id"] != nil
++          - replace_pattern(attributes["aws.lambda.function.arn"], "^arn:aws:lambda:cn-", "arn:aws-cn:lambda:cn-") where attributes["aws.lambda.function.arn"] != nil
++          - replace_pattern(attributes["aws.lambda.function.arn"], "^arn:aws:lambda:us-gov-", "arn:aws-us-gov:lambda:us-gov-") where attributes["aws.lambda.function.arn"] != nil
+   # CloudWatch OTLP metrics require delta temporality; OBI emits cumulative.
+   cumulativetodelta: {}
+   # CloudWatch OTLP accepts at most 1000 datapoints per request.

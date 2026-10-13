@@ -105,6 +105,18 @@ const PeerServiceName = Name("peer.service.name")
 // Host header when X-Forwarded-Host is absent (EXPERIMENTAL). Server spans only.
 const XForwardedHost = Name("x-forwarded-host")
 
+// AWSLambdaFunctionARN is the unqualified ARN of the Lambda function an Invoke
+// call targets. No semconv attribute covers the client side (aws.lambda.invoked_arn
+// is the server-side, possibly qualified, ARN), so the name follows the AWS SDK
+// instrumentation used by ADOT / Application Signals.
+const AWSLambdaFunctionARN = Name("aws.lambda.function.arn")
+
+// FaaS client attributes (outgoing invocations).
+var (
+	FaaSInvokedName   = Name(semconv.FaaSInvokedNameKey)
+	FaaSInvokedRegion = Name(semconv.FaaSInvokedRegionKey)
+)
+
 // HTTPRequestHeaderKey returns the attribute key for a request header (lowercased).
 func HTTPRequestHeaderKey(name string) string {
 	return HTTPRequestHeaderPrefix + strings.ToLower(name)

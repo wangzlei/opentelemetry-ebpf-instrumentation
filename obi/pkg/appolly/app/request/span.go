@@ -292,9 +292,12 @@ type AWSLambda struct {
 	Operation string  `json:"operation"`
 	// FunctionName is the bare function name, also when the call used a
 	// (partial) ARN; Qualifier is the version or alias, if any.
-	FunctionName    string `json:"functionName"`
-	Qualifier       string `json:"qualifier"`
-	FunctionRegion  string `json:"functionRegion"`
+	FunctionName   string `json:"functionName"`
+	Qualifier      string `json:"qualifier"`
+	FunctionRegion string `json:"functionRegion"`
+	// FunctionARN is the unqualified function ARN, set when the call named the
+	// account (full or partial ARN); empty for calls by bare name.
+	FunctionARN     string `json:"functionArn"`
 	InvocationType  string `json:"invocationType"`
 	ExecutedVersion string `json:"executedVersion"`
 	// FunctionError is the x-amz-function-error response header (the
@@ -1491,6 +1494,7 @@ func spanAttributes(s *Span) SpanAttributes {
 			attrs["awsLambdaFunctionName"] = lambda.FunctionName
 			attrs["awsLambdaQualifier"] = lambda.Qualifier
 			attrs["awsLambdaFunctionRegion"] = lambda.FunctionRegion
+			attrs["awsLambdaFunctionARN"] = lambda.FunctionARN
 			attrs["awsLambdaFunctionError"] = lambda.FunctionError
 		}
 		if s.SubType == HTTPSubtypeSQLPP {

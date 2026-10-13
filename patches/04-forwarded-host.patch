@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: wangzlei <66336933+wangzlei@users.noreply.github.com>
 Date: Wed, 7 Oct 2026 20:38:15 -0700
-Subject: [PATCH 4/8] forwarded-host: X-Forwarded-Host / Host on server spans
+Subject: [PATCH 4/9] forwarded-host: X-Forwarded-Host / Host on server spans
  and HTTP server RED
 
 Record the front-door name an incoming HTTP request was addressed to: the

@@ -1239,3 +1239,47 @@ func TestSpanOTELGetters_Instance(t *testing.T) {
 	assert.Equal(t, string(attr.Instance), string(kv.Key))
 	assert.Equal(t, "instance-42", kv.Value.AsString())
 }
+
+// TestSpanOTELGetters_AWSResourceAttrs: the AWS resource attributes of the HTTP
+// client RED metrics are set only on spans the AWS parsers recognized and are
+// omitted (not emitted empty) everywhere else.
+func TestSpanOTELGetters_AWSResourceAttrs(t *testing.T) {
+	s3 := &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSS3, AWS: &AWS{S3: AWSS3{Bucket: "my-bucket", Method: "GetObject"}}}
+	s3NoBucket := &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSS3, AWS: &AWS{S3: AWSS3{Method: "ListBuckets"}}}
+	sqs := &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSSQS, AWS: &AWS{SQS: AWSSQS{QueueURL: "https://sqs.us-west-2.amazonaws.com/123456789012/q"}}}
+	sqsNoQueue := &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSSQS, AWS: &AWS{SQS: AWSSQS{OperationName: "ListQueues"}}}
+	lambdaARN := &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSLambda, AWS: &AWS{Lambda: AWSLambda{
+		FunctionName: "fn", FunctionRegion: "us-west-2", FunctionARN: "arn:aws:lambda:us-west-2:123456789012:function:fn",
+	}}}
+	lambdaName := &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSLambda, AWS: &AWS{Lambda: AWSLambda{FunctionName: "fn", FunctionRegion: "us-west-2"}}}
+	plain := &Span{Type: EventTypeHTTPClient, Method: "GET", Host: "example.com", Status: 200}
+	server := &Span{Type: EventTypeHTTP, SubType: HTTPSubtypeAWSS3, AWS: &AWS{S3: AWSS3{Bucket: "b"}}}
+
+	tests := []struct {
+		name  attr.Name
+		set   map[*Span]string
+		unset []*Span
+	}{
+		{attr.AWSS3Bucket, map[*Span]string{s3: "my-bucket"}, []*Span{s3NoBucket, sqs, lambdaARN, plain, server}},
+		{attr.AWSSQSQueueURL, map[*Span]string{sqs: "https://sqs.us-west-2.amazonaws.com/123456789012/q"}, []*Span{sqsNoQueue, s3, lambdaARN, plain}},
+		{attr.AWSLambdaFunctionARN, map[*Span]string{lambdaARN: "arn:aws:lambda:us-west-2:123456789012:function:fn"}, []*Span{lambdaName, s3, sqs, plain}},
+		{attr.FaaSInvokedName, map[*Span]string{lambdaARN: "fn", lambdaName: "fn"}, []*Span{s3, sqs, plain}},
+		{attr.FaaSInvokedRegion, map[*Span]string{lambdaARN: "us-west-2", lambdaName: "us-west-2"}, []*Span{s3, sqs, plain}},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.name), func(t *testing.T) {
+			getter, ok := spanOTELGetters(tt.name)
+			require.True(t, ok)
+			for span, want := range tt.set {
+				kv := getter(span)
+				require.True(t, kv.Valid())
+				assert.Equal(t, string(tt.name), string(kv.Key))
+				assert.Equal(t, want, kv.Value.AsString())
+			}
+			for _, span := range tt.unset {
+				kv := getter(span)
+				assert.False(t, kv.Valid(), "attribute should be omitted, got %v", kv)
+			}
+		})
+	}
+}

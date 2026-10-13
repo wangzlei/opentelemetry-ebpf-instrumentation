@@ -4,6 +4,7 @@
 package ebpfcommon
 
 import (
+	"bufio"
 	"io"
 	"net/http"
 	"strings"
@@ -188,6 +189,35 @@ func TestParseAWSSQS(t *testing.T) {
 				MessageID:     "abc123",
 				QueueURL:      "https://sqs.us-east-1.amazonaws.com/123456789012/test-queue",
 				Destination:   "test-queue",
+			},
+			wantErr: false,
+		},
+		{
+			// Go clients: the captured response may end before Content-Length.
+			name: "response body truncated by the capture",
+			req: func() *http.Request {
+				body := `{"QueueUrl":"https://sqs.us-west-2.amazonaws.com/123456789012/q","MaxNumberOfMessages":1}`
+				r, _ := http.NewRequest(http.MethodPost, "https://sqs.us-west-2.amazonaws.com/", io.NopCloser(strings.NewReader(body)))
+				r.Header.Set("x-amz-target", "AmazonSQS.ReceiveMessage")
+				return r
+			}(),
+			resp: func() *http.Response {
+				raw := "HTTP/1.1 200 OK\r\nX-Amzn-RequestId: reqid-trunc\r\nContent-Length: 400\r\n\r\n{\"Messa"
+				r, err := http.ReadResponse(bufio.NewReader(strings.NewReader(raw)), nil)
+				if err != nil {
+					panic(err)
+				}
+				return r
+			}(),
+			want: request.AWSSQS{
+				Meta: request.AWSMeta{
+					Region:    "us-west-2",
+					RequestID: "reqid-trunc",
+				},
+				OperationName: "ReceiveMessage",
+				OperationType: "receive",
+				QueueURL:      "https://sqs.us-west-2.amazonaws.com/123456789012/q",
+				Destination:   "q",
 			},
 			wantErr: false,
 		},

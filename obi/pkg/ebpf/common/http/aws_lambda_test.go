@@ -88,6 +88,7 @@ func TestParseAWSLambda(t *testing.T) {
 				Operation:       "Invoke",
 				FunctionName:    "my-function",
 				FunctionRegion:  "ap-southeast-1",
+				FunctionARN:     "arn:aws:lambda:ap-southeast-1:123456789012:function:my-function",
 				ExecutedVersion: "$LATEST",
 			},
 		},
@@ -101,6 +102,7 @@ func TestParseAWSLambda(t *testing.T) {
 				FunctionName:    "my-function",
 				Qualifier:       "live",
 				FunctionRegion:  "us-west-2",
+				FunctionARN:     "arn:aws:lambda:us-west-2:123456789012:function:my-function",
 				ExecutedVersion: "$LATEST",
 			},
 		},
@@ -113,6 +115,7 @@ func TestParseAWSLambda(t *testing.T) {
 				Operation:       "Invoke",
 				FunctionName:    "fn",
 				FunctionRegion:  "cn-north-1",
+				FunctionARN:     "arn:aws-cn:lambda:cn-north-1:123456789012:function:fn",
 				ExecutedVersion: "$LATEST",
 			},
 		},
@@ -126,6 +129,7 @@ func TestParseAWSLambda(t *testing.T) {
 				FunctionName:    "my-function",
 				Qualifier:       "3",
 				FunctionRegion:  "us-west-2",
+				FunctionARN:     "arn:aws:lambda:us-west-2:123456789012:function:my-function",
 				ExecutedVersion: "$LATEST",
 			},
 		},
@@ -205,6 +209,7 @@ func TestParseAWSLambda(t *testing.T) {
 				FunctionName:    "obi-lambda-test",
 				Qualifier:       "live",
 				FunctionRegion:  "us-west-2",
+				FunctionARN:     "arn:aws:lambda:us-west-2:123456789012:function:obi-lambda-test",
 				ExecutedVersion: "$LATEST",
 			},
 		},
@@ -327,6 +332,30 @@ func TestParseLambdaFunctionID(t *testing.T) {
 			assert.Equal(t, tt.name, name)
 			assert.Equal(t, tt.qualifier, qualifier)
 			assert.Equal(t, tt.region, region)
+		})
+	}
+}
+
+func TestLambdaFunctionARN(t *testing.T) {
+	tests := []struct {
+		id, region, want string
+	}{
+		{"my-function", "us-west-2", ""},
+		{"my-function:prod", "us-west-2", ""},
+		{"123456789012:function:my-function", "us-west-2", "arn:aws:lambda:us-west-2:123456789012:function:my-function"},
+		{"123456789012:function:my-function:prod", "eu-west-1", "arn:aws:lambda:eu-west-1:123456789012:function:my-function"},
+		{"123456789012:function:my-function", "cn-northwest-1", "arn:aws-cn:lambda:cn-northwest-1:123456789012:function:my-function"},
+		{"123456789012:function:my-function", "us-gov-west-1", "arn:aws-us-gov:lambda:us-gov-west-1:123456789012:function:my-function"},
+		{"12345:function:my-function", "us-west-2", ""},
+		{"123456789012:function:my-function", "", ""},
+		{"arn:aws:lambda:us-west-2:123456789012:function:my-function", "eu-west-1", "arn:aws:lambda:us-west-2:123456789012:function:my-function"},
+		{"arn:aws:lambda:us-west-2:123456789012:function:my-function:$LATEST", "us-west-2", "arn:aws:lambda:us-west-2:123456789012:function:my-function"},
+		{"arn:aws-us-gov:lambda:us-gov-west-1:123456789012:function:f:live", "us-gov-west-1", "arn:aws-us-gov:lambda:us-gov-west-1:123456789012:function:f"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.id, func(t *testing.T) {
+			name, _, _ := parseLambdaFunctionID(tt.id)
+			assert.Equal(t, tt.want, lambdaFunctionARN(tt.id, name, tt.region))
 		})
 	}
 }

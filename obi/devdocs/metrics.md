@@ -82,6 +82,28 @@ In the following methods:
 
 the actual metrics are created using the names defined in [pkg/export/attributes/metric.go](../pkg/export/attributes/metric.go) with the attributes defined and added in [pkg/export/attributes/attr_defs.go](../pkg/export/attributes/attr_defs.go).
 
+### AWS resource attributes on HTTP client metrics (ADOT, experimental)
+
+With `payload_extraction.http.aws.enabled` (and `buffer_sizes.http`), the HTTP
+client RED metrics (`http.client.request.duration`, `http.client.request.body.size`,
+`http.client.response.body.size`) carry the AWS resource of calls the AWS SDK
+parsers recognized, as default attributes of `httpClientInfo`:
+
+| Service | Attribute | Notes |
+|---|---|---|
+| S3 | `aws.s3.bucket` | omitted for bucket-less calls (`ListBuckets`) |
+| SQS | `aws.sqs.queue.url` | omitted when the queue URL is not in the payload (`ListQueues`) |
+| Lambda `Invoke` | `aws.lambda.function.arn` | unqualified ARN; only when the call names the account (full or partial ARN). Calls by bare name leave it out: the collector can complete it from `cloud.account.id` |
+| Lambda `Invoke` | `faas.invoked_name`, `faas.invoked_region` | function name (no qualifier) and region |
+
+The getters return an invalid `KeyValue` for every other span, so the OTEL
+exporter omits the attributes on plain HTTP client datapoints (Prometheus, which
+needs fixed label sets, gets an empty label). Cardinality: one series per
+bucket / queue / function an application calls - bounded by the application's
+own resources, not by request data (object keys, message ids and qualifiers are
+never used). Exclude them with `attributes.select` if an application talks to
+an unbounded set of buckets or queues.
+
 ### Add a new application metric
 
 To add a new application metric, follow these guidelines:

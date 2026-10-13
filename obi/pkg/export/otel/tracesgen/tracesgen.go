@@ -727,6 +727,9 @@ func traceAttributesSelectorInternal(span *request.Span, optionalAttrs map[attr.
 			attrs = append(attrs, semconv.FaaSInvokedName(lambda.FunctionName))
 			attrs = append(attrs, semconv.FaaSInvokedProviderAWS)
 			attrs = append(attrs, semconv.FaaSInvokedRegion(lambda.FunctionRegion))
+			if lambda.FunctionARN != "" {
+				attrs = append(attrs, request.AWSLambdaFunctionARN(lambda.FunctionARN))
+			}
 			// error.type only applies to failed invocations: omit it otherwise.
 			if lambda.ErrorType != "" {
 				attrs = append(attrs, request.ErrorType(lambda.ErrorType))

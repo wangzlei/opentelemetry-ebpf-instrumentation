@@ -1404,11 +1404,19 @@ func TestTraceAttributesSelector_AWSLambda(t *testing.T) {
 	}
 	_, ok := selected.Get("error.type")
 	assert.False(t, ok, "error.type must be omitted on success")
+	_, ok = selected.Get("aws.lambda.function.arn")
+	assert.False(t, ok, "aws.lambda.function.arn must be omitted when unknown")
+
+	span.AWS.Lambda.FunctionARN = "arn:aws:lambda:eu-west-1:123456789012:function:fn"
+	selected = AttrsToMap(TraceAttributesSelector(span, defaultAttrs))
+	v, ok := selected.Get("aws.lambda.function.arn")
+	require.True(t, ok)
+	assert.Equal(t, "arn:aws:lambda:eu-west-1:123456789012:function:fn", v.Str())
 
 	span.AWS.Lambda.FunctionError = "Unhandled"
 	span.AWS.Lambda.ErrorType = "ValueError"
 	selected = AttrsToMap(TraceAttributesSelector(span, defaultAttrs))
-	v, ok := selected.Get("error.type")
+	v, ok = selected.Get("error.type")
 	require.True(t, ok)
 	assert.Equal(t, "ValueError", v.Str())
 }

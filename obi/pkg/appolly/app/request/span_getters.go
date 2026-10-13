@@ -403,11 +403,13 @@ func spanOTELGetters(name attr.Name) (attributes.Getter[*Span, attribute.KeyValu
 			return AWSExtendedRequestID("")
 		}
 	case attr.AWSS3Bucket:
+		// Omitted (invalid KeyValue) unless the S3 parser found a bucket, so that
+		// plain HTTP client metrics get no empty label.
 		getter = func(s *Span) attribute.KeyValue {
-			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSS3 && s.AWS != nil {
+			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSS3 && s.AWS != nil && s.AWS.S3.Bucket != "" {
 				return AWSS3Bucket(s.AWS.S3.Bucket)
 			}
-			return AWSS3Bucket("")
+			return attribute.KeyValue{}
 		}
 	case attr.AWSS3Key:
 		getter = func(s *Span) attribute.KeyValue {
@@ -418,10 +420,31 @@ func spanOTELGetters(name attr.Name) (attributes.Getter[*Span, attribute.KeyValu
 		}
 	case attr.AWSSQSQueueURL:
 		getter = func(s *Span) attribute.KeyValue {
-			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSSQS && s.AWS != nil {
+			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSSQS && s.AWS != nil && s.AWS.SQS.QueueURL != "" {
 				return AWSSQSQueueURL(s.AWS.SQS.QueueURL)
 			}
-			return AWSSQSQueueURL("")
+			return attribute.KeyValue{}
+		}
+	case attr.AWSLambdaFunctionARN:
+		getter = func(s *Span) attribute.KeyValue {
+			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSLambda && s.AWS != nil && s.AWS.Lambda.FunctionARN != "" {
+				return AWSLambdaFunctionARN(s.AWS.Lambda.FunctionARN)
+			}
+			return attribute.KeyValue{}
+		}
+	case attr.FaaSInvokedName:
+		getter = func(s *Span) attribute.KeyValue {
+			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSLambda && s.AWS != nil && s.AWS.Lambda.FunctionName != "" {
+				return semconv.FaaSInvokedName(s.AWS.Lambda.FunctionName)
+			}
+			return attribute.KeyValue{}
+		}
+	case attr.FaaSInvokedRegion:
+		getter = func(s *Span) attribute.KeyValue {
+			if s.Type == EventTypeHTTPClient && s.SubType == HTTPSubtypeAWSLambda && s.AWS != nil && s.AWS.Lambda.FunctionRegion != "" {
+				return semconv.FaaSInvokedRegion(s.AWS.Lambda.FunctionRegion)
+			}
+			return attribute.KeyValue{}
 		}
 	case attr.CloudRegion:
 		getter = func(s *Span) attribute.KeyValue {

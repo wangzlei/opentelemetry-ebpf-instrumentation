@@ -295,3 +295,20 @@ func TestTracesGenAIToolCallAttributes(t *testing.T) {
 	assert.NotContains(t, p.For(Traces), attr.GenAIToolCallArguments)
 	assert.NotContains(t, p.For(Traces), attr.GenAIToolCallResult)
 }
+
+func TestHTTPClientAWSResourceAttributes(t *testing.T) {
+	p, err := NewAttrSelector(AttrGroups(0), &SelectorConfig{})
+	require.NoError(t, err)
+
+	awsAttrs := []attr.Name{
+		attr.AWSS3Bucket, attr.AWSSQSQueueURL, attr.AWSLambdaFunctionARN,
+		attr.FaaSInvokedName, attr.FaaSInvokedRegion,
+	}
+	for _, section := range []Section{HTTPClientDuration.Section, HTTPClientRequestSize.Section, HTTPClientResponseSize.Section} {
+		assert.Subset(t, p.For(Name{Section: section}), awsAttrs, "client RED metric %s", section)
+	}
+	for _, section := range []Section{HTTPServerDuration.Section, RPCClientDuration.Section} {
+		assert.NotContains(t, p.For(Name{Section: section}), attr.AWSLambdaFunctionARN, section)
+		assert.NotContains(t, p.For(Name{Section: section}), attr.AWSS3Bucket, section)
+	}
+}

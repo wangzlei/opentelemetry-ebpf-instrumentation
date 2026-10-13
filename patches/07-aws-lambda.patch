@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: wangzlei <66336933+wangzlei@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 04:31:41 +0000
-Subject: [PATCH 7/8] aws-lambda: Lambda Invoke spans in the AWS SDK payload
+Subject: [PATCH 7/9] aws-lambda: Lambda Invoke spans in the AWS SDK payload
  extraction
 
 Upstream's AWS payload extraction (payload_extraction.http.aws) recognises S3

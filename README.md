@@ -25,6 +25,9 @@ patches/                  git format-patch stack applied in order on top of upst
                                        server spans get the Host (so 04's x-forwarded-host / RED peer.service.name work for Go)
   07-aws-lambda.patch                  AWS SDK payload extraction for Lambda Invoke (next to upstream's S3/SQS): span
                                        lambda.Invoke, rpc.method=Lambda/Invoke, faas.invoked_name/provider/region, function errors
+  08-aws-red-attrs.patch               HTTP client RED metrics carry the AWS resource of parsed SDK calls: aws.s3.bucket,
+                                       aws.sqs.queue.url, aws.lambda.function.arn (+ faas.invoked_name/region); absent on plain
+                                       HTTP; Lambda calls by name get the ARN completed from cloud.account.id in config/otel.yaml
   99-pin-to-cwagent.patch              go.mod pinned to cwagent's dependency versions + forced code adaptations (ALWAYS LAST)
 obi/                      GENERATED, committed: upstream/ + patches/ as plain code (minus .github/ and
                           internal/test/integration/). Committed together with patches/ so every commit shows
@@ -49,7 +52,8 @@ cwagent/                  the cwagent change (format-patch of branch exp/obi-rec
                           shipped only as the template etc/ebpf/systemd-dropin.conf); `amazon-cloudwatch-agent-ctl
                           -a enable-ebpf` (or Distributor Additional Arguments {"SSM_EBPF":"true"}) creates the marker
                           etc/ebpf/enabled + installs the drop-in, `-a disable-ebpf` removes both; upgrades from the
-                          always-on versions keep eBPF on. CI applies all of them
+                          always-on versions keep eBPF on. 0011 completes aws.lambda.function.arn for Lambda calls by
+                          name, like config/otel.yaml. CI applies all of them
 distributor/              SSM Distributor package ADOT-CloudWatchAgent-eBPF-Beta (292779133546, us-west-2): install.sh,
                           uninstall.sh, manifest.json, README with the publish steps. Install without arguments = the
                           official agent's behaviour; Additional Arguments {"SSM_EBPF":"true"} = install + start with eBPF.

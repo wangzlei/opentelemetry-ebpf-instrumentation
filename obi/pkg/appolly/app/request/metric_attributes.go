@@ -217,6 +217,10 @@ func AWSSQSQueueURL(val string) attribute.KeyValue {
 	return attribute.Key(attr.AWSSQSQueueURL).String(val)
 }
 
+func AWSLambdaFunctionARN(val string) attribute.KeyValue {
+	return attribute.Key(attr.AWSLambdaFunctionARN).String(val)
+}
+
 func CloudRegion(val string) attribute.KeyValue {
 	return attribute.Key(attr.CloudRegion).String(val)
 }

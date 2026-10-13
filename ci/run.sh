@@ -68,6 +68,10 @@ if want cwagent; then : > "$LOGS/cwagent.log"; RESULT[cwagent]=PASS
   run cwagent "$ROOT/ci/check-cwagent-versions.sh" "$ROOT/ci/cwagent-v1.300074.0.go.mod" "$CW/go.mod"
   run cwagent bash -c "cd '$CW' && go list -m all > '$LOGS/cwagent-new.modlist' && '$ROOT/ci/check-cwagent-versions.sh' --full '$ROOT/ci/cwagent-v1.300074.0.modlist' '$LOGS/cwagent-new.modlist'"
   run cwagent "$ROOT/scripts/build-cwagent.sh" gobuild
+  # The RPM default eBPF config (etc/ebpf/obi.yaml) is a copy of config/otel.yaml with
+  # RPM-specific comments: it must stay identical apart from comments, and load.
+  run cwagent bash -c "strip() { sed -e 's/[[:space:]]*#.*\$//' -e '/^[[:space:]]*\$/d' \"\$1\"; }; diff <(strip '$ROOT/config/otel.yaml') <(strip '$CW/packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml') && echo 'RPM default config == config/otel.yaml (comments aside)'"
+  run cwagent bash -c "img=\$(docker images --format '{{.Repository}}:{{.Tag}}' otelcol-obi | head -1); [[ -n \$img ]] || { echo 'no otelcol-obi image: run the collector stage first'; exit 1; }; docker run --rm -e AWS_ACCESS_KEY_ID=ci -e AWS_SECRET_ACCESS_KEY=ci -v '$CW/packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml:/rpm.yaml:ro' \$img validate --config=/rpm.yaml && echo \"RPM default config validates in \$img\""
   run cwagent bash -c "cd '$CW' && go vet ./service/defaultcomponents/ && go test -count=1 ./service/defaultcomponents/"
   run cwagent bash -c "cd '$CW' && GOOS=windows GOARCH=amd64 go build -o /dev/null ./cmd/amazon-cloudwatch-agent && echo windows ok"
   run cwagent bash -c "cd '$CW' && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /dev/null ./cmd/amazon-cloudwatch-agent && echo linux/arm64 ok"

@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app/request"
@@ -88,6 +89,7 @@ func parseAWSLambda(req *http.Request, resp *http.Response, spanHost string) (re
 	if lambda.FunctionRegion == "" {
 		lambda.FunctionRegion = lambda.Meta.Region
 	}
+	lambda.FunctionARN = lambdaFunctionARN(functionID, lambda.FunctionName, lambda.FunctionRegion)
 	lambda.InvocationType = req.Header.Get(lambdaInvocationType)
 	lambda.ExecutedVersion = resp.Header.Get(lambdaExecutedVersion)
 
@@ -179,4 +181,38 @@ func parseLambdaFunctionID(id string) (name, qualifier, region string) {
 		region = ""
 	}
 	return name, qualifier, region
+}
+
+var awsAccountIDRgx = regexp.MustCompile(`^\d{12}$`)
+
+// lambdaFunctionARN returns the unqualified ARN of the invoked function when
+// the FunctionName parameter names the account (full or partial ARN), else "".
+// A call by bare name targets the caller's account, which OBI does not know;
+// the collector can complete it from the cloud.account.id resource attribute.
+//
+//	arn:aws:lambda:us-west-2:123456789012:function:my-function:7 => arn:aws:lambda:us-west-2:123456789012:function:my-function
+//	123456789012:function:my-function:prod (region us-west-2)    => arn:aws:lambda:us-west-2:123456789012:function:my-function
+//	my-function                                                  => ""
+func lambdaFunctionARN(id, name, region string) string {
+	parts := strings.Split(id, ":")
+	switch {
+	case len(parts) >= 7 && parts[0] == "arn" && parts[2] == "lambda" && parts[5] == "function":
+		return strings.Join(parts[:7], ":")
+	case len(parts) >= 3 && parts[1] == "function" && awsAccountIDRgx.MatchString(parts[0]) && region != "":
+		return "arn:" + awsPartition(region) + ":lambda:" + region + ":" + parts[0] + ":function:" + name
+	}
+	return ""
+}
+
+// awsPartition returns the ARN partition of a region (see isAWSRegion for the
+// regions OBI recognizes).
+func awsPartition(region string) string {
+	switch {
+	case strings.HasPrefix(region, "cn-"):
+		return "aws-cn"
+	case strings.HasPrefix(region, "us-gov-"):
+		return "aws-us-gov"
+	default:
+		return "aws"
+	}
 }
