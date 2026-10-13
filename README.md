@@ -152,7 +152,10 @@ Required capabilities: CAP_BPF, CAP_PERFMON, CAP_SYS_PTRACE, CAP_DAC_READ_SEARCH
 CAP_CHECKPOINT_RESTORE, CAP_NET_RAW, + CAP_NET_ADMIN for context propagation, + CAP_SYS_ADMIN
 for context propagation on kernels with commit 929e30f93125 (6.6.128+, 6.12.75+, 6.18.14+, 6.19+):
 there OBI loads a FIONREAD compensation program that uses bpf_probe_write_user (CAP_SYS_ADMIN only);
-without it OBI logs "context propagation is disabled". The RPM drop-in grants all 8.
+without it OBI logs "context propagation is disabled". + CAP_KILL (NodeJS injector: SIGUSR1 opens the
+inspector) and CAP_SYS_CHROOT, CAP_SETUID, CAP_SETGID (Java agent injector: setns into the JVM's mount
+namespace, then the JVM owner's uid/gid); without them RED still works, but no NodeJS context
+propagation / runtime metrics and no Java agent. The RPM drop-in grants all 12.
 Caveats: kernels < 5.11 also want CAP_SYS_RESOURCE (or a high RLIMIT_MEMLOCK set by the
 service manager); on cgroup-v1 hosts (Amazon Linux 2) TCP propagation needs a cgroup2
 hierarchy at /sys/fs/cgroup/unified, otherwise OBI's fallback (fsmount) needs CAP_SYS_ADMIN
