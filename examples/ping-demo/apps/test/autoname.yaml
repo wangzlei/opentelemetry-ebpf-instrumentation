@@ -1,0 +1,26 @@
+# Local autoname check: the adot-obi collector (otelcol-obi image, patch 05-autoname) with only a
+# debug exporter. Run with ./autoname.sh while ./fleet.sh is up; expected service names:
+# checkout_api, payment, inventory, audit-worker.
+receivers:
+  obi:
+    log_level: INFO
+    ebpf:
+      bpf_fs_base_dir: /sys/fs/bpf
+      context_propagation: "all"
+    discovery:
+      service_name_from_cmdline: true
+      instrument:
+        - open_ports: "8000"
+    metrics:
+      features: "application"
+exporters:
+  debug:
+    verbosity: detailed
+service:
+  telemetry:
+    metrics:
+      level: none
+  pipelines:
+    traces:
+      receivers: [obi]
+      exporters: [debug]
