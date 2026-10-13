@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Publish a new version of the SSM Distributor package ADOT-CloudWatchAgent-eBPF-Beta
-# (account 292779133546, us-west-2) from the Mac. Builds on the dev desktop.
+# (account 292779133546, us-west-2). By default everything runs LOCALLY on this Linux dev
+# desktop (DEVDSK unset or DEVDSK=local). DEVDSK=<host> keeps the old mode: run from another
+# machine (e.g. a Mac) and build on that dev desktop over ssh.
 #
 #   distributor/publish.sh [--set-default] [--dry-run]
 #
@@ -11,7 +13,8 @@
 #
 # Steps:
 #  0) local preflight: the cwagent worktree ($CWAGENT, default ../adot-obi-work/cwagent) must be
-#     clean; version = 1.300074.0-obi.<cwagent short sha>
+#     clean; version = 1.300074.0-obi.<adot-obi short sha> (adot-obi carries both the OBI
+#     patches and the cwagent patches, so its sha identifies the whole build)
 #  1) dev-dsk: ada credentials (Admin, 292779133546); pick a free versionName (adds -r<N> if the
 #     name already exists in Distributor; versionName must match ^[a-zA-Z0-9_\-.]{1,128}$, no '+')
 #  2) dev-dsk: current adot-obi tree via ci/run-remote.sh apply (tar copy + apply-patches.sh ->
@@ -42,8 +45,19 @@ done
 ROOT=$(cd "$(dirname "$0")/.." && pwd)          # adot-obi repo
 DIST="$ROOT/distributor"
 CW=${CWAGENT:-"$(cd "$ROOT/.." && pwd)/adot-obi-work/cwagent"}
-H=${DEVDSK:-dev-dsk-wangzl-2b-8ea796f6.us-west-2.amazon.com}
-R=adot-obi-work                                   # remote dir (relative to ~) used by ci/run-remote.sh
+H=${DEVDSK:-local}
+if [[ $H == local ]]; then
+  LOCAL=1
+  # Build in place: ~/$R/cwagent is the real worktree and ~/$R/adot-obi must resolve to this
+  # repo (adot-obi-work/adot-obi -> ../adot-obi), matching the cwagent go.mod replaces.
+  R=$(realpath --relative-to="$HOME" "$(dirname "$CW")")
+  export PATH=$HOME/.toolbox/bin:$PATH        # ada
+  BUILD_GOPROXY=${GOPROXY:-https://goproxy.cn,direct}   # proxy.golang.org is blocked here
+else
+  LOCAL=0
+  R=adot-obi-work                                 # remote dir (relative to ~) used by ci/run-remote.sh
+  BUILD_GOPROXY=${GOPROXY:-direct}
+fi
 STAGE=distributor-pkg                             # remote staging dir (relative to ~)
 PKG=ADOT-CloudWatchAgent-eBPF-Beta
 ACCOUNT=292779133546 REGION=us-west-2 SHARE_ACCOUNT=868155213681
@@ -57,7 +71,7 @@ export COPYFILE_DISABLE=1 # no macOS ._* / xattr entries in the archives
 
 step() { echo; echo "=== [$(date +%H:%M:%S) +$((SECONDS-T0))s] $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
-rsh() { "${SSH[@]}" "$@"; }
+if [[ $LOCAL == 1 ]]; then rsh() { (cd ~ && bash -c "$*"); }; else rsh() { "${SSH[@]}" "$@"; }; fi
 # remote aws with the ada credentials (default profile on dev-dsk)
 raws() { rsh "AWS_REGION=$REGION AWS_PAGER= aws $(printf '%q ' "$@")"; }
 
@@ -80,7 +94,7 @@ if [[ $OBI_DIRTY != 0 ]]; then
   echo "WARNING: adot-obi has $OBI_DIRTY uncommitted tracked change(s); the build uses the working tree as is:"
   git -C "$ROOT" status --short --untracked-files=no | head -20
 fi
-VERSION_BASE="$BASE_VERSION-obi.$CW_SHA"
+VERSION_BASE="$BASE_VERSION-obi.$(git -C "$ROOT" rev-parse --short=7 HEAD)"
 
 # ---------------------------------------------------------------------------
 step "1) dev-dsk $H: connectivity + AWS credentials"
@@ -114,6 +128,7 @@ echo "new versionName: $VERSION   (RPM version $RPM_VERSION, S3 $S3/)"
 
 if [[ $DRY == 1 ]]; then
   step "dry run: plan (nothing copied, built, uploaded or changed)"
+[[ $LOCAL == 1 ]] && echo "  LOCAL mode: steps 2-5 run on this host in place (scripts/apply-patches.sh, no ssh, no copy; GOPROXY=$BUILD_GOPROXY); the ssh/tar lines below apply only to DEVDSK=<host>"
   cat <<EOF
   2) DEVDSK=$H CWAGENT=$CW ci/run-remote.sh apply   # tar-copies adot-obi ($OBI_SHA) to ~/$R/adot-obi, apply-patches.sh -> build/obi
      ssh: cd ~/$R/adot-obi && SKIP_REPRO=1 scripts/generate-bpf.sh                   # BPF bindings into build/obi
@@ -133,9 +148,15 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
-step "2) dev-dsk: current adot-obi tree -> build/obi (ci/run-remote.sh apply) + BPF generation"
-DEVDSK=$H CWAGENT=$CW GOPROXY=direct GOSUMDB=off "$ROOT/ci/run-remote.sh" apply \
-  || die "ci/run-remote.sh apply failed (see $ROOT/ci/logs/apply.log)"
+step "2) current adot-obi tree -> build/obi + BPF generation ($H)"
+if [[ $LOCAL == 1 ]]; then
+  [[ $(realpath "$HOME/$R/adot-obi") == "$(realpath "$ROOT")" ]] \
+    || die "$HOME/$R/adot-obi must point at $ROOT (ln -s ../adot-obi $HOME/$R/adot-obi)"
+  "$ROOT/scripts/apply-patches.sh" > /tmp/obi-apply.log 2>&1 || { tail -20 /tmp/obi-apply.log; die "apply-patches.sh failed"; }
+else
+  DEVDSK=$H CWAGENT=$CW GOPROXY=direct GOSUMDB=off "$ROOT/ci/run-remote.sh" apply \
+    || die "ci/run-remote.sh apply failed (see $ROOT/ci/logs/apply.log)"
+fi
 rsh "cd $R/adot-obi && SKIP_REPRO=1 scripts/generate-bpf.sh > /tmp/obi-bpf.log 2>&1" \
   || { rsh 'tail -30 /tmp/obi-bpf.log' || true; die "BPF generation failed on $H (/tmp/obi-bpf.log)"; }
 rsh 'tail -1 /tmp/obi-bpf.log'
@@ -143,6 +164,9 @@ OBI_REMOTE=$(rsh "cd $R/adot-obi && echo \"adot-obi \$(git rev-parse --short=8 H
 echo "obi used: $OBI_REMOTE"
 
 # ---------------------------------------------------------------------------
+if [[ $LOCAL == 1 ]]; then
+  step "3) cwagent tree: built in place ($CW), no copy"
+else
 step "3) cwagent tree -> $H:~/$R/cwagent (tar over ssh, no .git/build)"
 rsh "rm -rf ~/$R/cwagent && mkdir -p ~/$R/cwagent"
 tar -C "$CW" --no-xattrs --exclude ./.git --exclude ./build -czf - . | rsh "tar -C ~/$R/cwagent -xzf -"
@@ -154,13 +178,14 @@ LC=$(cd "$CW" && find . -path ./.git -prune -o -path ./build -prune -o -type f -
 RC=$(rsh "cd ~/$R/cwagent && find . -type f | wc -l")
 [[ $LC == "$RC" ]] || die "cwagent file count differs: local $LC remote $RC"
 echo "  key files identical, $LC files"
+fi
 
 # ---------------------------------------------------------------------------
 step "4) dev-dsk: make package-rpm VERSION=$VERSION (log /tmp/cw-rpm.log)"
-rsh bash -s -- "$VERSION" "$RPM_VERSION" "$R" <<'EOF'
+rsh bash -s -- "$VERSION" "$RPM_VERSION" "$R" "$BUILD_GOPROXY" <<'EOF'
 set -euo pipefail
 VERSION=$1 RPM_VERSION=$2 R=$3
-export GOPROXY=direct GOSUMDB=off GOTOOLCHAIN=local GOFLAGS=-mod=mod BS=$HOME/$R/cwagent-rpm-build
+export GOPROXY=$4 GOSUMDB=off GOTOOLCHAIN=local GOFLAGS=-mod=mod BS=$HOME/$R/cwagent-rpm-build
 cd ~/$R/cwagent
 rm -rf $BS/private; mkdir -p $BS/bin; rm -f $BS/bin/linux/*/amazon-cloudwatch-agent.rpm
 start=$SECONDS
