@@ -73,8 +73,12 @@ EOF
   else cat <<EOF
 set -e
 IMG=$2; SVCENV=""
-aws ecr get-login-password --region $ECR_REGION | docker login --username AWS --password-stdin $ECR >/dev/null
-docker pull -q \$IMG >/dev/null
+# hosts with a netem loss fault time out on IMDS credentials: longer timeouts + retries
+export AWS_METADATA_SERVICE_TIMEOUT=10 AWS_METADATA_SERVICE_NUM_ATTEMPTS=6 AWS_RETRY_MODE=standard AWS_MAX_ATTEMPTS=8
+for i in 1 2 3 4 5; do
+  aws ecr get-login-password --region $ECR_REGION | docker login --username AWS --password-stdin $ECR >/dev/null && docker pull -q \$IMG >/dev/null && break
+  [ \$i = 5 ] && exit 1; sleep 5
+done
 EOF
   fi
   cat <<EOF

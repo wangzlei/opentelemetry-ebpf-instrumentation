@@ -93,6 +93,8 @@ public class Main {
     static final List<String> AUDIT_URLS = split(System.getenv("AUDIT_URLS"));
     static final boolean PREFER_SAME_AZ = env("PREFER_SAME_AZ", "0").equals("1");
     static final boolean DEBUG = "1".equals(System.getenv("DEBUG"));
+    // optional external stock check (API Gateway -> Lambda), POSTed on the OK path of /reservations
+    static final String STOCK_URL = System.getenv().getOrDefault("STOCK_URL", "");
     static final long PID = ProcessHandle.current().pid();
 
     // Read per request so POST /fault flips it at runtime (instance-wide: one process).
@@ -269,12 +271,30 @@ public class Main {
         return 0;
     }
 
+    /** POST a small stock check to an external HTTPS endpoint by its URL (no IP fan-out: TLS needs the
+     *  name). Its result is not adopted: a failing stock check does not fail the reservation. */
+    static void callUrl(String url) {
+        try {
+            HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+                .timeout(Duration.ofSeconds(5))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString("{\"sku\":\"sku-" + ThreadLocalRandom.current().nextInt(100) + "\"}"))
+                .build();
+            client.send(req, HttpResponse.BodyHandlers.discarding());
+        } catch (IOException e) {
+            if (DEBUG) System.err.println("call " + url + " failed: " + e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     /** Call this role's downstreams (sequentially) and return the status to adopt, or 0. */
     static int fanOut() {
         return switch (ROLE) {
             case "checkout" -> worstStatus(call(PAYMENT_URLS, "/charges"), call(INVENTORY_URLS, "/reservations"));
             case "payment" -> worstStatus(call(AUDIT_URLS, "/audit"));
-            default -> 0; // inventory, audit: leaves
+            case "inventory" -> { if (!STOCK_URL.isEmpty()) callUrl(STOCK_URL); yield 0; }
+            default -> 0; // audit: leaf
         };
     }
 

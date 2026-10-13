@@ -74,8 +74,8 @@ two-worker split is documented in `../NOTES.md`); error *bodies* for 404/405 dif
 status codes match); capacity differs (gunicorn: 16 concurrent requests; Java: 32 threads; Go/Node:
 unbounded), which only matters above ~16 concurrent requests per instance. Not ported from the older
 lei-demo audit app: the optional AWS SDK Lambda archive call (`ARCHIVE_FUNCTION`) — it is not in
-`server.py`, and dropping it leaves the Node image dependency-free. Also not included yet: the lei-demo inventory's optional `STOCK_URL`
-(HTTPS call to an API Gateway endpoint per reservation).
+`server.py`, and dropping it leaves the Node image dependency-free. Java inventory only: optional `STOCK_URL` — on the OK path of POST /reservations it POSTs
+`{"sku":...}` to that HTTPS URL (the API Gateway -> Lambda from deploy/apigw.sh); the result is not adopted.
 
 ## Build, push
 
