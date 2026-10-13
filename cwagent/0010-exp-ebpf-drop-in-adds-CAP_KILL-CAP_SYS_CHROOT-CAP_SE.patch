@@ -4,15 +4,16 @@ Date: Tue, 13 Oct 2026 03:13:08 +0000
 Subject: [PATCH] exp: ebpf drop-in adds CAP_KILL, CAP_SYS_CHROOT, CAP_SETUID,
  CAP_SETGID for the NodeJS and Java injectors
 
+SecureBits=no-setuid-fixup keeps the effective capabilities when the Java injector switches the euid to a root JVM's owner and back.
 ---
- .../dependencies/amazon-cloudwatch-agent-ebpf.conf     | 10 ++++++++--
- 1 file changed, 8 insertions(+), 2 deletions(-)
+ .../amazon-cloudwatch-agent-ebpf.conf             | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
 
 diff --git a/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf b/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf
-index aa5544c3..035bf4c3 100644
+index aa5544c3..c55e4696 100644
 --- a/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf
 +++ b/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf
-@@ -11,11 +11,17 @@
+@@ -11,11 +11,22 @@
  # compensation BPF program that uses bpf_probe_write_user, which the verifier only
  # allows with CAP_SYS_ADMIN. Without it propagation is disabled (RED still works,
  # no peer.service.name).
@@ -22,6 +23,10 @@ index aa5544c3..035bf4c3 100644
 +# and switches to the JVM owner's uid/gid to attach (CAP_SETUID, CAP_SETGID).
 +# Without them RED still works, but there is no NodeJS context propagation /
 +# runtime metrics and no Java agent.
++# SecureBits=no-setuid-fixup: the Java injector switches the process-wide euid to the
++# JVM's owner and back (Go's Seteuid applies to all threads). Without this bit the
++# kernel clears the effective capabilities of every thread when the euid goes from 0
++# (a root JVM) back to cwagent, and eBPF stops working for the rest of the run.
  [Service]
  User=cwagent
  Group=cwagent
@@ -29,6 +34,7 @@ index aa5544c3..035bf4c3 100644
 -CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_CHECKPOINT_RESTORE CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_ADMIN
 +AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_CHECKPOINT_RESTORE CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_ADMIN CAP_KILL CAP_SYS_CHROOT CAP_SETUID CAP_SETGID
 +CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_CHECKPOINT_RESTORE CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_ADMIN CAP_KILL CAP_SYS_CHROOT CAP_SETUID CAP_SETGID
++SecureBits=no-setuid-fixup
  LimitMEMLOCK=infinity
  # The agent writes logs/ and var/ and reads etc/ (written by the ctl as root).
  # "+" runs this one step as root.

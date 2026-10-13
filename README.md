@@ -155,7 +155,8 @@ there OBI loads a FIONREAD compensation program that uses bpf_probe_write_user (
 without it OBI logs "context propagation is disabled". + CAP_KILL (NodeJS injector: SIGUSR1 opens the
 inspector) and CAP_SYS_CHROOT, CAP_SETUID, CAP_SETGID (Java agent injector: setns into the JVM's mount
 namespace, then the JVM owner's uid/gid); without them RED still works, but no NodeJS context
-propagation / runtime metrics and no Java agent. The RPM drop-in grants all 12.
+propagation / runtime metrics and no Java agent. The RPM drop-in grants all 12, plus SecureBits=no-setuid-fixup: the Java injector's process-wide
+seteuid to a root JVM and back would otherwise clear the effective capabilities of every thread.
 Caveats: kernels < 5.11 also want CAP_SYS_RESOURCE (or a high RLIMIT_MEMLOCK set by the
 service manager); on cgroup-v1 hosts (Amazon Linux 2) TCP propagation needs a cgroup2
 hierarchy at /sys/fs/cgroup/unified, otherwise OBI's fallback (fsmount) needs CAP_SYS_ADMIN
