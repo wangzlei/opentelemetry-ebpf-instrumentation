@@ -1,6 +1,6 @@
 {
   "schemaVersion": "2.0",
-  "version": "1.300074.0-obi.cdab50d-r2",
+  "version": "1.300074.0-obi.cad3cf5",
   "publisher": "ADOT OBI (beta)",
   "packages": {
     "amazon": {
@@ -17,12 +17,12 @@
   "files": {
     "amazon-cloudwatch-agent-ebpf-beta_x86_64.zip": {
       "checksums": {
-        "sha256": "7d5a680a9c2f1100f851064a385b7d37db71a16614375ef0a110673a10216a99"
+        "sha256": "c1595122d212a386d21d3d0d9694694c0aefc115e7917edf668a62969fe31fbc"
       }
     },
     "amazon-cloudwatch-agent-ebpf-beta_arm64.zip": {
       "checksums": {
-        "sha256": "6c3a6628334cb87e37dc0805b54fc2a9edebba01eda102d1a81de6581dffef39"
+        "sha256": "5ab4541f440895c2b3443ccb9ace8fbb88606e40499a5ea9377f2393356a858d"
       }
     }
   }
