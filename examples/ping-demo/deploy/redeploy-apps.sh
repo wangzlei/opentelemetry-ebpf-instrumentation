@@ -23,7 +23,8 @@
 # running OBI tracks its connections from process start.
 . "$(dirname "$0")/lib.sh"
 ECR_ACCOUNT=${ECR_ACCOUNT:-292779133546}
-ECR=$ECR_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com
+ECR_REGION=${ECR_REGION:-$AWS_REGION}   # us-east-1 pulls cross-region from us-west-2 (env file)
+ECR=$ECR_ACCOUNT.dkr.ecr.$ECR_REGION.amazonaws.com
 REPO=ping-demo-apps
 O_CHECKOUT=${IMG_CHECKOUT:-} O_PAYMENT=${IMG_PAYMENT:-} O_INVENTORY=${IMG_INVENTORY:-} O_AUDIT=${IMG_AUDIT:-}
 ROLES=${ROLES:-$ROLES_ALL}
@@ -38,7 +39,7 @@ ecr_tags() {
     unset AWS_PROFILE
     eval "$(~/.toolbox/bin/ada credentials print --account "$ECR_ACCOUNT" --role Admin --provider isengard 2>/dev/null \
       | python3 -c 'import json,sys; d=json.load(sys.stdin); print("export AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" % (d["AccessKeyId"], d["SecretAccessKey"], d["SessionToken"]))')"
-    aws ecr describe-images --repository-name $REPO --query 'sort_by(imageDetails,&imagePushedAt)[].imageTags[]' --output text | tr '\t' '\n'
+    aws ecr describe-images --region $ECR_REGION --repository-name $REPO --query 'sort_by(imageDetails,&imagePushedAt)[].imageTags[]' --output text | tr '\t' '\n'
   )
 }
 
@@ -72,7 +73,7 @@ EOF
   else cat <<EOF
 set -e
 IMG=$2; SVCENV=""
-aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR >/dev/null
+aws ecr get-login-password --region $ECR_REGION | docker login --username AWS --password-stdin $ECR >/dev/null
 docker pull -q \$IMG >/dev/null
 EOF
   fi

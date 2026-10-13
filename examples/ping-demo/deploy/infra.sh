@@ -91,7 +91,9 @@ sleep 3; curl -s -m 3 localhost:8000/healthz | head -c 120" "$id"
 
 # ---------------------------------------------------------------- ALB
 alb() {
-  local sg; sg=$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC_ID" "Name=group-name,Values=$ALB_SG_NAME" \
+  # ALB_SG set in env/<region>.env = reuse that SG (us-east-1: the app SG only admits itself).
+  local sg=${ALB_SG:-}
+  none "$sg" && sg=$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC_ID" "Name=group-name,Values=$ALB_SG_NAME" \
     --query 'SecurityGroups[0].GroupId' --output text)
   if none "$sg"; then
     sg=$(aws ec2 create-security-group --vpc-id "$VPC_ID" --group-name "$ALB_SG_NAME" \

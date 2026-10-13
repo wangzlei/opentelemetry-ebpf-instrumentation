@@ -7,6 +7,7 @@
 #   REGION=us-west-2 ./upgrade-agent.sh check [--ids "<id> ..."]
 #
 # Steps (per host):
+#  0) a running old OBI collector container ping-collector is stopped (not removed; us-east-1 rig)
 #  1) AWS-ConfigureAWSPackage Install, Additional Arguments {"SSM_EBPF":"true"}. A version change is
 #     uninstall + install; the package carries the eBPF state across. Same version = no-op.
 #  2) 10-aws-env.conf drop-in (AWS_VPC_ID/AWS_SUBNET_ID from IMDS) if missing; omni-bridge.yaml in
@@ -38,6 +39,8 @@ fi
 
 T0=$SECONDS
 DEF=$(aws ssm describe-document --name "$PKG_ARN" --query 'Document.[DefaultVersion,VersionName]' --output text | tr '\t' ' ')
+log "0) stop a RUNNING old OBI collector container ping-collector (two OBIs must not instrument one host); kept for rollback"
+ssm_run 'if [ "$(docker inspect -f "{{.State.Running}}" ping-collector 2>/dev/null)" = true ]; then docker update --restart=no ping-collector >/dev/null && docker stop ping-collector >/dev/null && echo "ping-collector stopped"; else echo "no running ping-collector"; fi' $IDS
 log "1) Distributor Install $PKG_ARN ${VERSION:-(default: doc $DEF)} SSM_EBPF=true on $(echo "$IDS" | wc -w) hosts"
 PARAMS="{\"action\":[\"Install\"],\"name\":[\"$PKG_ARN\"],\"additionalArguments\":[\"{\\\"SSM_EBPF\\\":\\\"true\\\"}\"]"
 [ -n "$VERSION" ] && PARAMS="$PARAMS,\"version\":[\"$VERSION\"]"
