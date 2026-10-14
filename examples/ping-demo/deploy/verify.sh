@@ -6,7 +6,7 @@
 #  1) per-host agent state (upgrade-agent.sh check)
 #  2) server RED by service (+ by service/subnet/instance: aws.subnet.id slicing) and by http.route
 #  3) client RED edges: service -> server.address / peer.service.name / http.route, and the join
-#     client server.address == server peer.service.name (both backend.alb.internal:8000 via the ALB)
+#     client server.address == server peer.service.name (both backend.alb:8000 via the ALB)
 #  4) X-Ray service graph (all services + APIGW stage + Lambda), Lambda invocations/errors
 # Everything is filtered by @resource.aws.vpc.id = the rig's VPC (other demos share the account).
 . "$(dirname "$0")/lib.sh"

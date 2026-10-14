@@ -14,7 +14,8 @@ export AWS_REGION=$REGION AWS_PAGER=""
 if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then export AWS_PROFILE=${AWS_PROFILE:-$PROFILE}; fi
 ROLES_ALL="audit inventory payment checkout"   # downstream first
 APP=ping-app-svc                               # app container name on every host
-BACKEND=backend.alb.internal                   # shared ALB name (private zone alb.internal)
+BACKEND=backend.alb                            # shared ALB name (private zone alb)
+BACKEND_ZONE=${BACKEND#*.}
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 none() { [ -z "${1:-}" ] || [ "$1" = None ] || [ "$1" = null ]; }

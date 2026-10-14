@@ -4,16 +4,16 @@
 #   REGION=us-west-2 ./infra.sh hosts    # launch NEW_HOSTS (env/<region>.env) if missing, seed the app
 #                                        # (copy of the role's ping-app image via S3) + install the agent
 #   REGION=us-west-2 ./infra.sh alb      # shared internal ALB + TGs + path rules, private zone
-#                                        # alb.internal with backend.alb.internal -> ALB
+#                                        # alb with backend.alb -> ALB
 #   REGION=us-west-2 ./infra.sh dns      # host A records in $ZONE (audit/inventory/checkout = all IPs)
 #   REGION=us-west-2 ./infra.sh probe    # curl the ALB paths from the checkout host
 #   REGION=us-west-2 ./infra.sh all      # hosts, alb, dns, probe
 #
 # Idempotent: hosts by Name tag, ALB/TG by name, zone by name on the VPC. Every resource gets the tag
 # purpose=ping-demo. ALB design = lei (demo/lei/up.sh infra_alb): ONE internal ALB in front of payment
-# AND inventory, reached through ONE name backend.alb.internal:8000, routed by path
+# AND inventory, reached through ONE name backend.alb:8000, routed by path
 # (/charges -> payment TG, /reservations -> inventory TG, default 404), health check GET /healthz.
-# Every backend therefore sees Host: backend.alb.internal:8000, which is what the client RED
+# Every backend therefore sees Host: backend.alb:8000, which is what the client RED
 # server.address and the server RED peer.service.name (X-Forwarded-Host/Host) join on.
 . "$(dirname "$0")/lib.sh"
 check_account
@@ -145,22 +145,22 @@ alb() {
   local dns zone; read -r dns zone < <(aws elbv2 describe-load-balancers --load-balancer-arns "$arn" \
     --query 'LoadBalancers[0].[DNSName,CanonicalHostedZoneId]' --output text)
 
-  # private zone alb.internal on the rig's VPC, record backend.alb.internal -> ALB (alias)
+  # private zone $BACKEND_ZONE on the rig's VPC, record $BACKEND -> ALB (alias)
   local zid; zid=$(aws route53 list-hosted-zones-by-vpc --vpc-id "$VPC_ID" --vpc-region "$AWS_REGION" \
-    --query "HostedZoneSummaries[?Name=='alb.internal.'].HostedZoneId | [0]" --output text)
+    --query "HostedZoneSummaries[?Name=='$BACKEND_ZONE.'].HostedZoneId | [0]" --output text)
   if none "$zid"; then
-    zid=$(aws route53 create-hosted-zone --name alb.internal --caller-reference "$PFX-demo-alb-$(date +%s)" \
+    zid=$(aws route53 create-hosted-zone --name $BACKEND_ZONE --caller-reference "$PFX-demo-alb-$(date +%s)" \
       --vpc VPCRegion="$AWS_REGION",VPCId="$VPC_ID" --hosted-zone-config Comment="ping demo shared ALB",PrivateZone=true \
       --query HostedZone.Id --output text)
     zid=${zid#/hostedzone/}
     aws route53 change-tags-for-resource --resource-type hostedzone --resource-id "$zid" --add-tags "Key=$TAG_KEY,Value=$TAG_VAL"
-    log "created zone alb.internal $zid"
+    log "created zone $BACKEND_ZONE $zid"
   fi
   aws route53 change-resource-record-sets --hosted-zone-id "$zid" --change-batch "{\"Changes\":[{\"Action\":\"UPSERT\",\"ResourceRecordSet\":{\"Name\":\"$BACKEND\",\"Type\":\"A\",\"AliasTarget\":{\"HostedZoneId\":\"$zone\",\"DNSName\":\"$dns\",\"EvaluateTargetHealth\":false}}}]}" >/dev/null
   log "ALB $ALB_NAME $arn sg=$sg"
   log "  TG payment $tg_pay"
   log "  TG inventory $tg_inv"
-  log "  zone alb.internal $zid: $BACKEND -> $dns"
+  log "  zone $BACKEND_ZONE $zid: $BACKEND -> $dns"
   for t in "$tg_pay" "$tg_inv"; do
     aws elbv2 describe-target-health --target-group-arn "$t" --query 'TargetHealthDescriptions[].[Target.Id,TargetHealth.State]' --output text | tr '\n' ' '; echo
   done

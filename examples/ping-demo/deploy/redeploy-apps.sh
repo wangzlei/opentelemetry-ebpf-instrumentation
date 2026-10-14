@@ -13,7 +13,7 @@
 #   --dry-run                                     print the per-role host script, change nothing
 #
 # Wiring (both modes; lei's latest design):
-#   checkout  PAYMENT_URLS = INVENTORY_URLS = http://backend.alb.internal:8000 (shared ALB, path routing)
+#   checkout  PAYMENT_URLS = INVENTORY_URLS = http://backend.alb:8000 (shared ALB, path routing)
 #   payment   AUDIT_URLS=http://audit.$ZONE:8000 PREFER_SAME_AZ=1
 #   inventory STOCK_URL=<apigw.sh url> (API Gateway -> Lambda), when the API exists
 #   audit     leaf
