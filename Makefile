@@ -1,4 +1,6 @@
 # Main binary configuration
+# CI baseline probe (no-op): triggers PR build workflows to establish a green
+# baseline on this fork before applying POC changes. Safe to remove.
 # CMD: Default binary name is now "obi" (OpenTelemetry eBPF Instrumentation)
 CMD ?= obi
 JAVA_AGENT ?= obi-java-agent.jar
