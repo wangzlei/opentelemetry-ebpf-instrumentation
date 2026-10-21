@@ -151,8 +151,10 @@ through a GOPROXY and has no clang, so the module it consumes must already conta
 
 ## Receiver defaults (cwagent)
 
-`ebpf.context_propagation: tcp` (no header injection, which needs CAP_SYS_ADMIN via
-bpf_probe_write_user for Go), network flow metrics off, `enforce_sys_caps: false`.
+`ebpf.context_propagation: tcp_service_name` (servers return their service.name in TCP option
+kind 26, only to peers inside the VPC unless `ebpf.tcp_service_name_outside_vpc: true`; no trace
+context and no header injection, which needs CAP_SYS_ADMIN via bpf_probe_write_user for Go),
+network flow metrics off, `enforce_sys_caps: false`.
 The YAML block under `receivers: obi:` is OBI's standard config schema. Nothing is
 instrumented until `discovery` selects targets.
 
