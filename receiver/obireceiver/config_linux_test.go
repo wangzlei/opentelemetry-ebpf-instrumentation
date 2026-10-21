@@ -21,7 +21,7 @@ func TestFactoryType(t *testing.T) {
 
 func TestDefaults(t *testing.T) {
 	cfg := NewFactory().CreateDefaultConfig().(*Config)
-	assert.Equal(t, config.ContextPropagationTCP, cfg.OBI().EBPF.ContextPropagation)
+	assert.Equal(t, config.ContextPropagationTCPServiceName, cfg.OBI().EBPF.ContextPropagation)
 	assert.False(t, cfg.OBI().NetworkFlows.Enable)
 	assert.False(t, cfg.OBI().EnforceSysCaps)
 	// Nothing is instrumented by default: the user must select targets
@@ -48,5 +48,5 @@ func TestDefaultsAreIndependent(t *testing.T) {
 	a := NewFactory().CreateDefaultConfig().(*Config)
 	b := NewFactory().CreateDefaultConfig().(*Config)
 	a.OBI().EBPF.ContextPropagation = config.ContextPropagationAll
-	assert.Equal(t, config.ContextPropagationTCP, b.OBI().EBPF.ContextPropagation)
+	assert.Equal(t, config.ContextPropagationTCPServiceName, b.OBI().EBPF.ContextPropagation)
 }

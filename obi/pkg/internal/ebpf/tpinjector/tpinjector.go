@@ -85,6 +85,9 @@ func New(cfg *obi.Config) *Tracer {
 // here as a raw fixed-size array to avoid coupling to the bpf2go-generated type.
 const svcNameMaxLen = 25
 
+// ipv4MappedPrefixBits is the ::ffff:0:0/96 prefix IPv4 peers are matched under.
+const ipv4MappedPrefixBits = 96
+
 // recordServiceName records this process's service.name into svc_name_by_pid,
 // keyed by host PID (matching pid_from_pid_tgid on the BPF side). The sk_msg send
 // path looks it up to stamp the real service name into a TCP option on responses
@@ -253,6 +256,9 @@ func (p *Tracer) constants() map[string]any {
 	if p.cfg.EBPF.ContextPropagation.HasTCP() {
 		flags |= 2 // k_inject_tcp_options
 	}
+	if p.cfg.EBPF.ContextPropagation.HasTCPServiceName() {
+		flags |= 4 // k_inject_tcp_svc_name
+	}
 
 	filterPids := int32(1)
 	if p.cfg.Discovery.BPFPidFilterOff {
@@ -263,6 +269,7 @@ func (p *Tracer) constants() map[string]any {
 		"filter_pids":          filterPids,
 		"max_transaction_time": uint64(p.cfg.EBPF.MaxTransactionTime.Nanoseconds()),
 		"inject_flags":         flags,
+		"svc_name_any_peer":    p.cfg.EBPF.TCPServiceNameOutsideVPC,
 		"g_bpf_debug":          p.cfg.EBPF.BpfDebug,
 	}
 }
@@ -273,7 +280,25 @@ func (p *Tracer) iterConstants() map[string]any {
 	}
 }
 
-func (p *Tracer) SetupTailCalls() {}
+// SetupTailCalls runs after the objects are loaded and before sockops is attached, so
+// the tcp_service_name peer filter is complete before the first connection is seen.
+func (p *Tracer) SetupTailCalls() {
+	if !p.cfg.EBPF.ContextPropagation.HasTCPServiceName() || p.cfg.EBPF.TCPServiceNameOutsideVPC {
+		return
+	}
+
+	cidrs, source := svcNamePeerCIDRs(context.Background())
+	for _, c := range cidrs {
+		key := BpfSvcNamePeerCidrKeyT{Prefixlen: uint32(c.Bits()), Addr: c.Addr().As16()}
+		if c.Addr().Is4() {
+			key.Prefixlen += ipv4MappedPrefixBits
+		}
+		if err := p.bpfObjects.SvcNamePeerCidrs.Update(&key, uint8(1), ebpf.UpdateAny); err != nil {
+			p.log.Warn("cannot allow tcp_service_name peers", "cidr", c, "error", err)
+		}
+	}
+	p.log.Info("tcp_service_name is only exchanged with peers in", "cidrs", cidrs, "source", source)
+}
 
 func (p *Tracer) RegisterOffsets(_ *exec.FileInfo, _ *goexec.Offsets) {}
 

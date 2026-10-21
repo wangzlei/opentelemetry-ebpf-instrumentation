@@ -183,7 +183,7 @@ func newCommonTracersGroup(cfg *obi.Config, metrics imetrics.Reporter, pidFilter
 	// Add tracers based on configuration
 
 	// Enables tpinjector which handles context propagation via both HTTP headers (sk_msg) and TCP options (BPF_SOCK_OPS)
-	if cfg.EBPF.ContextPropagation.HasHeaders() || cfg.EBPF.ContextPropagation.HasTCP() {
+	if cfg.EBPF.ContextPropagation.IsEnabled() {
 		tracers = append(tracers, tpinjector.New(cfg))
 	}
 

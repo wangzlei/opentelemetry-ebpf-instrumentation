@@ -4,7 +4,7 @@
 # an explicit capability set and to mount a cgroup2 hierarchy on cgroup-v1 hosts).
 #
 # usage: run-e2e.sh <agent-binary> <scenario> <outdir>
-#   scenario tcp     : context_propagation=tcp, caps = the shipped 8-cap set incl. CAP_NET_ADMIN
+#   scenario tcp     : context_propagation=tcp_service_name, caps = the shipped 8-cap set incl. CAP_NET_ADMIN
 #                      and CAP_SYS_ADMIN (SYS_ADMIN is for the FIONREAD compensation that
 #                      kernels 6.6.128+/6.12.75+/6.18.14+/6.19+ need; without it OBI disables
 #                      context propagation there and the peer.service.name check fails)
@@ -19,8 +19,8 @@ FRONTEND_PORT=${FRONTEND_PORT:-18080}; BACKEND_PORT=${BACKEND_PORT:-18081}
 REQS=${REQS:-300}
 CAPS_BASE="cap_bpf,cap_perfmon,cap_sys_ptrace,cap_dac_read_search,cap_checkpoint_restore,cap_net_raw"
 case $SCEN in
-  tcp)        CP=tcp;      CAPS="$CAPS_BASE,cap_net_admin,cap_sys_admin"; EXPECT_PEER="--expect-peer-service e2e-frontend=e2e-backend";;
-  nonetadmin) CP=disabled; CAPS="$CAPS_BASE";               EXPECT_PEER="";;
+  tcp)        CP=tcp_service_name; CAPS="$CAPS_BASE,cap_net_admin,cap_sys_admin"; EXPECT_PEER="--expect-peer-service e2e-frontend=e2e-backend";;
+  nonetadmin) CP=disabled;         CAPS="$CAPS_BASE";               EXPECT_PEER="";;
   *) echo "unknown scenario $SCEN"; exit 2;;
 esac
 rm -rf "$OUT"; mkdir -p "$OUT/agent"
@@ -39,7 +39,7 @@ trap cleanup EXIT
 # (what systemd's "hybrid" mode does) and record that we did so for cleanup.
 # /sys/fs/cgroup is a read-only tmpfs there, so it is briefly remounted rw to
 # create the mountpoint. ci/run.sh undoes all of this (scripts in cgroup2-undo.sh).
-if [[ $CP == tcp && ${SKIP_CGROUP2_MOUNT:-0} != 1 ]] && [[ $(stat -fc %T /sys/fs/cgroup) != cgroup2fs ]] \
+if [[ $CP != disabled && ${SKIP_CGROUP2_MOUNT:-0} != 1 ]] && [[ $(stat -fc %T /sys/fs/cgroup) != cgroup2fs ]] \
    && ! mountpoint -q /sys/fs/cgroup/unified; then
   sudo mount -o remount,rw /sys/fs/cgroup && sudo mkdir -p /sys/fs/cgroup/unified \
     && sudo mount -o remount,ro /sys/fs/cgroup \

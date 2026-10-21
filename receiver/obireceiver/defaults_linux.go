@@ -12,12 +12,13 @@ import (
 
 // DefaultOBIConfig returns OBI's defaults adjusted for the CloudWatch Agent:
 //
-//   - ebpf.context_propagation: "tcp". Context (and, with the ADOT patches, the
-//     downstream service name -> peer.service.name) is carried in a TCP option
-//     only. "headers"/"all" are not the default because Go library-level header
-//     injection uses bpf_probe_write_user, which needs CAP_SYS_ADMIN, and
-//     because rewriting HTTP payloads is more intrusive than a TCP option.
-//     Requires CAP_NET_ADMIN; set "disabled" to run without it.
+//   - ebpf.context_propagation: "tcp_service_name". Servers return their service
+//     name in a TCP option (-> peer.service.name on the client), only to peers
+//     inside the VPC; no trace context is sent. "headers"/"all" are not the
+//     default because Go library-level header injection uses
+//     bpf_probe_write_user, which needs CAP_SYS_ADMIN, and because rewriting HTTP
+//     payloads is more intrusive than a TCP option. Requires CAP_NET_ADMIN; set
+//     "disabled" to run without it.
 //   - network flow metrics (network.enable) off: they are a separate,
 //     high-cardinality feature that CloudWatch customers opt into explicitly.
 //   - enforce_sys_caps false: missing capabilities are logged, and individual
@@ -27,7 +28,7 @@ import (
 // OBI's upstream default.
 func DefaultOBIConfig() *obi.Config {
 	cfg := obi.DefaultConfig
-	cfg.EBPF.ContextPropagation = config.ContextPropagationTCP
+	cfg.EBPF.ContextPropagation = config.ContextPropagationTCPServiceName
 	cfg.NetworkFlows.Enable = false
 	cfg.EnforceSysCaps = false
 	return &cfg

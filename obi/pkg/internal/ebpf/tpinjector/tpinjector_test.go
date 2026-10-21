@@ -60,7 +60,14 @@ func TestTracer_Constants(t *testing.T) {
 			name:                "all",
 			contextPropagation:  "all",
 			bpfPidFilterOff:     false,
-			expectedInjectFlags: 3, // k_inject_http_headers | k_inject_tcp_options
+			expectedInjectFlags: 7, // k_inject_http_headers | k_inject_tcp_options | k_inject_tcp_svc_name
+			expectedFilterPids:  1,
+		},
+		{
+			name:                "tcp_service_name",
+			contextPropagation:  "tcp_service_name",
+			bpfPidFilterOff:     false,
+			expectedInjectFlags: 4, // k_inject_tcp_svc_name
 			expectedFilterPids:  1,
 		},
 		{

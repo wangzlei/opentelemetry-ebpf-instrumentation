@@ -24,13 +24,17 @@ const (
 	ContextPropagationDisabled ContextPropagationMode = 0
 	ContextPropagationHeaders  ContextPropagationMode = 1 << 0 // HTTP headers
 	ContextPropagationTCP      ContextPropagationMode = 1 << 1 // TCP options
+	// TCPServiceName is independent of TCP: servers return their service.name to the
+	// client in a TCP option on responses, without sending any trace context.
+	ContextPropagationTCPServiceName ContextPropagationMode = 1 << 2
 
 	// Convenience aliases
-	ContextPropagationAll         = ContextPropagationHeaders | ContextPropagationTCP
-	StrContextPropagationDisabled = "disabled"
-	StrContextPropagationAll      = "all"
-	StrContextPropagationHeaders  = "headers"
-	StrContextPropagationTCP      = "tcp"
+	ContextPropagationAll           = ContextPropagationHeaders | ContextPropagationTCP | ContextPropagationTCPServiceName
+	StrContextPropagationDisabled   = "disabled"
+	StrContextPropagationAll        = "all"
+	StrContextPropagationHeaders    = "headers"
+	StrContextPropagationTCP        = "tcp"
+	StrContextPropagationTCPSvcName = "tcp_service_name"
 )
 
 type MapsConfig struct {
@@ -82,8 +86,13 @@ type EBPFTracer struct {
 	GoHTTPClientBufferTimeout time.Duration `yaml:"go_http_client_buffer_timeout" env:"OTEL_EBPF_BPF_GO_HTTP_CLIENT_BUFFER_TIMEOUT" validate:"gte=0"`
 
 	// Enables distributed context propagation.
-	// Can be a combination of: headers, tcp (e.g., "headers,tcp" or "all")
+	// Can be a combination of: headers, tcp, tcp_service_name (e.g., "headers,tcp" or "all")
 	ContextPropagation ContextPropagationMode `yaml:"context_propagation" env:"OTEL_EBPF_BPF_CONTEXT_PROPAGATION"`
+
+	// By default tcp_service_name only writes the option on connections whose peer is inside
+	// the host's VPC (the VPC CIDRs from EC2 instance metadata, or the private address ranges
+	// when instance metadata is unavailable). Setting this sends it to any peer.
+	TCPServiceNameOutsideVPC bool `yaml:"tcp_service_name_outside_vpc" env:"OTEL_EBPF_BPF_TCP_SERVICE_NAME_OUTSIDE_VPC" validate:"boolean"`
 
 	// Skips checking the kernel version for bpf_loop functionality. Some modified kernels have this
 	// backported prior to version 5.17.
@@ -199,6 +208,11 @@ func (m ContextPropagationMode) HasTCP() bool {
 	return m&ContextPropagationTCP != 0
 }
 
+// HasTCPServiceName returns true if service name propagation in TCP options is enabled
+func (m ContextPropagationMode) HasTCPServiceName() bool {
+	return m&ContextPropagationTCPServiceName != 0
+}
+
 // IsEnabled returns true if any context propagation is enabled
 func (m ContextPropagationMode) IsEnabled() bool {
 	return m != ContextPropagationDisabled
@@ -228,10 +242,12 @@ func (m *ContextPropagationMode) UnmarshalText(text []byte) error {
 			result |= ContextPropagationHeaders
 		case StrContextPropagationTCP:
 			result |= ContextPropagationTCP
+		case StrContextPropagationTCPSvcName:
+			result |= ContextPropagationTCPServiceName
 		case "ip":
 			slog.Warn("context_propagation value 'ip' is deprecated and has no effect; IP options injection has been removed")
 		default:
-			return fmt.Errorf("invalid value for context_propagation: '%s' (valid: all, disabled, headers, tcp)", part)
+			return fmt.Errorf("invalid value for context_propagation: '%s' (valid: all, disabled, headers, tcp, tcp_service_name)", part)
 		}
 	}
 
@@ -255,6 +271,9 @@ func (m ContextPropagationMode) MarshalText() ([]byte, error) {
 	if m.HasTCP() {
 		parts = append(parts, "tcp")
 	}
+	if m.HasTCPServiceName() {
+		parts = append(parts, "tcp_service_name")
+	}
 	if len(parts) == 0 {
 		return nil, fmt.Errorf("invalid context propagation mode: %d", m)
 	}
@@ -263,7 +282,7 @@ func (m ContextPropagationMode) MarshalText() ([]byte, error) {
 }
 
 func (ContextPropagationMode) JSONSchema() *jsonschema.Schema {
-	options := []string{StrContextPropagationHeaders, StrContextPropagationTCP}
+	options := []string{StrContextPropagationHeaders, StrContextPropagationTCP, StrContextPropagationTCPSvcName}
 	optionsStr := strings.Join(options, "|")
 	optionsRegexp := fmt.Sprintf("^(%s)(,(%s))*$", optionsStr, optionsStr)
 	return &jsonschema.Schema{
@@ -275,8 +294,8 @@ func (ContextPropagationMode) JSONSchema() *jsonschema.Schema {
 			},
 			{
 				Type:        "string",
-				Description: "Comma-separated list of propagation methods (headers for HTTP headers, tcp for TCP options)",
-				Examples:    []any{"headers", "tcp", "headers,tcp"},
+				Description: "Comma-separated list of propagation methods (headers for HTTP headers, tcp for TCP options, tcp_service_name for the server service name in TCP options)",
+				Examples:    []any{"headers", "tcp", "headers,tcp", "tcp_service_name"},
 				Pattern:     optionsRegexp,
 			},
 			{
@@ -287,6 +306,6 @@ func (ContextPropagationMode) JSONSchema() *jsonschema.Schema {
 			},
 		},
 		Title:       "Context Propagation Mode",
-		Description: "Configures distributed context propagation. Can be 'all' to enable all methods, 'disabled'/'' to disable, or a comma-separated list of methods: 'headers' for HTTP headers, 'tcp' for TCP options (e.g. \"headers,tcp\").",
+		Description: "Configures distributed context propagation. Can be 'all' to enable all methods, 'disabled'/'' to disable, or a comma-separated list of methods: 'headers' for HTTP headers, 'tcp' for TCP options, 'tcp_service_name' for the server service name in TCP options (e.g. \"headers,tcp\").",
 	}
 }

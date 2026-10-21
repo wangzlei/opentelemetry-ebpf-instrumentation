@@ -41,8 +41,13 @@ func TestContextPropagationMode_UnmarshalText(t *testing.T) {
 			want:  ContextPropagationHeaders | ContextPropagationTCP,
 		},
 		{
-			name:  "all two",
-			input: "headers,tcp",
+			name:  "tcp_service_name only",
+			input: "tcp_service_name",
+			want:  ContextPropagationTCPServiceName,
+		},
+		{
+			name:  "all three",
+			input: "headers,tcp,tcp_service_name",
 			want:  ContextPropagationAll,
 		},
 		{
@@ -102,8 +107,18 @@ func TestContextPropagationMode_MarshalText(t *testing.T) {
 			want: "tcp",
 		},
 		{
+			name: "tcp_service_name only",
+			mode: ContextPropagationTCPServiceName,
+			want: "tcp_service_name",
+		},
+		{
 			name: "headers and tcp",
 			mode: ContextPropagationHeaders | ContextPropagationTCP,
+			want: "headers,tcp",
+		},
+		{
+			name: "all",
+			mode: ContextPropagationAll,
 			want: "all",
 		},
 	}

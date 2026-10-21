@@ -47,6 +47,7 @@
 #include <tpinjector/maps/sk_h2_flags.h>
 #include <tpinjector/maps/sk_h2_conn_flag.h>
 #include <tpinjector/maps/sk_svc_name_map.h>
+#include <tpinjector/maps/svc_name_peer_cidrs.h>
 #include <tpinjector/maps/sk_tp_info_pid_map.h>
 #include <tpinjector/maps/svc_name_by_pid.h>
 
@@ -118,10 +119,14 @@ char __license[] SEC("license") = "Dual MIT/GPL";
 enum {
     k_inject_http_headers = 1 << 0, // Bit 0: inject HTTP headers
     k_inject_tcp_options = 1 << 1,  // Bit 1: inject TCP options
+    k_inject_tcp_svc_name = 1 << 2, // Bit 2: servers return their service name in a TCP option
 };
 
 volatile const u32 inject_flags =
     k_inject_http_headers | k_inject_tcp_options; // default: both enabled
+
+// When false, the service name is only exchanged with peers in svc_name_peer_cidrs.
+volatile const bool svc_name_any_peer = false;
 
 // Kind 25 is unassigned per IANA TCP Parameters registry (released 2000-12-18)
 // Better than experimental options (253-254) which must not be shipped as defaults
@@ -527,6 +532,30 @@ static __always_inline void bpf_sock_ops_set_flags(struct bpf_sock_ops *skops, u
     bpf_sock_ops_cb_flags_set(skops, skops->bpf_sock_ops_cb_flags | flags);
 }
 
+static __always_inline bool svc_name_peer_allowed(struct bpf_sock_ops *skops) {
+    if (svc_name_any_peer) {
+        return true;
+    }
+
+    // All ctx fields are read unconditionally and in struct order: reading them
+    // inside the family branch lets clang merge the accesses into a modified ctx
+    // pointer, which the verifier rejects.
+    const u32 family = skops->family;
+    const u32 remote_ip4 = skops->remote_ip4;
+    const u32 remote_ip6[4] = {
+        skops->remote_ip6[0], skops->remote_ip6[1], skops->remote_ip6[2], skops->remote_ip6[3]};
+
+    svc_name_peer_cidr_key_t key = {.prefixlen = sizeof(key.addr) * 8};
+    if (family == AF_INET6) {
+        __builtin_memcpy(key.addr, remote_ip6, sizeof(key.addr));
+    } else {
+        __builtin_memcpy(key.addr, ip4ip6_prefix, sizeof(ip4ip6_prefix));
+        __builtin_memcpy(key.addr + sizeof(ip4ip6_prefix), &remote_ip4, sizeof(remote_ip4));
+    }
+
+    return bpf_map_lookup_elem(&svc_name_peer_cidrs, &key) != NULL;
+}
+
 // Helper that writes in the sock map for a sock_ops program
 static __always_inline void bpf_sock_ops_active_est_cb(struct bpf_sock_ops *skops) {
     const u64 cookie = bpf_get_socket_cookie(skops);
@@ -539,17 +568,19 @@ static __always_inline void bpf_sock_ops_active_est_cb(struct bpf_sock_ops *skop
     // EXPERIMENTAL — service-name propagation: the client also PARSES, to read
     // the server's name off response segments. Reading is idle unless a kind-26
     // option is present, so this does not affect the existing request path.
-    if (inject_flags & k_inject_tcp_options) {
+    if ((inject_flags & k_inject_tcp_svc_name) && svc_name_peer_allowed(skops)) {
         bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG);
     }
 }
 
 static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *skops) {
-    if (!(inject_flags & k_inject_tcp_options)) {
-        return;
+    if (inject_flags & k_inject_tcp_options) {
+        bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG);
     }
 
-    bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG);
+    if (!(inject_flags & k_inject_tcp_svc_name) || !svc_name_peer_allowed(skops)) {
+        return;
+    }
 
     // EXPERIMENTAL — service-name propagation, write side. A server must (a) run
     // its responses through sk_msg to resolve the writing PID -> local name, so
@@ -741,12 +772,13 @@ static __always_inline void parse_svc_name_hdr_opt(struct bpf_sock_ops *skops) {
 }
 
 static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops) {
-    if (!(inject_flags & k_inject_tcp_options)) {
-        return;
+    if (inject_flags & k_inject_tcp_options) {
+        parse_trace_hdr_opt(skops);
     }
 
-    parse_trace_hdr_opt(skops);
-    parse_svc_name_hdr_opt(skops);
+    if (inject_flags & k_inject_tcp_svc_name) {
+        parse_svc_name_hdr_opt(skops);
+    }
 }
 
 // Tracks all outgoing sockets (BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB)
@@ -1259,8 +1291,8 @@ static __always_inline bool schedule_service_name_option(struct sk_msg_md *msg, 
 // Traceparent string.
 SEC("sk_msg")
 int obi_packet_extender(struct sk_msg_md *msg) {
-    // If neither injection method is enabled, nothing to do
-    if (!(inject_flags & (k_inject_http_headers | k_inject_tcp_options))) {
+    // If no injection method is enabled, nothing to do
+    if (!(inject_flags & (k_inject_http_headers | k_inject_tcp_options | k_inject_tcp_svc_name))) {
         return SK_PASS;
     }
 
@@ -1294,6 +1326,16 @@ int obi_packet_extender(struct sk_msg_md *msg) {
     if (schedule_service_name_option(msg, id)) {
         bpf_msg_pull_data(msg, 0, msg->size, 0);
         fill_msg_buffers(msg, &t_ctx->p_conn, &e_key);
+        return SK_PASS;
+    }
+
+    // tcp_service_name alone: client sockets still need msg_buffers for request capture,
+    // but no trace context may be created or written.
+    if (!(inject_flags & (k_inject_http_headers | k_inject_tcp_options))) {
+        if (valid_pid(id)) {
+            bpf_msg_pull_data(msg, 0, msg->size, 0);
+            fill_msg_buffers(msg, &t_ctx->p_conn, &e_key);
+        }
         return SK_PASS;
     }
 
