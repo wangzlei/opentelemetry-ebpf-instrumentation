@@ -13,6 +13,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CW=${CWAGENT:-"$ROOT/../cwagent"}
 # the worktree publish.sh builds from; a missing ../cwagent would be created (root-owned) by docker -v
 [[ -n ${CWAGENT:-} || -f $CW/go.mod || ! -f $ROOT/../adot-obi-work/cwagent/go.mod ]] || CW=$ROOT/../adot-obi-work/cwagent
+export CWAGENT=$CW
 LOGS="$ROOT/ci/logs"; mkdir -p "$LOGS"
 export GOPROXY=${GOPROXY:-https://proxy.golang.org,direct} GOSUMDB=${GOSUMDB:-sum.golang.org} GOFLAGS=-mod=readonly
 STAGES=("$@"); [[ ${#STAGES[@]} -gt 0 ]] || STAGES=(apply bpf obi collector cwagent e2e)
