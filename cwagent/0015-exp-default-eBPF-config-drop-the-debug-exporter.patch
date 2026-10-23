@@ -1,0 +1,38 @@
+From 91061a53000ede753ce87547ef04abee2da2b3ae Mon Sep 17 00:00:00 2001
+From: wangzlei <66336933+wangzlei@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 22:09:23 +0000
+Subject: [PATCH] exp: default eBPF config: drop the debug exporter
+
+Nothing reads it in production, and an exporter that writes telemetry to the
+agent log is a path for captured data to reach disk.
+---
+ packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml | 6 ++----
+ 1 file changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml b/packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml
+index decc78d6..5c595db0 100644
+--- a/packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml
++++ b/packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml
+@@ -155,8 +155,6 @@ processors:
+     send_batch_max_size: 500
+ 
+ exporters:
+-  debug:
+-    verbosity: basic
+   # otlp_http compresses with gzip by default.
+   otlp_http/xray:
+     traces_endpoint: https://xray.${env:AWS_REGION:-us-west-2}.amazonaws.com/v1/traces
+@@ -178,8 +176,8 @@ service:
+     traces:
+       receivers: [obi]
+       processors: [transform/aws, batch]
+-      exporters: [otlp_http/xray, debug]
++      exporters: [otlp_http/xray]
+     metrics:
+       receivers: [obi]
+       processors: [transform/aws, cumulativetodelta, batch]
+-      exporters: [otlp_http/cloudwatch, debug]
++      exporters: [otlp_http/cloudwatch]
+-- 
+2.50.1
+
