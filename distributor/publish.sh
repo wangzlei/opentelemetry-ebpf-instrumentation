@@ -136,7 +136,7 @@ if [[ $DRY == 1 ]]; then
   3) tar (excl .git, build) $CW -> $H:~/$R/cwagent; sha256 check: ${KEY_FILES[*]}
   4) ssh: GOPROXY=direct GOSUMDB=off GOTOOLCHAIN=local GOFLAGS=-mod=mod BS=~/$R/cwagent-rpm-build
           make package-rpm BUILD_SPACE=\$BS VERSION=$VERSION  > /tmp/cw-rpm.log
-     check rpm -qp %{VERSION} == $RPM_VERSION; payload has etc/ebpf/obi.yaml + etc/ebpf/systemd-dropin.conf
+     check rpm -qp %{VERSION} == $RPM_VERSION; payload has etc/ebpf/obi.yaml + share/ebpf/systemd-dropin.conf
   5) ~/$STAGE/stage/{x86_64,arm64}: rpm + install.sh/uninstall.sh from $DIST
      zip -q -X ~/$STAGE/amazon-cloudwatch-agent-ebpf-beta_{x86_64,arm64}.zip ...; manifest.json version=$VERSION
   6) aws s3 cp <zips> $S3/
@@ -200,10 +200,10 @@ for a in amd64 arm64; do
   v=$(rpm -qp --qf '%{VERSION}' "$f" 2>/dev/null); arch=$(rpm -qp --qf '%{ARCH}' "$f" 2>/dev/null)
   [ "$v" = "$RPM_VERSION" ] || { echo "$f: version $v, expected $RPM_VERSION"; exit 1; }
   list=$(rpm2cpio "$f" | cpio -t --quiet)
-  for p in etc/ebpf/obi.yaml etc/ebpf/systemd-dropin.conf; do
+  for p in etc/ebpf/obi.yaml share/ebpf/systemd-dropin.conf; do
     grep -q "/opt/aws/amazon-cloudwatch-agent/$p\$" <<<"$list" || { echo "$f: $p missing from the payload"; exit 1; }
   done
-  echo "  $a: $v $arch $(du -h "$f" | cut -f1), has etc/ebpf/obi.yaml + etc/ebpf/systemd-dropin.conf"
+  echo "  $a: $v $arch $(du -h "$f" | cut -f1), has etc/ebpf/obi.yaml + share/ebpf/systemd-dropin.conf"
 done
 EOF
 

@@ -51,7 +51,7 @@ cwagent/                  the cwagent change (format-patch of branch exp/obi-rec
                           keeps it), loaded first by start-agent. Edit that file to change it (a .d YAML cannot:
                           the agent rejects duplicate receivers/processors/exporters/extensions/service::pipelines
                           keys). 0007 makes eBPF opt-in: by default the RPM behaves like the official agent (drop-in
-                          shipped only as the template etc/ebpf/systemd-dropin.conf); `amazon-cloudwatch-agent-ctl
+                          shipped only as the template share/ebpf/systemd-dropin.conf); `amazon-cloudwatch-agent-ctl
                           -a enable-ebpf` (or Distributor Additional Arguments {"SSM_EBPF":"true"}) creates the marker
                           etc/ebpf/enabled + installs the drop-in, `-a disable-ebpf` removes both; upgrades from the
                           always-on versions keep eBPF on. 0011 completes aws.lambda.function.arn for Lambda calls by
