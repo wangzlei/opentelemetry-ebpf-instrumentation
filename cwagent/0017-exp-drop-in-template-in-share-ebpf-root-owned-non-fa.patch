@@ -1,0 +1,102 @@
+From 535bcb4f32b9e20e8c1bfaa27f037c56335d75a2 Mon Sep 17 00:00:00 2001
+From: wangzlei <66336933+wangzlei@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 23:11:10 +0000
+Subject: [PATCH] exp: drop-in template in share/ebpf (root-owned); non-fatal
+ bpffs prep
+
+The drop-in chowns etc/ to cwagent at every start, so a template under
+etc/ebpf/ was cwagent-writable while root copies it into /etc/systemd/system
+(enable-ebpf, %posttrans). share/ebpf/ is never chowned. The /sys/fs/bpf/otel
+mkdir/chown steps are now non-fatal: without bpffs the agent failed to start.
+---
+ Tools/src/create_rpm.sh                                  | 4 ++--
+ packaging/dependencies/amazon-cloudwatch-agent-ctl       | 3 ++-
+ packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf | 9 ++++++---
+ packaging/linux/amazon-cloudwatch-agent.spec             | 8 +++++---
+ 4 files changed, 15 insertions(+), 9 deletions(-)
+
+diff --git a/Tools/src/create_rpm.sh b/Tools/src/create_rpm.sh
+index 09223eb3..131b369d 100755
+--- a/Tools/src/create_rpm.sh
++++ b/Tools/src/create_rpm.sh
+@@ -32,9 +32,9 @@ cp ${PREPKGPATH}/CWAGENT_VERSION ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch
+ cp ${PREPKGPATH}/amazon-cloudwatch-agent ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/bin/
+ cp ${PREPKGPATH}/amazon-cloudwatch-agent-ctl ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/bin/
+ cp ${PREPKGPATH}/amazon-cloudwatch-agent.service ${BUILD_ROOT}/SOURCES/etc/systemd/system/
+-mkdir -p ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/etc/ebpf
++mkdir -p ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/etc/ebpf ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/share/ebpf
+ # eBPF is opt-in: the drop-in is a template that "ctl -a enable-ebpf" installs.
+-cp ${PREPKGPATH}/amazon-cloudwatch-agent-ebpf.conf ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/etc/ebpf/systemd-dropin.conf
++cp ${PREPKGPATH}/amazon-cloudwatch-agent-ebpf.conf ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/share/ebpf/systemd-dropin.conf
+ cp ${PREPKGPATH}/amazon-cloudwatch-agent-ebpf.yaml ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/etc/ebpf/obi.yaml
+ cp ${PREPKGPATH}/config-translator ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/bin/
+ cp ${PREPKGPATH}/config-downloader ${BUILD_ROOT}/SOURCES/opt/aws/amazon-cloudwatch-agent/bin/
+diff --git a/packaging/dependencies/amazon-cloudwatch-agent-ctl b/packaging/dependencies/amazon-cloudwatch-agent-ctl
+index 3d740c92..5fa0510a 100755
+--- a/packaging/dependencies/amazon-cloudwatch-agent-ctl
++++ b/packaging/dependencies/amazon-cloudwatch-agent-ctl
+@@ -26,7 +26,8 @@ readonly ENV_CONFIG="${CONFDIR}/env-config.json"
+ # runs the agent as cwagent with the capabilities the eBPF receiver needs.
+ readonly EBPF_DIR="${CONFDIR}/ebpf"
+ readonly EBPF_MARKER="${EBPF_DIR}/enabled"
+-readonly EBPF_DROPIN_TEMPLATE="${EBPF_DIR}/systemd-dropin.conf"
++# The template is in share/ (root-owned), not etc/ (chowned to cwagent at start).
++readonly EBPF_DROPIN_TEMPLATE="${AGENTDIR}/share/ebpf/systemd-dropin.conf"
+ readonly EBPF_DROPIN_DIR="/etc/systemd/system/amazon-cloudwatch-agent.service.d"
+ readonly EBPF_DROPIN="${EBPF_DROPIN_DIR}/ebpf.conf"
+ 
+diff --git a/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf b/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf
+index c55e4696..654323f4 100644
+--- a/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf
++++ b/packaging/dependencies/amazon-cloudwatch-agent-ebpf.conf
+@@ -1,7 +1,8 @@
+ # systemd drop-in installed as
+ #   /etc/systemd/system/amazon-cloudwatch-agent.service.d/ebpf.conf
+ # by "amazon-cloudwatch-agent-ctl -a enable-ebpf" (eBPF is opt-in; the RPM ships
+-# this file as the template etc/ebpf/systemd-dropin.conf).
++# this file as the template share/ebpf/systemd-dropin.conf; it must stay out of
++# etc/, which ExecStartPre below chowns to cwagent).
+ # Runs the agent as the unprivileged cwagent user with only the capabilities the
+ # ADOT OBI eBPF receiver needs (raised as ambient, so they survive the exec of the
+ # agent binary). start-amazon-cloudwatch-agent skips its own run_as_user switch
+@@ -35,5 +36,7 @@ ExecStartPre=+/bin/chown -R cwagent:cwagent /opt/aws/amazon-cloudwatch-agent/log
+ # /sys/fs/bpf is root-only: prepare that one directory (and any pins a previous
+ # root run left there) for cwagent, or OBI fails with "load pinned map: permission
+ # denied" (existing root-owned dir) or runs with pinning disabled (no dir).
+-ExecStartPre=+/bin/mkdir -p /sys/fs/bpf/otel
+-ExecStartPre=+/bin/chown -R cwagent:cwagent /sys/fs/bpf/otel
++# "-": without bpffs (/sys/fs/bpf not mounted) these fail; the agent still starts
++# and OBI runs with pinning disabled.
++ExecStartPre=-+/bin/mkdir -p /sys/fs/bpf/otel
++ExecStartPre=-+/bin/chown -R cwagent:cwagent /sys/fs/bpf/otel
+diff --git a/packaging/linux/amazon-cloudwatch-agent.spec b/packaging/linux/amazon-cloudwatch-agent.spec
+index 6f94c67d..739d1ab1 100644
+--- a/packaging/linux/amazon-cloudwatch-agent.spec
++++ b/packaging/linux/amazon-cloudwatch-agent.spec
+@@ -60,8 +60,10 @@ ln -f -s /opt/aws/amazon-cloudwatch-agent/var ${RPM_BUILD_ROOT}/var/run/amazon/a
+ /opt/aws/amazon-cloudwatch-agent/doc/amazon-cloudwatch-agent-schema.json
+ %config(noreplace) /opt/aws/amazon-cloudwatch-agent/etc/common-config.toml
+ %dir /opt/aws/amazon-cloudwatch-agent/etc/ebpf
++%dir /opt/aws/amazon-cloudwatch-agent/share
++%dir /opt/aws/amazon-cloudwatch-agent/share/ebpf
+ %config(noreplace) /opt/aws/amazon-cloudwatch-agent/etc/ebpf/obi.yaml
+-/opt/aws/amazon-cloudwatch-agent/etc/ebpf/systemd-dropin.conf
++/opt/aws/amazon-cloudwatch-agent/share/ebpf/systemd-dropin.conf
+ /opt/aws/amazon-cloudwatch-agent/LICENSE
+ /opt/aws/amazon-cloudwatch-agent/NOTICE
+ 
+@@ -124,9 +126,9 @@ fi
+ %posttrans
+ # eBPF opted in: (re)install the systemd drop-in from the template. On an upgrade
+ # from an always-on version the old package's erase removed its ebpf.conf.
+-if [ -f /opt/aws/amazon-cloudwatch-agent/etc/ebpf/enabled ] && [ -f /opt/aws/amazon-cloudwatch-agent/etc/ebpf/systemd-dropin.conf ]; then
++if [ -f /opt/aws/amazon-cloudwatch-agent/etc/ebpf/enabled ] && [ -f /opt/aws/amazon-cloudwatch-agent/share/ebpf/systemd-dropin.conf ]; then
+     mkdir -p /etc/systemd/system/amazon-cloudwatch-agent.service.d
+-    cp -f /opt/aws/amazon-cloudwatch-agent/etc/ebpf/systemd-dropin.conf /etc/systemd/system/amazon-cloudwatch-agent.service.d/ebpf.conf
++    cp -f /opt/aws/amazon-cloudwatch-agent/share/ebpf/systemd-dropin.conf /etc/systemd/system/amazon-cloudwatch-agent.service.d/ebpf.conf
+     if command -v systemctl >/dev/null 2>&1; then
+         systemctl daemon-reload >/dev/null 2>&1 || :
+     fi
+-- 
+2.50.1
+
