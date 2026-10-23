@@ -1,0 +1,33 @@
+From 61d9bdad4896f1ec1ef3af1af77bd71995dd54c6 Mon Sep 17 00:00:00 2001
+From: wangzlei <66336933+wangzlei@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 17:04:56 +0000
+Subject: [PATCH] exp: default eBPF config: nodejs.enabled false (no Node.js
+ injector)
+
+RED does not need the injector; on a node binary it cost +340 us CPU per
+request and cut max throughput from 42k to 2.8k RPS (c6i.2xlarge). Disabled:
++14 us per request, 25k RPS, RED exact.
+---
+ packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml b/packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml
+index 10f80887..decc78d6 100644
+--- a/packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml
++++ b/packaging/dependencies/amazon-cloudwatch-agent-ebpf.yaml
+@@ -85,6 +85,12 @@ receivers:
+         enable: "autodetect"
+     metrics:
+       features: "application"
++    # No Node.js injector (SIGUSR1 + inspector + injected JS): RED does not need it,
++    # the socket / libssl probes count every request without it. On a node binary it
++    # cost +340 us CPU per request and cut max throughput from 42k to 2.8k RPS on
++    # c6i.2xlarge; disabled: +14 us, 25k RPS, RED exact (perf-ec2, 2026-10-23).
++    nodejs:
++      enabled: false
+ 
+ extensions:
+   sigv4auth/xray:
+-- 
+2.50.1
+
