@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: wangzlei <66336933+wangzlei@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 16:32:49 -0700
-Subject: [PATCH 06/10] go-request-host: read net/http.Request.Host in the Go
+Subject: [PATCH 06/11] go-request-host: read net/http.Request.Host in the Go
  HTTP probes
 
 Upstream's Go uprobes read only Request.URL.Host. Two consequences:

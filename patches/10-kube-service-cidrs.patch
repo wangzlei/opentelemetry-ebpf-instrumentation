@@ -1,0 +1,369 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: wangzlei <66336933+wangzlei@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 19:52:39 +0000
+Subject: [PATCH 10/11] kube-service-cidrs: allow Kubernetes Service addresses
+ as tcp_service_name peers
+
+A client connected to a Kubernetes Service sees the ClusterIP as its peer
+(kube-proxy DNATs to the pod later), and the Service CIDR is usually outside
+the VPC (EKS: 10.100.0.0/16 or 172.20.0.0/16). The VPC-only peer filter
+therefore never exchanged the service name on Service traffic, so client RED
+had no peer.service.name on EKS (seen on the ebpf-mode EKS test cluster).
+
+When the Kubernetes metadata decorator is enabled (or autodetected), the
+tracer also allows the cluster's Service addresses:
+- the networking.k8s.io/v1 ServiceCIDR objects (Kubernetes 1.33+), when the
+  API serves them and the agent may list them;
+- otherwise every Service's ClusterIPs, one /32 or /128 entry each.
+Both are watched and kept current. Startup waits at most 10s for the initial
+list before sockops is attached. The trie's max_entries is raised from 256 to
+65536 at load time (no BPF change; the trie is not preallocated). EC2 / ECS
+(no Kubernetes) are unchanged, and addresses outside the VPC and the cluster
+are still never sent the service name.
+
+Adot-Obi-Patch: 10-kube-service-cidrs
+---
+ .../ebpf/tpinjector/kube_peer_cidrs.go        | 220 ++++++++++++++++++
+ .../ebpf/tpinjector/kube_peer_cidrs_test.go   |  62 +++++
+ pkg/internal/ebpf/tpinjector/tpinjector.go    |  20 +-
+ 3 files changed, 298 insertions(+), 4 deletions(-)
+ create mode 100644 pkg/internal/ebpf/tpinjector/kube_peer_cidrs.go
+ create mode 100644 pkg/internal/ebpf/tpinjector/kube_peer_cidrs_test.go
+
+diff --git a/pkg/internal/ebpf/tpinjector/kube_peer_cidrs.go b/pkg/internal/ebpf/tpinjector/kube_peer_cidrs.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..76d76759f730a9a1cf99a32e9fa66d06cfaed529
+--- /dev/null
++++ b/pkg/internal/ebpf/tpinjector/kube_peer_cidrs.go
+@@ -0,0 +1,220 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++//go:build linux
++
++package tpinjector // import "go.opentelemetry.io/obi/pkg/internal/ebpf/tpinjector"
++
++import (
++	"context"
++	"errors"
++	"log/slog"
++	"net/netip"
++	"sync"
++	"time"
++
++	"github.com/cilium/ebpf"
++	corev1 "k8s.io/api/core/v1"
++	networkingv1 "k8s.io/api/networking/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/client-go/informers"
++	"k8s.io/client-go/kubernetes"
++	"k8s.io/client-go/tools/cache"
++
++	"go.opentelemetry.io/obi/pkg/kube"
++	"go.opentelemetry.io/obi/pkg/obi"
++)
++
++// In Kubernetes a client connected to a Service sees the ClusterIP as its peer (the
++// DNAT to a pod happens later), and the Service CIDR is usually outside the VPC. The
++// cluster's Service addresses are therefore also allowed tcp_service_name peers: the
++// ServiceCIDR objects (networking.k8s.io/v1, Kubernetes 1.33+), or else every
++// Service's ClusterIPs.
++
++const (
++	// kubePeerSyncTimeout bounds how long startup (before sockops is attached) waits for
++	// the initial list; the trie is still filled when the list completes later.
++	kubePeerSyncTimeout = 10 * time.Second
++
++	// svcNamePeerCIDRsMaxEntries replaces the BPF default (256) so the trie also holds
++	// one entry per ClusterIP on clusters without ServiceCIDR objects. The trie is not
++	// preallocated: unused entries cost no memory.
++	svcNamePeerCIDRsMaxEntries = 65536
++
++	serviceCIDRResource = "servicecidrs"
++)
++
++// kubePeerCIDRs keeps the Kubernetes entries of svc_name_peer_cidrs. Prefixes are
++// reference counted, because an update adds the new object's prefixes before it
++// removes the old ones, and static prefixes (VPC, interfaces, loopback) are never removed.
++type kubePeerCIDRs struct {
++	log    *slog.Logger
++	peers  *ebpf.Map
++	static map[netip.Prefix]bool
++
++	mu   sync.Mutex
++	refs map[netip.Prefix]int
++}
++
++func newKubePeerCIDRs(log *slog.Logger, peers *ebpf.Map, static []netip.Prefix) *kubePeerCIDRs {
++	k := &kubePeerCIDRs{log: log, peers: peers, static: map[netip.Prefix]bool{}, refs: map[netip.Prefix]int{}}
++	for _, c := range static {
++		k.static[c] = true
++	}
++	return k
++}
++
++func (k *kubePeerCIDRs) add(prefixes []netip.Prefix) {
++	k.mu.Lock()
++	defer k.mu.Unlock()
++
++	for _, c := range prefixes {
++		k.refs[c]++
++		if k.refs[c] > 1 || k.static[c] {
++			continue
++		}
++		key := svcNamePeerKey(c)
++		if err := k.peers.Update(&key, uint8(1), ebpf.UpdateAny); err != nil {
++			k.log.Warn("cannot allow tcp_service_name peers", "cidr", c, "error", err)
++		}
++	}
++}
++
++func (k *kubePeerCIDRs) remove(prefixes []netip.Prefix) {
++	k.mu.Lock()
++	defer k.mu.Unlock()
++
++	for _, c := range prefixes {
++		if k.refs[c] == 0 {
++			continue
++		}
++		k.refs[c]--
++		if k.refs[c] > 0 || k.static[c] {
++			continue
++		}
++		delete(k.refs, c)
++		key := svcNamePeerKey(c)
++		if err := k.peers.Delete(&key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
++			k.log.Debug("cannot remove tcp_service_name peers", "cidr", c, "error", err)
++		}
++	}
++}
++
++// watch fills the trie from the cluster and keeps it current until ctx is done.
++// synced is closed once the initial list is in the trie.
++func (k *kubePeerCIDRs) watch(ctx context.Context, client kubernetes.Interface, synced chan<- struct{}) {
++	defer close(synced)
++
++	factory := informers.NewSharedInformerFactory(client, 0)
++
++	var informer cache.SharedIndexInformer
++	var source string
++	if hasServiceCIDRs(ctx, client) {
++		informer = factory.Networking().V1().ServiceCIDRs().Informer()
++		source = "ServiceCIDR objects"
++	} else {
++		informer = factory.Core().V1().Services().Informer()
++		source = "Service ClusterIPs"
++	}
++	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
++		AddFunc: func(obj any) { k.add(kubePeerPrefixes(obj)) },
++		UpdateFunc: func(oldObj, newObj any) {
++			k.add(kubePeerPrefixes(newObj))
++			k.remove(kubePeerPrefixes(oldObj))
++		},
++		DeleteFunc: func(obj any) { k.remove(kubePeerPrefixes(obj)) },
++	})
++	if err != nil {
++		k.log.Warn("cannot watch Kubernetes Service addresses for tcp_service_name", "error", err)
++		return
++	}
++
++	factory.Start(ctx.Done())
++	if cache.WaitForCacheSync(ctx.Done(), informer.HasSynced) {
++		k.log.Info("tcp_service_name is also exchanged with Kubernetes Services", "source", source, "entries", k.size())
++	}
++}
++
++func (k *kubePeerCIDRs) size() int {
++	k.mu.Lock()
++	defer k.mu.Unlock()
++	return len(k.refs)
++}
++
++// hasServiceCIDRs reports whether the API server serves networking.k8s.io/v1
++// ServiceCIDRs and this agent may list them.
++func hasServiceCIDRs(ctx context.Context, client kubernetes.Interface) bool {
++	resources, err := client.Discovery().ServerResourcesForGroupVersion(networkingv1.SchemeGroupVersion.String())
++	if err != nil {
++		return false
++	}
++	found := false
++	for _, r := range resources.APIResources {
++		if r.Name == serviceCIDRResource {
++			found = true
++			break
++		}
++	}
++	if !found {
++		return false
++	}
++
++	_, err = client.NetworkingV1().ServiceCIDRs().List(ctx, metav1.ListOptions{Limit: 1})
++	return err == nil
++}
++
++// kubePeerPrefixes returns the allowed peer prefixes of a ServiceCIDR or a Service.
++func kubePeerPrefixes(obj any) []netip.Prefix {
++	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
++		obj = tombstone.Obj
++	}
++
++	var prefixes []netip.Prefix
++	switch o := obj.(type) {
++	case *networkingv1.ServiceCIDR:
++		for _, c := range o.Spec.CIDRs {
++			if p, err := netip.ParsePrefix(c); err == nil {
++				prefixes = append(prefixes, p.Masked())
++			}
++		}
++	case *corev1.Service:
++		for _, ip := range o.Spec.ClusterIPs {
++			if a, err := netip.ParseAddr(ip); err == nil {
++				prefixes = append(prefixes, netip.PrefixFrom(a, a.BitLen()))
++			}
++		}
++	}
++	return prefixes
++}
++
++// kubeClient returns a client when the Kubernetes metadata decorator is (or detects
++// to be) enabled, nil otherwise.
++func kubeClient(cfg *obi.Config) kubernetes.Interface {
++	k8s := cfg.Attributes.Kubernetes
++	mp := kube.NewMetadataProvider(kube.MetadataConfig{Enable: k8s.Enable, KubeConfigPath: k8s.KubeconfigPath}, nil)
++	if !mp.IsKubeEnabled() {
++		return nil
++	}
++	client, err := mp.KubeClient()
++	if err != nil {
++		return nil
++	}
++	return client
++}
++
++// svcNamePeerKey is the svc_name_peer_cidrs trie key of a prefix.
++func svcNamePeerKey(c netip.Prefix) BpfSvcNamePeerCidrKeyT {
++	key := BpfSvcNamePeerCidrKeyT{Prefixlen: uint32(c.Bits()), Addr: c.Addr().As16()}
++	if c.Addr().Is4() {
++		key.Prefixlen += ipv4MappedPrefixBits
++	}
++	return key
++}
++
++// stopFunc adapts a context cancel function to the tracer's closers.
++type stopFunc context.CancelFunc
++
++func (f stopFunc) Close() error {
++	f()
++	return nil
++}
+diff --git a/pkg/internal/ebpf/tpinjector/kube_peer_cidrs_test.go b/pkg/internal/ebpf/tpinjector/kube_peer_cidrs_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..f12241eece45ba4f19d24ae88b891d278c294f0d
+--- /dev/null
++++ b/pkg/internal/ebpf/tpinjector/kube_peer_cidrs_test.go
+@@ -0,0 +1,62 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++//go:build linux
++
++package tpinjector
++
++import (
++	"context"
++	"net/netip"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	corev1 "k8s.io/api/core/v1"
++	networkingv1 "k8s.io/api/networking/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	fakediscovery "k8s.io/client-go/discovery/fake"
++	"k8s.io/client-go/kubernetes/fake"
++	"k8s.io/client-go/tools/cache"
++)
++
++func TestKubePeerPrefixes(t *testing.T) {
++	serviceCIDR := &networkingv1.ServiceCIDR{Spec: networkingv1.ServiceCIDRSpec{CIDRs: []string{"10.100.0.0/16", "fd00:10:96::/112"}}}
++	assert.Equal(t, []netip.Prefix{netip.MustParsePrefix("10.100.0.0/16"), netip.MustParsePrefix("fd00:10:96::/112")},
++		kubePeerPrefixes(serviceCIDR))
++
++	service := &corev1.Service{Spec: corev1.ServiceSpec{ClusterIPs: []string{"10.100.12.7", "fd00:10:96::a"}}}
++	assert.Equal(t, []netip.Prefix{netip.MustParsePrefix("10.100.12.7/32"), netip.MustParsePrefix("fd00:10:96::a/128")},
++		kubePeerPrefixes(service))
++
++	headless := &corev1.Service{Spec: corev1.ServiceSpec{ClusterIP: corev1.ClusterIPNone, ClusterIPs: []string{corev1.ClusterIPNone}}}
++	assert.Empty(t, kubePeerPrefixes(headless))
++
++	assert.Equal(t, kubePeerPrefixes(service), kubePeerPrefixes(cache.DeletedFinalStateUnknown{Obj: service.DeepCopy()}))
++}
++
++func TestHasServiceCIDRs(t *testing.T) {
++	withResources := func(names ...string) *fake.Clientset {
++		client := fake.NewClientset(&networkingv1.ServiceCIDR{ObjectMeta: metav1.ObjectMeta{Name: "kubernetes"}})
++		var resources []metav1.APIResource
++		for _, n := range names {
++			resources = append(resources, metav1.APIResource{Name: n})
++		}
++		client.Discovery().(*fakediscovery.FakeDiscovery).Resources = []*metav1.APIResourceList{
++			{GroupVersion: networkingv1.SchemeGroupVersion.String(), APIResources: resources},
++		}
++		return client
++	}
++
++	assert.True(t, hasServiceCIDRs(context.Background(), withResources("ingresses", serviceCIDRResource)))
++	assert.False(t, hasServiceCIDRs(context.Background(), withResources("ingresses", "networkpolicies")))
++	assert.False(t, hasServiceCIDRs(context.Background(), fake.NewClientset()))
++}
++
++func TestSvcNamePeerKey(t *testing.T) {
++	v4 := svcNamePeerKey(netip.MustParsePrefix("10.100.0.0/16"))
++	assert.Equal(t, uint32(ipv4MappedPrefixBits+16), v4.Prefixlen)
++	assert.Equal(t, netip.MustParseAddr("::ffff:10.100.0.0").As16(), v4.Addr)
++
++	v6 := svcNamePeerKey(netip.MustParsePrefix("fd00:10:96::/112"))
++	assert.Equal(t, uint32(112), v6.Prefixlen)
++}
+diff --git a/pkg/internal/ebpf/tpinjector/tpinjector.go b/pkg/internal/ebpf/tpinjector/tpinjector.go
+index 9baecfc36f622f366fb3e1fc99adbaadec7a47a9..2967bb04f9f709b26131f89f698299fc57606ac5 100644
+--- a/pkg/internal/ebpf/tpinjector/tpinjector.go
++++ b/pkg/internal/ebpf/tpinjector/tpinjector.go
+@@ -206,6 +206,9 @@ func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if m, ok := spec.Maps["svc_name_peer_cidrs"]; ok {
++		m.MaxEntries = svcNamePeerCIDRsMaxEntries
++	}
+ 
+ 	bundles := []*ebpfcommon.SpecBundle{{
+ 		Spec:      spec,
+@@ -289,15 +292,24 @@ func (p *Tracer) SetupTailCalls() {
+ 
+ 	cidrs, source := svcNamePeerCIDRs(context.Background())
+ 	for _, c := range cidrs {
+-		key := BpfSvcNamePeerCidrKeyT{Prefixlen: uint32(c.Bits()), Addr: c.Addr().As16()}
+-		if c.Addr().Is4() {
+-			key.Prefixlen += ipv4MappedPrefixBits
+-		}
++		key := svcNamePeerKey(c)
+ 		if err := p.bpfObjects.SvcNamePeerCidrs.Update(&key, uint8(1), ebpf.UpdateAny); err != nil {
+ 			p.log.Warn("cannot allow tcp_service_name peers", "cidr", c, "error", err)
+ 		}
+ 	}
+ 	p.log.Info("tcp_service_name is only exchanged with peers in", "cidrs", cidrs, "source", source)
++
++	if client := kubeClient(p.cfg); client != nil {
++		ctx, cancel := context.WithCancel(context.Background())
++		p.AddCloser(stopFunc(cancel))
++		synced := make(chan struct{})
++		go newKubePeerCIDRs(p.log, p.bpfObjects.SvcNamePeerCidrs, cidrs).watch(ctx, client, synced)
++		select {
++		case <-synced:
++		case <-time.After(kubePeerSyncTimeout):
++			p.log.Warn("Kubernetes Service addresses not listed yet; tcp_service_name to Services starts when they are")
++		}
++	}
+ }
+ 
+ func (p *Tracer) RegisterOffsets(_ *exec.FileInfo, _ *goexec.Offsets) {}

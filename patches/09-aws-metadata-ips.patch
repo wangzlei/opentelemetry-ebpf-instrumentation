@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: wangzlei <66336933+wangzlei@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 06:13:37 +0000
-Subject: [PATCH 09/10] aws-metadata-ips: keep AWS metadata endpoint IPs
+Subject: [PATCH 09/11] aws-metadata-ips: keep AWS metadata endpoint IPs
  instead of "outgoing"
 
 AWS SDKs fetch credentials from EC2 IMDS (169.254.169.254 / fd00:ec2::254), the
